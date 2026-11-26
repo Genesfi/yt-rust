@@ -59,6 +59,8 @@ Phases 1–4 are complete (`11/11` unit tests passing, Windows release binary + 
 ## Next Roadmap (v0.2.0 Ideas — Ready for Contributors & New Chat)
 
 ### Phase 5 — Playback Resilience & Deeper Community Features
+- [ ] **Fix VOD / Archived Livestream Detection (`is_live`)**: prevent finished livestream VODs (which still include a Live Chat Replay `liveChatRenderer` token or finite `duration_secs` via `fetch_next_watch_fallback` / `yt-dlp`) from being misclassified as `is_live: true` (`● Live` seekbar instead of normal VOD timeline); verify against `yt-dlp` `is_live` and `videoViewCountRenderer.isLive` rather than `live_chat_token.is_some()`.
+- [ ] **HLS & Livestream Quality Selector**: parse `#EXT-X-STREAM-INF` variants from `.m3u8` master playlists (or retain `m3u8` variants from `yt-dlp` / switch `libmpv` `vid` tracks) and respect `PreferredQuality` from Settings so both livestreams and `yt-dlp` HLS fallback streams expose manual resolution switching (`Auto`, `1080p`, `720p`, `480p`, `360p`) in Player Settings.
 - [ ] **Authenticated Player Client Fallback & Stream Recovery**: when unauthenticated `VISIONOS` `/player` hits `LOGIN_REQUIRED`, try authenticated Web/TV InnerTube `/player` before spawning `yt-dlp`, and auto-refresh expired `googlevideo` URLs if `HTTP 403` occurs mid-playback.
 - [ ] **Playlist Playback & Management**: "Play All" / "Shuffle Play" buttons on Playlist & Channel pages (loading full playlist into Queue), plus removing or reordering tracks inside custom YouTube playlists.
 - [ ] **Rich Live Chat & Emote Picker**: render Super Chats (`liveChatPaidMessageRenderer`), membership banners, and an inline custom channel emote picker in the Live Chat compose bar.
