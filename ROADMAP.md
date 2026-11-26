@@ -63,7 +63,7 @@ Phases 1–4 are complete (`11/11` unit tests passing, Windows release binary + 
 - [ ] **HLS & Livestream Quality Selector**: parse `#EXT-X-STREAM-INF` variants from `.m3u8` master playlists (or retain `m3u8` variants from `yt-dlp` / switch `libmpv` `vid` tracks) and respect `PreferredQuality` from Settings so both livestreams and `yt-dlp` HLS fallback streams expose manual resolution switching (`Auto`, `1080p`, `720p`, `480p`, `360p`) in Player Settings.
 - [ ] **Authenticated Player Client Fallback & Stream Recovery**: when unauthenticated `VISIONOS` `/player` hits `LOGIN_REQUIRED`, try authenticated Web/TV InnerTube `/player` before spawning `yt-dlp`, and auto-refresh expired `googlevideo` URLs if `HTTP 403` occurs mid-playback.
 - [ ] **Playlist Playback & Management**: "Play All" / "Shuffle Play" buttons on Playlist & Channel pages (loading full playlist into Queue), plus removing or reordering tracks inside custom YouTube playlists.
-- [ ] **Rich Live Chat & Emote Picker**: render Super Chats (`liveChatPaidMessageRenderer`), membership banners, and an inline custom channel emote picker in the Live Chat compose bar.
+- [ ] **Rich Live Chat, Replay & Emote Picker**: support Premiere / archived VOD Live Chat Replay (`live_chat/get_live_chat_replay` syncing `playerOffsetMs` and unwrapping `replayChatItemAction`), render Super Chats (`liveChatPaidMessageRenderer`), membership banners, and add an inline custom channel emote picker in the Live Chat compose bar.
 - [ ] **Comment Actions & Badges**: thumb-up (`comment/perform_comment_action`) on comments/replies, plus pinned comment & creator heart badges.
 
 ### Phase 6 — Desktop Experience, Notifications & Settings
