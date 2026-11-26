@@ -182,6 +182,7 @@ pub struct PlaybackState {
     pub paused: bool,
     pub buffering: bool,
     pub eof: bool,
+    pub idle: bool,
     pub video_w: i64,
     pub video_h: i64,
     pub fps: f64,
@@ -491,6 +492,7 @@ impl MpvPlayer {
         st.paused = self.get_flag("pause").unwrap_or(false);
         st.buffering = self.get_flag("paused-for-cache").unwrap_or(false);
         st.eof = self.get_flag("eof-reached").unwrap_or(false);
+        st.idle = self.get_flag("idle-active").unwrap_or(false);
         st.video_w = self.get_double("video-params/w").unwrap_or(0.0) as i64;
         st.video_h = self.get_double("video-params/h").unwrap_or(0.0) as i64;
         st.fps = self

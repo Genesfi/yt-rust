@@ -224,6 +224,7 @@ pub struct YtApp {
     pub(super) active_downloads: Vec<ActiveDownload>,
 
     pub(super) playback: PlaybackState,
+    pub(super) watch_started_at: Option<Instant>,
     pub(super) seeking_pos: Option<f64>,
     pub(super) volume: f64,
     pub(super) muted: bool,
@@ -495,6 +496,7 @@ impl YtApp {
             avatar_requested: HashSet::new(),
             right_tab: RightTab::UpNext,
             playback: PlaybackState::default(),
+            watch_started_at: None,
             seeking_pos: None,
             volume,
             muted: false,
@@ -781,6 +783,7 @@ impl YtApp {
         self.watch_scrolled_into_pip = false;
         self.scroll_watch_to_top = true;
         self.watch_loading = true;
+        self.watch_started_at = None;
         self.last_error = None;
         self.sponsor_segments.clear();
         self.last_skipped_end = -1.0;
@@ -1522,6 +1525,7 @@ impl YtApp {
                         );
                         mpv.set_speed(self.speed);
                     }
+                    self.watch_started_at = Some(Instant::now());
                     if let Some(s) = start_at {
                         self.toast(format!("Resumed at {}", format_duration(s)));
                     }
@@ -2115,6 +2119,22 @@ impl YtApp {
         let was_eof = self.playback.eof;
         if let Some(mpv) = &self.mpv {
             self.playback = mpv.poll_state();
+        }
+        if !self.watch_loading
+            && self.playback.idle
+            && !self.playback.eof
+            && self.playback.duration <= 0.0
+            && self.playback.video_h == 0
+            && self.last_error.is_none()
+            && self
+                .watch_started_at
+                .is_some_and(|t| t.elapsed() >= Duration::from_secs(2))
+        {
+            self.watch_started_at = None;
+            self.last_error = Some(
+                "Stream stopped before playback started (HTTP 403 or network error). Try switching quality or reopening."
+                    .to_owned(),
+            );
         }
         if !self.watch_loading {
             self.backend

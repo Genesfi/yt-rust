@@ -99,6 +99,7 @@ pub struct YtdlpStreams {
     pub video_content_length: u64,
     pub audio_url: Option<String>,
     pub audio_content_length: u64,
+    pub hls_url: Option<String>,
     pub video_formats: Vec<VideoFormat>,
     pub audio_tracks: Vec<AudioTrack>,
     pub user_agent: Option<String>,
@@ -300,6 +301,31 @@ async fn fetch_release_asset(
     Ok(())
 }
 
+const DEFAULT_STREAM_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
+
+async fn probe_stream_ok(http: &reqwest::Client, url: &str, ua: Option<&str>) -> bool {
+    if url.contains(".m3u8") || url.contains("/manifest/hls") {
+        return true;
+    }
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let probe_url = if url.contains("range=") {
+        url.to_owned()
+    } else {
+        format!("{url}{sep}range=0-1023")
+    };
+    let ua = ua.filter(|s| !s.trim().is_empty()).unwrap_or(DEFAULT_STREAM_UA);
+    match http
+        .get(&probe_url)
+        .header("User-Agent", ua)
+        .timeout(Duration::from_secs(6))
+        .send()
+        .await
+    {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => true,
+    }
+}
+
 /// Fallback stream resolution using yt-dlp when InnerTube direct URLs fail.
 pub async fn resolve_video(
     http: &reqwest::Client,
@@ -313,20 +339,50 @@ pub async fn resolve_video(
         resolve_js_runtime(http, data_dir),
     );
     let bin = bin_res?;
-    let data_dir = data_dir.to_owned();
-    let cookie = cookie.filter(|c| !c.trim().is_empty()).map(str::to_owned);
+    let data_dir_owned = data_dir.to_owned();
+    let cookie_owned = cookie.filter(|c| !c.trim().is_empty()).map(str::to_owned);
     let vid = video_id.to_owned();
-    tokio::task::spawn_blocking(move || {
+    let rt_owned = runtime.clone();
+    let bin_first = bin.clone();
+    let streams = tokio::task::spawn_blocking(move || {
         run_ytdlp(
-            &bin,
-            runtime.as_deref(),
-            &data_dir,
-            cookie.as_deref(),
+            &bin_first,
+            rt_owned.as_deref(),
+            &data_dir_owned,
+            cookie_owned.as_deref(),
             &vid,
             max_height,
+            false,
         )
     })
-    .await?
+    .await??;
+
+    // YouTube c=WEB URLs resolved with cookies can return HTTP 403 on GVS without a browser PO-token.
+    // Probe the first 1 KB; if 403, re-resolve using web_safari/tv/android_vr HLS/non-PO-token clients.
+    if !probe_stream_ok(http, &streams.video_url, streams.user_agent.as_deref()).await {
+        log::warn!(
+            "yt-dlp primary stream for {video_id} returned 403 on preflight; falling back to web_safari/tv clients"
+        );
+        let data_dir_retry = data_dir.to_owned();
+        let cookie_retry = cookie.filter(|c| !c.trim().is_empty()).map(str::to_owned);
+        let vid_retry = video_id.to_owned();
+        if let Ok(Ok(alt)) = tokio::task::spawn_blocking(move || {
+            run_ytdlp(
+                &bin,
+                runtime.as_deref(),
+                &data_dir_retry,
+                cookie_retry.as_deref(),
+                &vid_retry,
+                max_height,
+                true,
+            )
+        })
+        .await
+        {
+            return Ok(alt);
+        }
+    }
+    Ok(streams)
 }
 
 fn apply_js_runtime(cmd: &mut Command, runtime: Option<&str>) {
@@ -370,6 +426,7 @@ fn run_ytdlp(
     cookie: Option<&str>,
     video_id: &str,
     max_height: u32,
+    prefer_alt_clients: bool,
 ) -> anyhow::Result<YtdlpStreams> {
     let _jar = cookie
         .map(|c| TempCookieJar::create(data_dir, c))
@@ -378,20 +435,31 @@ fn run_ytdlp(
     let selector = format!(
         "bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best"
     );
-    let mut out = invoke_ytdlp_json(bin, runtime, jar_path, video_id, &selector, &[])?;
-    if !out.status.success() {
+    let hls_sel = format!(
+        "bestvideo[height<={max_height}][protocol^=m3u8]+bestaudio/best[height<={max_height}][protocol^=m3u8]/bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best"
+    );
+    let mut out = if prefer_alt_clients {
+        invoke_ytdlp_json(
+            bin,
+            runtime,
+            jar_path,
+            video_id,
+            &hls_sel,
+            &["--extractor-args", "youtube:player_client=web_safari,tv,android_vr"],
+        )?
+    } else {
+        invoke_ytdlp_json(bin, runtime, jar_path, video_id, &selector, &[])?
+    };
+    if !out.status.success() && !prefer_alt_clients {
         let err = String::from_utf8_lossy(&out.stderr);
         if err.contains("Requested format is not available") {
-            let hls_sel = format!(
-                "bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best[protocol^=m3u8]/best"
-            );
             out = invoke_ytdlp_json(
                 bin,
                 runtime,
                 jar_path,
                 video_id,
                 &hls_sel,
-                &["--extractor-args", "youtube:player_client=web_safari,web"],
+                &["--extractor-args", "youtube:player_client=web_safari,tv,android_vr"],
             )?;
         }
     }
@@ -451,16 +519,23 @@ fn parse_ytdlp_streams(v: &Value) -> anyhow::Result<YtdlpStreams> {
 
     let mut video_formats = Vec::new();
     let mut audio_cands: Vec<(bool, u64, AudioTrack)> = Vec::new();
+    let mut best_hls_url: Option<String> = v["manifest_url"].as_str().map(str::to_owned);
 
     if let Some(formats) = v["formats"].as_array() {
         for f in formats {
             let protocol = f["protocol"].as_str().unwrap_or_default();
-            if protocol != "https" && protocol != "http" {
-                continue;
-            }
             let Some(url) = f["url"].as_str() else {
                 continue;
             };
+            if protocol.contains("m3u8") {
+                if f["vcodec"].as_str().is_some_and(|c| c != "none") {
+                    best_hls_url = Some(url.to_owned());
+                }
+                continue;
+            }
+            if protocol != "https" && protocol != "http" {
+                continue;
+            }
             let vcodec = f["vcodec"].as_str().unwrap_or("none");
             let acodec = f["acodec"].as_str().unwrap_or("none");
             let content_length = f["filesize"]
@@ -594,6 +669,7 @@ fn parse_ytdlp_streams(v: &Value) -> anyhow::Result<YtdlpStreams> {
         .unwrap_or(fallback_alen);
     let video_url = fallback_video_url
         .or_else(|| deduped_v.first().map(|f| f.url.clone()))
+        .or_else(|| best_hls_url.clone())
         .ok_or_else(|| anyhow::anyhow!("yt-dlp returned no video URL"))?;
     let user_agent = v["requested_formats"]
         .as_array()
@@ -613,6 +689,7 @@ fn parse_ytdlp_streams(v: &Value) -> anyhow::Result<YtdlpStreams> {
         video_content_length: fallback_vlen,
         audio_url,
         audio_content_length,
+        hls_url: best_hls_url,
         video_formats: deduped_v,
         audio_tracks,
         user_agent,

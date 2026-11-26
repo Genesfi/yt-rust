@@ -1731,6 +1731,9 @@ fn apply_ytdlp_streams(
         data.audio_url = yt.audio_url.clone();
         data.audio_content_length = yt.audio_content_length;
     }
+    if yt.hls_url.is_some() {
+        data.hls_url = yt.hls_url.clone();
+    }
     let fmt_idx = pick_format_index(&data.video_formats, max_height);
     let (v_url, a_url) = if let Some(idx) = fmt_idx {
         let fmt = &data.video_formats[idx];
@@ -1743,6 +1746,12 @@ fn apply_ytdlp_streams(
                 .map(|u| wrap_yt(u, data.audio_content_length))
         };
         (v, a)
+    } else if yt.video_url.contains(".m3u8") || yt.video_url.contains("/manifest/hls") {
+        let a = yt
+            .audio_url
+            .as_deref()
+            .map(|u| wrap_yt(u, yt.audio_content_length));
+        (yt.video_url, a)
     } else {
         (
             wrap_yt(&yt.video_url, yt.video_content_length),

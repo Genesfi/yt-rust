@@ -334,9 +334,11 @@ impl YtApp {
             0.18,
         );
 
-        // Buffering spinner
-        let is_initial_wait =
-            self.watch.is_some() && self.playback.video_h == 0 && !self.playback.paused;
+        // Buffering spinner (stop showing once mpv enters idle/aborted state)
+        let is_initial_wait = self.watch.is_some()
+            && self.playback.video_h == 0
+            && !self.playback.paused
+            && !self.playback.idle;
         if self.watch_loading || self.playback.buffering || is_initial_wait {
             ctx.request_repaint();
             let label = if self.watch_loading {
