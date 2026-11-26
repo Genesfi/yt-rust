@@ -6,7 +6,7 @@ use egui::{
 };
 
 use crate::backend::Request;
-use crate::model::{SponsorCategory, VideoItem, WatchData};
+use crate::model::{LiveChatRun, SponsorCategory, VideoItem, WatchData};
 use crate::theme::{self, icon};
 
 use super::cards::{
@@ -19,6 +19,12 @@ impl YtApp {
         if self.fullscreen {
             let avail = ui.available_size();
             self.draw_video_surface(ui, ctx, avail, true);
+            return;
+        }
+
+        if self.shorts_mode {
+            self.watch_scrolled_into_pip = false;
+            self.draw_shorts_player(ui, ctx);
             return;
         }
 
@@ -38,9 +44,11 @@ impl YtApp {
                             self.scroll_watch_to_top = false;
                             self.watch_scrolled_into_pip = false;
                         }
+                        let mut last_video_h = 360.0_f32;
                         let scroll_out = sa.show(ui, |ui| {
                             let video_h =
                                 (left_w * 9.0 / 16.0).min(ctx.content_rect().height() * 0.74);
+                            last_video_h = video_h;
                             if self.watch_scrolled_into_pip && self.watch.is_some() {
                                 if draw_pip_dock_placeholder(ui, Vec2::new(left_w, video_h)) {
                                     self.watch_scrolled_into_pip = false;
@@ -53,9 +61,17 @@ impl YtApp {
                             self.draw_watch_metadata(ui);
                         });
                         let sy = scroll_out.state.clamped_offset().y;
-                        if !self.watch_scrolled_into_pip && sy > 28.0 && self.watch.is_some() {
+                        let max_scroll =
+                            (scroll_out.content_size.y - scroll_out.inner_rect.height()).max(0.0);
+                        let enter_sy = (last_video_h * 0.65).max(160.0);
+                        let exit_sy = (last_video_h * 0.40).max(80.0);
+                        if !self.watch_scrolled_into_pip
+                            && self.watch.is_some()
+                            && max_scroll > (last_video_h * 0.55).max(140.0)
+                            && sy > enter_sy
+                        {
                             self.watch_scrolled_into_pip = true;
-                        } else if self.watch_scrolled_into_pip && sy <= 12.0 {
+                        } else if self.watch_scrolled_into_pip && sy <= exit_sy {
                             self.watch_scrolled_into_pip = false;
                         }
                     },
@@ -76,6 +92,7 @@ impl YtApp {
                 self.scroll_watch_to_top = false;
                 self.watch_scrolled_into_pip = false;
             }
+            let mut last_video_h = 360.0_f32;
             let scroll_out = sa.show(ui, |ui| {
                 let w = ui.available_width();
                 let video_h = if self.theater_mode {
@@ -83,6 +100,7 @@ impl YtApp {
                 } else {
                     (w * 9.0 / 16.0).min(580.0)
                 };
+                last_video_h = video_h;
                 if self.watch_scrolled_into_pip && self.watch.is_some() {
                     if draw_pip_dock_placeholder(ui, Vec2::new(w, video_h)) {
                         self.watch_scrolled_into_pip = false;
@@ -97,10 +115,126 @@ impl YtApp {
                 self.draw_related_panel(ui, ctx);
             });
             let sy = scroll_out.state.clamped_offset().y;
-            if !self.watch_scrolled_into_pip && sy > 28.0 && self.watch.is_some() {
+            let max_scroll =
+                (scroll_out.content_size.y - scroll_out.inner_rect.height()).max(0.0);
+            let enter_sy = (last_video_h * 0.65).max(160.0);
+            let exit_sy = (last_video_h * 0.40).max(80.0);
+            if !self.watch_scrolled_into_pip
+                && self.watch.is_some()
+                && max_scroll > (last_video_h * 0.55).max(140.0)
+                && sy > enter_sy
+            {
                 self.watch_scrolled_into_pip = true;
-            } else if self.watch_scrolled_into_pip && sy <= 12.0 {
+            } else if self.watch_scrolled_into_pip && sy <= exit_sy {
                 self.watch_scrolled_into_pip = false;
+            }
+        }
+    }
+
+    fn draw_shorts_player(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let sh = (ui.available_height() - 28.0).clamp(360.0, 820.0);
+        let sw = (sh * 9.0 / 16.0).min((ui.available_width() - 180.0).max(240.0));
+        let mut step_delta: isize = 0;
+
+        ui.vertical_centered(|ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(format!("{}  Standard Player", icon::CHEVRON_LEFT))
+                                .font(theme::medium(12.5))
+                                .color(theme::TEXT),
+                        )
+                        .fill(theme::CHIP)
+                        .corner_radius(16),
+                    )
+                    .clicked()
+                {
+                    self.shorts_mode = false;
+                }
+                ui.add_space(8.0);
+                if let Some(w) = &self.watch {
+                    ui.label(
+                        RichText::new(format!("{} · {}", w.title, w.channel))
+                            .font(theme::medium(13.0))
+                            .color(theme::TEXT_DIM),
+                    );
+                }
+            });
+            ui.add_space(8.0);
+
+            let total_row_w = sw + 116.0;
+            let side_pad = ((ui.available_width() - total_row_w) * 0.5).max(0.0);
+            ui.horizontal(|ui| {
+                ui.add_space(side_pad);
+                self.draw_video_surface(ui, ctx, Vec2::new(sw, sh), false);
+                ui.add_space(14.0);
+                ui.vertical(|ui| {
+                    ui.add_space((sh * 0.25).max(20.0));
+                    if self.shorts_idx > 0
+                        && icon_circle_button(ui, icon::CHEVRON_UP, 18.0, "Previous Short")
+                    {
+                        step_delta = -1;
+                    }
+                    ui.add_space(8.0);
+                    let can_next = (!self.shorts_queue.is_empty()
+                        && self.shorts_idx + 1 < self.shorts_queue.len())
+                        || self
+                            .watch
+                            .as_ref()
+                            .is_some_and(|w| !w.related.is_empty());
+                    if can_next && icon_circle_button(ui, icon::CHEVRON_DOWN, 18.0, "Next Short") {
+                        step_delta = 1;
+                    }
+                    if let Some(w) = self.watch.clone() {
+                        ui.add_space(16.0);
+                        if icon_circle_button(
+                            ui,
+                            icon::HEART,
+                            18.0,
+                            if w.is_liked { "Unlike" } else { "Like" },
+                        ) {
+                            let _ = self.backend.tx.send(Request::SetLike {
+                                video_id: w.id.clone(),
+                                like: !w.is_liked,
+                            });
+                        }
+                        if icon_circle_button(ui, icon::THUMBS_DOWN, 18.0, "Dislike") {
+                            let _ = self.backend.tx.send(Request::SetDislike {
+                                video_id: w.id.clone(),
+                                dislike: !w.is_disliked,
+                            });
+                        }
+                        if icon_circle_button(ui, icon::DOWNLOAD, 18.0, "Download MP4") {
+                            self.start_download(w.id.clone(), w.title.clone(), false);
+                        }
+                        if icon_circle_button(ui, icon::COPY, 17.0, "Copy Short URL") {
+                            ctx.copy_text(format!("https://www.youtube.com/shorts/{}", w.id));
+                            self.toast("Copied Shorts URL");
+                        }
+                    }
+                });
+            });
+        });
+
+        if step_delta < 0 && self.shorts_idx > 0 {
+            let next_i = self.shorts_idx - 1;
+            if let Some(item) = self.shorts_queue.get(next_i).cloned() {
+                self.shorts_idx = next_i;
+                let list = self.shorts_queue.clone();
+                self.open_short(item, list);
+            }
+        } else if step_delta > 0 {
+            if !self.shorts_queue.is_empty() && self.shorts_idx + 1 < self.shorts_queue.len() {
+                let next_i = self.shorts_idx + 1;
+                if let Some(item) = self.shorts_queue.get(next_i).cloned() {
+                    self.shorts_idx = next_i;
+                    let list = self.shorts_queue.clone();
+                    self.open_short(item, list);
+                }
+            } else if let Some(next) = self.watch.as_ref().and_then(|w| w.related.first()).cloned()
+            {
+                self.open_short(next, Vec::new());
             }
         }
     }
@@ -1652,6 +1786,11 @@ impl YtApp {
                 );
             }
         } else {
+            let mut open_reply_for: Option<(String, String)> = None;
+            let mut submit_reply: Option<(String, String, String, Option<String>)> = None;
+            let mut cancel_reply = false;
+            let active_reply_id = self.comment_reply_target_id.clone();
+
             for c in &self.comments {
                 ui.horizontal_top(|ui| {
                     draw_avatar(ui, c.avatar_url.as_deref(), &c.author, 34.0);
@@ -1672,12 +1811,85 @@ impl YtApp {
                                 .font(theme::regular(13.0))
                                 .color(theme::TEXT),
                         );
-                        if !c.likes.is_empty() {
-                            ui.label(
-                                RichText::new(format!("{} likes", c.likes))
-                                    .font(theme::regular(11.5))
-                                    .color(theme::TEXT_DIM),
-                            );
+                        ui.horizontal(|ui| {
+                            if !c.likes.is_empty() {
+                                ui.label(
+                                    RichText::new(format!("{} likes", c.likes))
+                                        .font(theme::regular(11.5))
+                                        .color(theme::TEXT_DIM),
+                                );
+                            }
+                            if self.signed_in && c.reply_params.is_some() {
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Reply")
+                                                .font(theme::semibold(11.5))
+                                                .color(theme::TEXT_DIM),
+                                        )
+                                        .fill(Color32::TRANSPARENT),
+                                    )
+                                    .clicked()
+                                {
+                                    open_reply_for = Some((c.id.clone(), c.author.clone()));
+                                }
+                            }
+                        });
+                        if active_reply_id.as_deref() == Some(c.id.as_str()) {
+                            if let Some(rp) = c.reply_params.clone() {
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    let rw = (ui.available_width() - 140.0).max(130.0);
+                                    let te = ui.add_sized(
+                                        Vec2::new(rw, 28.0),
+                                        egui::TextEdit::singleline(&mut self.comment_reply_draft)
+                                            .hint_text(format!(
+                                                "Replying to {}...",
+                                                self.comment_reply_target_author
+                                            )),
+                                    );
+                                    let send_clicked = ui
+                                        .add_sized(
+                                            Vec2::new(60.0, 28.0),
+                                            egui::Button::new(
+                                                RichText::new("Reply")
+                                                    .font(theme::semibold(12.0))
+                                                    .color(Color32::from_rgb(15, 15, 15)),
+                                            )
+                                            .fill(theme::YT_BLUE)
+                                            .corner_radius(14),
+                                        )
+                                        .clicked()
+                                        || (te.lost_focus()
+                                            && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                                    if send_clicked {
+                                        let rtxt = self.comment_reply_draft.trim().to_owned();
+                                        if !rtxt.is_empty() {
+                                            submit_reply = Some((
+                                                c.id.clone(),
+                                                rtxt,
+                                                rp,
+                                                c.replies_token.clone(),
+                                            ));
+                                        }
+                                    }
+                                    if ui
+                                        .add_sized(
+                                            Vec2::new(60.0, 28.0),
+                                            egui::Button::new(
+                                                RichText::new("Cancel")
+                                                    .font(theme::medium(12.0))
+                                                    .color(theme::TEXT_DIM),
+                                            )
+                                            .fill(theme::CHIP)
+                                            .corner_radius(14),
+                                        )
+                                        .clicked()
+                                    {
+                                        cancel_reply = true;
+                                    }
+                                });
+                            }
                         }
                         if !c.replies.is_empty() {
                             ui.add_space(6.0);
@@ -1735,6 +1947,26 @@ impl YtApp {
                     });
                 });
                 ui.add_space(10.0);
+            }
+            if let Some((cid, author)) = open_reply_for {
+                self.comment_reply_target_id = Some(cid);
+                self.comment_reply_target_author = author;
+                self.comment_reply_draft.clear();
+            } else if cancel_reply {
+                self.comment_reply_target_id = None;
+                self.comment_reply_target_author.clear();
+                self.comment_reply_draft.clear();
+            } else if let Some((cid, rtxt, rp, rtok)) = submit_reply {
+                let _ = self.backend.tx.send(Request::PostCommentReply {
+                    video_id: w.id.clone(),
+                    comment_id: cid,
+                    text: rtxt,
+                    params: rp,
+                    replies_continuation: rtok,
+                });
+                self.comment_reply_target_id = None;
+                self.comment_reply_target_author.clear();
+                self.comment_reply_draft.clear();
             }
             if let Some((cid, rtok)) = expand_replies {
                 if let Some(c) = self.comments.iter_mut().find(|c| c.id == cid) {
@@ -2603,26 +2835,64 @@ impl YtApp {
                                 );
                             }
                             for m in &self.live_chat {
-                                ui.horizontal_wrapped(|ui| {
-                                    let author_col = if m.is_owner {
-                                        Color32::from_rgb(255, 214, 0)
-                                    } else if m.is_mod {
-                                        theme::YT_BLUE
-                                    } else {
-                                        theme::TEXT_DIM
-                                    };
-                                    ui.label(
-                                        RichText::new(format!("{}:", m.author))
-                                            .font(theme::semibold(12.0))
-                                            .color(author_col),
-                                    );
-                                    ui.label(
-                                        RichText::new(&m.text)
-                                            .font(theme::regular(12.5))
-                                            .color(theme::TEXT),
-                                    );
+                                ui.horizontal_top(|ui| {
+                                    draw_avatar(ui, m.avatar_url.as_deref(), &m.author, 20.0);
+                                    ui.add_space(4.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 3.0;
+                                        let author_col = if m.is_owner {
+                                            Color32::from_rgb(255, 214, 0)
+                                        } else if m.is_mod {
+                                            theme::YT_BLUE
+                                        } else {
+                                            theme::TEXT_DIM
+                                        };
+                                        ui.label(
+                                            RichText::new(format!("{}:", m.author))
+                                                .font(theme::semibold(12.0))
+                                                .color(author_col),
+                                        );
+                                        if m.runs.is_empty() {
+                                            ui.label(
+                                                RichText::new(&m.text)
+                                                    .font(theme::regular(12.5))
+                                                    .color(theme::TEXT),
+                                            );
+                                        } else {
+                                            for run in &m.runs {
+                                                match run {
+                                                    LiveChatRun::Text(t) => {
+                                                        if !t.is_empty() {
+                                                            ui.label(
+                                                                RichText::new(t)
+                                                                    .font(theme::regular(12.5))
+                                                                    .color(theme::TEXT),
+                                                            );
+                                                        }
+                                                    }
+                                                    LiveChatRun::Emoji { alt, url } => {
+                                                        if let Some(u) = url {
+                                                            let img = egui::Image::new(u)
+                                                                .show_loading_spinner(false)
+                                                                .fit_to_exact_size(vec2(17.0, 17.0));
+                                                            let eresp = ui.add(img);
+                                                            if !alt.is_empty() {
+                                                                eresp.on_hover_text(alt);
+                                                            }
+                                                        } else if !alt.is_empty() {
+                                                            ui.label(
+                                                                RichText::new(alt)
+                                                                    .font(theme::regular(12.5))
+                                                                    .color(theme::TEXT),
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    });
                                 });
-                                ui.add_space(4.0);
+                                ui.add_space(5.0);
                             }
                         });
                     if can_send {

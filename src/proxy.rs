@@ -13,6 +13,7 @@ const WORKERS: usize = 4;
 const PREFETCH_AHEAD: usize = 14;
 const KEEP_BEHIND: usize = 2;
 const VISIONOS_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+const WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 
 #[derive(Clone)]
 pub struct StreamProxy {
@@ -29,6 +30,7 @@ struct ProxyState {
 
 struct StreamSession {
     url: String,
+    user_agent: String,
     size: u64,
     num_blocks: usize,
     blocks: Mutex<HashMap<usize, Vec<u8>>>,
@@ -41,10 +43,11 @@ struct StreamSession {
 }
 
 impl StreamSession {
-    fn new(url: String, size: u64) -> Self {
+    fn new(url: String, user_agent: String, size: u64) -> Self {
         let num_blocks = block_count(size);
         Self {
             url,
+            user_agent,
             size,
             num_blocks,
             blocks: Mutex::new(HashMap::new()),
@@ -166,10 +169,19 @@ impl StreamProxy {
     /// Registers a googlevideo progressive/adaptive URL for parallel `&range=` prefetching.
     /// Returns the original URL unchanged if `size == 0` or if it's an HLS playlist.
     pub fn register(&self, url: &str, size: u64) -> String {
-        if size == 0 || url.contains(".m3u8") {
+        self.register_with_ua(url, size, VISIONOS_UA)
+    }
+
+    pub fn register_with_ua(&self, url: &str, size: u64, user_agent: &str) -> String {
+        if size == 0 || url.contains(".m3u8") || url.contains("range=") {
             return url.to_owned();
         }
-        let session = Arc::new(StreamSession::new(url.to_owned(), size));
+        let ua = if user_agent.trim().is_empty() {
+            WEB_UA.to_owned()
+        } else {
+            user_agent.to_owned()
+        };
+        let session = Arc::new(StreamSession::new(url.to_owned(), ua, size));
         let id = {
             let mut st = self.state.lock().unwrap();
             let id = st.next_id;
@@ -215,6 +227,7 @@ async fn worker_loop(http: reqwest::Client, sess: Arc<StreamSession>) {
         };
 
         let mut ok_data = None;
+        let mut try_alt_ua = false;
         for attempt in 0..4 {
             if sess.cancelled.load(Ordering::Acquire) {
                 sess.release_flight(idx);
@@ -222,9 +235,18 @@ async fn worker_loop(http: reqwest::Client, sess: Arc<StreamSession>) {
             }
             let sep = if sess.url.contains('?') { '&' } else { '?' };
             let ranged_url = format!("{}{sep}range={a}-{b}", sess.url);
+            let ua = if try_alt_ua {
+                if sess.user_agent == VISIONOS_UA {
+                    WEB_UA
+                } else {
+                    VISIONOS_UA
+                }
+            } else {
+                sess.user_agent.as_str()
+            };
             let res = http
                 .get(&ranged_url)
-                .header("User-Agent", VISIONOS_UA)
+                .header("User-Agent", ua)
                 .timeout(Duration::from_secs(12))
                 .send()
                 .await;
@@ -240,6 +262,10 @@ async fn worker_loop(http: reqwest::Client, sess: Arc<StreamSession>) {
                 }
                 Ok(resp) if resp.status().as_u16() == 403 => {
                     log::warn!("proxy chunk {idx} HTTP 403");
+                    if !try_alt_ua {
+                        try_alt_ua = true;
+                        continue;
+                    }
                     break;
                 }
                 _ => {}
@@ -319,21 +345,6 @@ async fn handle_conn(
         return Ok(());
     }
 
-    let len = end - start + 1;
-    let headers = if is_partial {
-        format!(
-            "HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
-        )
-    } else {
-        format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
-        )
-    };
-    write_half.write_all(headers.as_bytes()).await?;
-    if method.eq_ignore_ascii_case("HEAD") {
-        return Ok(());
-    }
-
     struct ReaderGuard(Arc<StreamSession>);
     impl Drop for ReaderGuard {
         fn drop(&mut self) {
@@ -343,6 +354,22 @@ async fn handle_conn(
     sess.active_readers.fetch_add(1, Ordering::Relaxed);
     let _guard = ReaderGuard(sess.clone());
 
+    if method.eq_ignore_ascii_case("HEAD") {
+        let len = end - start + 1;
+        let headers = if is_partial {
+            format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+            )
+        } else {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+            )
+        };
+        write_half.write_all(headers.as_bytes()).await?;
+        return Ok(());
+    }
+
+    let mut headers_sent = false;
     let mut pos = start;
     while pos <= end {
         if sess.cancelled.load(Ordering::Acquire) {
@@ -355,6 +382,13 @@ async fn handle_conn(
         let (b_start, _) = block_range(idx, total);
         let chunk = loop {
             if sess.cancelled.load(Ordering::Acquire) || sess.failed.load(Ordering::Acquire) {
+                if !headers_sent {
+                    let redir = format!(
+                        "HTTP/1.1 307 Temporary Redirect\r\nLocation: {}\r\nConnection: close\r\n\r\n",
+                        sess.url
+                    );
+                    let _ = write_half.write_all(redir.as_bytes()).await;
+                }
                 return Ok(());
             }
             let notified = sess.notify.notified();
@@ -366,6 +400,23 @@ async fn handle_conn(
             }
             notified.await;
         };
+
+        if !headers_sent {
+            let len = end - start + 1;
+            let headers = if is_partial {
+                format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+                )
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+                )
+            };
+            if write_half.write_all(headers.as_bytes()).await.is_err() {
+                break;
+            }
+            headers_sent = true;
+        }
 
         let offset = (pos - b_start) as usize;
         if offset >= chunk.len() {

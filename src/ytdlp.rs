@@ -101,6 +101,7 @@ pub struct YtdlpStreams {
     pub audio_content_length: u64,
     pub video_formats: Vec<VideoFormat>,
     pub audio_tracks: Vec<AudioTrack>,
+    pub user_agent: Option<String>,
     pub title: Option<String>,
     pub channel: Option<String>,
     pub channel_id: Option<String>,
@@ -594,6 +595,18 @@ fn parse_ytdlp_streams(v: &Value) -> anyhow::Result<YtdlpStreams> {
     let video_url = fallback_video_url
         .or_else(|| deduped_v.first().map(|f| f.url.clone()))
         .ok_or_else(|| anyhow::anyhow!("yt-dlp returned no video URL"))?;
+    let user_agent = v["requested_formats"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|f| f["http_headers"]["User-Agent"].as_str())
+        .or_else(|| v["http_headers"]["User-Agent"].as_str())
+        .or_else(|| {
+            v["formats"].as_array().and_then(|a| {
+                a.iter()
+                    .find_map(|f| f["http_headers"]["User-Agent"].as_str())
+            })
+        })
+        .map(str::to_owned);
 
     Ok(YtdlpStreams {
         video_url,
@@ -602,6 +615,7 @@ fn parse_ytdlp_streams(v: &Value) -> anyhow::Result<YtdlpStreams> {
         audio_content_length,
         video_formats: deduped_v,
         audio_tracks,
+        user_agent,
         title,
         channel,
         channel_id,

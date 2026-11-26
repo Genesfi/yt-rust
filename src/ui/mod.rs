@@ -169,6 +169,8 @@ pub struct YtApp {
     pub(super) channel_items: Vec<VideoItem>,
     pub(super) channel_continuation: Option<String>,
     pub(super) channel_loading: bool,
+    pub(super) channel_search_input: String,
+    pub(super) channel_search_active: String,
 
     pub(super) search_items: Vec<VideoItem>,
     pub(super) search_continuation: Option<String>,
@@ -204,6 +206,9 @@ pub struct YtApp {
     pub(super) selected_comment_sort: usize,
     pub(super) comment_create_params: Option<String>,
     pub(super) comment_draft: String,
+    pub(super) comment_reply_target_id: Option<String>,
+    pub(super) comment_reply_target_author: String,
+    pub(super) comment_reply_draft: String,
     pub(super) show_chapters: bool,
 
     pub(super) live_chat: Vec<LiveChatMessage>,
@@ -212,6 +217,9 @@ pub struct YtApp {
     pub(super) live_chat_send_params: Option<String>,
     pub(super) live_chat_draft: String,
     pub(super) right_tab: RightTab,
+    pub(super) shorts_mode: bool,
+    pub(super) shorts_queue: Vec<VideoItem>,
+    pub(super) shorts_idx: usize,
     pub(super) history_feedback_tokens: HashMap<String, String>,
     pub(super) active_downloads: Vec<ActiveDownload>,
 
@@ -436,6 +444,8 @@ impl YtApp {
             channel_items: Vec::new(),
             channel_continuation: None,
             channel_loading: false,
+            channel_search_input: String::new(),
+            channel_search_active: String::new(),
             search_items: Vec::new(),
             search_continuation: None,
             search_loading: false,
@@ -467,12 +477,18 @@ impl YtApp {
             selected_comment_sort: 0,
             comment_create_params: None,
             comment_draft: String::new(),
+            comment_reply_target_id: None,
+            comment_reply_target_author: String::new(),
+            comment_reply_draft: String::new(),
             show_chapters: false,
             live_chat: Vec::new(),
             live_chat_token: None,
             live_chat_next_poll: None,
             live_chat_send_params: None,
             live_chat_draft: String::new(),
+            shorts_mode: false,
+            shorts_queue: Vec::new(),
+            shorts_idx: 0,
             history_feedback_tokens: HashMap::new(),
             active_downloads: Vec::new(),
             channel_avatars: HashMap::new(),
@@ -632,6 +648,8 @@ impl YtApp {
         self.channel_items.clear();
         self.channel_continuation = None;
         self.channel_loading = true;
+        self.channel_search_input.clear();
+        self.channel_search_active.clear();
         self.last_error = None;
         let _ = self.backend.tx.send(Request::LoadChannel {
             channel_id,
@@ -667,6 +685,13 @@ impl YtApp {
         self.open_video_id(&item.id);
     }
 
+    pub(super) fn open_short(&mut self, item: VideoItem, list: Vec<VideoItem>) {
+        self.shorts_idx = list.iter().position(|x| x.id == item.id).unwrap_or(0);
+        self.shorts_queue = list;
+        self.open_video(item);
+        self.shorts_mode = true;
+    }
+
     pub(super) fn open_local_file(&mut self, path: &std::path::Path) {
         if self.page != Page::Watch {
             self.prev_page = self.page;
@@ -699,6 +724,10 @@ impl YtApp {
         self.selected_comment_sort = 0;
         self.comment_create_params = None;
         self.comment_draft.clear();
+        self.comment_reply_target_id = None;
+        self.comment_reply_target_author.clear();
+        self.comment_reply_draft.clear();
+        self.shorts_mode = false;
         self.show_chapters = false;
         self.live_chat.clear();
         self.live_chat_token = None;
@@ -767,6 +796,10 @@ impl YtApp {
         self.selected_comment_sort = 0;
         self.comment_create_params = None;
         self.comment_draft.clear();
+        self.comment_reply_target_id = None;
+        self.comment_reply_target_author.clear();
+        self.comment_reply_draft.clear();
+        self.shorts_mode = false;
         self.show_chapters = false;
         self.live_chat.clear();
         self.live_chat_token = None;
@@ -796,7 +829,11 @@ impl YtApp {
             return;
         }
         if let Some(vid) = innertube::extract_video_id(&q) {
+            let is_short = q.contains("/shorts/");
             self.open_video_id(&vid);
+            if is_short {
+                self.shorts_mode = true;
+            }
             return;
         }
         self.active_query = q.clone();
@@ -1386,6 +1423,31 @@ impl YtApp {
                         self.channel_continuation = continuation;
                     }
                 }
+                Response::ChannelSearchLoaded {
+                    channel_id,
+                    query,
+                    mut items,
+                    continuation,
+                    append,
+                } => {
+                    if self.channel_id.as_deref() == Some(channel_id.as_str())
+                        && self.channel_search_active == query
+                    {
+                        self.channel_loading = false;
+                        self.ingest_resume_metadata(&mut items);
+                        self.ingest_and_request_avatars(&mut items);
+                        if append {
+                            for it in items {
+                                if !self.channel_items.iter().any(|x| x.id == it.id) {
+                                    self.channel_items.push(it);
+                                }
+                            }
+                        } else {
+                            self.channel_items = items;
+                        }
+                        self.channel_continuation = continuation;
+                    }
+                }
                 Response::SearchLoaded {
                     query,
                     mut items,
@@ -1542,6 +1604,33 @@ impl YtApp {
                 Response::CommentPosted { video_id } => {
                     if self.watch.as_ref().is_some_and(|w| w.id == video_id) {
                         self.toast("Comment posted");
+                    }
+                }
+                Response::CommentReplyPosted {
+                    video_id,
+                    comment_id,
+                    text,
+                } => {
+                    if self.watch.as_ref().is_some_and(|w| w.id == video_id) {
+                        if let Some(c) = self.comments.iter_mut().find(|c| c.id == comment_id) {
+                            c.replies.push(CommentItem {
+                                id: format!("local-reply-{}", c.replies.len()),
+                                author: self
+                                    .account_name
+                                    .clone()
+                                    .unwrap_or_else(|| "You".to_owned()),
+                                avatar_url: self.account_avatar.clone(),
+                                published: "Just now".to_owned(),
+                                likes: String::new(),
+                                text,
+                                reply_count_text: String::new(),
+                                replies_token: None,
+                                reply_params: None,
+                                replies: Vec::new(),
+                                replies_loading: false,
+                            });
+                        }
+                        self.toast("Reply posted");
                     }
                 }
                 Response::LiveChatLoaded {

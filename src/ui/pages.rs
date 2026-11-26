@@ -543,6 +543,11 @@ impl YtApp {
         } else {
             vec![
                 crate::model::ChannelTab {
+                    title: "Home".to_owned(),
+                    params: Some("EghmZWF0dXJlZPIGBAoCMgA%3D".to_owned()),
+                    selected: false,
+                },
+                crate::model::ChannelTab {
                     title: "Videos".to_owned(),
                     params: Some("EgZ2aWRlb3PyBgQKAjoA".to_owned()),
                     selected: self.channel_tab_params.is_none(),
@@ -564,13 +569,23 @@ impl YtApp {
                 },
             ]
         };
+        let active_tab_title = tabs
+            .iter()
+            .find(|t| match (&self.channel_tab_params, &t.params) {
+                (Some(cur), Some(p)) => cur == p,
+                (None, _) => t.selected,
+                _ => false,
+            })
+            .map(|t| t.title.clone())
+            .unwrap_or_default();
         ui.horizontal(|ui| {
-            for tab in tabs {
-                let is_active = match (&self.channel_tab_params, &tab.params) {
-                    (Some(cur), Some(p)) => cur == p,
-                    (None, _) => tab.selected,
-                    _ => false,
-                };
+            for tab in &tabs {
+                let is_active = self.channel_search_active.is_empty()
+                    && match (&self.channel_tab_params, &tab.params) {
+                        (Some(cur), Some(p)) => cur == p,
+                        (None, _) => tab.selected,
+                        _ => false,
+                    };
                 let resp = ui.add(
                     egui::Button::new(
                         RichText::new(&tab.title)
@@ -599,19 +614,61 @@ impl YtApp {
                 }
                 if resp.clicked() && !is_active {
                     if let Some(cid) = self.channel_id.clone() {
+                        self.channel_search_active.clear();
                         self.channel_tab_params = tab.params.clone();
                         self.channel_items.clear();
                         self.channel_continuation = None;
                         self.channel_loading = true;
                         let _ = self.backend.tx.send(Request::LoadChannel {
                             channel_id: cid,
-                            params: tab.params,
+                            params: tab.params.clone(),
                             continuation: None,
                         });
                     }
                 }
                 ui.add_space(6.0);
             }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if !self.channel_search_active.is_empty()
+                    && icon_circle_button(ui, icon::X, 13.0, "Clear channel search")
+                {
+                    self.channel_search_input.clear();
+                    self.channel_search_active.clear();
+                    if let Some(cid) = self.channel_id.clone() {
+                        self.channel_items.clear();
+                        self.channel_continuation = None;
+                        self.channel_loading = true;
+                        let _ = self.backend.tx.send(Request::LoadChannel {
+                            channel_id: cid,
+                            params: self.channel_tab_params.clone(),
+                            continuation: None,
+                        });
+                    }
+                }
+                let search_clicked = icon_circle_button(ui, icon::SEARCH, 14.0, "Search channel");
+                let te = ui.add_sized(
+                    Vec2::new(190.0_f32.min(ui.available_width().max(90.0)), 28.0),
+                    egui::TextEdit::singleline(&mut self.channel_search_input)
+                        .hint_text("Search channel..."),
+                );
+                if search_clicked || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                {
+                    let q = self.channel_search_input.trim().to_owned();
+                    if !q.is_empty() {
+                        if let Some(cid) = self.channel_id.clone() {
+                            self.channel_search_active = q.clone();
+                            self.channel_items.clear();
+                            self.channel_continuation = None;
+                            self.channel_loading = true;
+                            let _ = self.backend.tx.send(Request::SearchChannel {
+                                channel_id: cid,
+                                query: q,
+                                continuation: None,
+                            });
+                        }
+                    }
+                }
+            });
         });
         ui.separator();
         ui.add_space(8.0);
@@ -620,15 +677,38 @@ impl YtApp {
         let loading = self.channel_loading;
         let cont = self.channel_continuation.clone();
         let tab_params = self.channel_tab_params.clone();
-        if let Some(act) = draw_video_grid(ui, "", &items, loading, cont.is_some()) {
+        let search_active = self.channel_search_active.clone();
+        let heading = if search_active.is_empty() {
+            String::new()
+        } else {
+            format!("Results in channel for \"{search_active}\"")
+        };
+        let is_shorts_tab = search_active.is_empty() && active_tab_title.eq_ignore_ascii_case("Shorts");
+        if let Some(act) = draw_video_grid(ui, &heading, &items, loading, cont.is_some()) {
+            if is_shorts_tab {
+                if let super::cards::GridAction::Open(ref it) = act {
+                    if it.playlist_browse_id.is_none() {
+                        self.open_short(it.clone(), items);
+                        return;
+                    }
+                }
+            }
             self.handle_grid_action(ctx, act, |app| {
                 if let Some(cid) = app.channel_id.clone() {
                     app.channel_loading = true;
-                    let _ = app.backend.tx.send(Request::LoadChannel {
-                        channel_id: cid,
-                        params: tab_params,
-                        continuation: cont,
-                    });
+                    if search_active.is_empty() {
+                        let _ = app.backend.tx.send(Request::LoadChannel {
+                            channel_id: cid,
+                            params: tab_params,
+                            continuation: cont,
+                        });
+                    } else {
+                        let _ = app.backend.tx.send(Request::SearchChannel {
+                            channel_id: cid,
+                            query: search_active,
+                            continuation: cont,
+                        });
+                    }
                 }
             });
         }

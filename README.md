@@ -56,12 +56,10 @@ A fast, lightweight native Windows desktop YouTube client written in Rust with [
 Contributions are very welcome! **yt-rust** is open for contributors — whether fixing bugs, improving InnerTube compatibility, polishing UI details, or picking up remaining items in [ROADMAP.md](ROADMAP.md).
 
 ### How to Contribute
-1. Check [ROADMAP.md](ROADMAP.md) or existing issues/PRs to see what is planned or in progress.
-2. Fork the repository and create a topic branch (`feat/...`, `fix/...`, `chore/...`).
-3. Keep code modular and clean:
-   - Use custom vector / bundled `lucide.ttf` icons instead of Unicode emojis in the UI.
-   - Ensure `cargo test --locked` passes with zero compiler warnings.
-4. Open a Pull Request describing your changes clearly (screenshots welcome for UI changes).
+1. Read [CONTRIBUTING.md](CONTRIBUTING.md) for architecture notes, UI conventions, and PR guidelines.
+2. Check [ROADMAP.md](ROADMAP.md) (see **Phase 5–7**) or existing issues/PRs to pick up planned work.
+3. Fork the repository and create a topic branch (`feat/...`, `fix/...`, `docs/...`).
+4. Ensure `cargo test --locked` passes with zero compiler warnings before opening a Pull Request.
 
 ## Build & Run
 

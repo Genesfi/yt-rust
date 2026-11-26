@@ -148,15 +148,24 @@ pub struct CommentItem {
     pub text: String,
     pub reply_count_text: String,
     pub replies_token: Option<String>,
+    pub reply_params: Option<String>,
     pub replies: Vec<CommentItem>,
     pub replies_loading: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum LiveChatRun {
+    Text(String),
+    Emoji { alt: String, url: Option<String> },
 }
 
 #[derive(Clone, Debug)]
 pub struct LiveChatMessage {
     pub id: String,
     pub author: String,
+    pub avatar_url: Option<String>,
     pub text: String,
+    pub runs: Vec<LiveChatRun>,
     pub is_owner: bool,
     pub is_mod: bool,
 }

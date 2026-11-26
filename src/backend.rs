@@ -36,6 +36,11 @@ pub enum Request {
         params: Option<String>,
         continuation: Option<String>,
     },
+    SearchChannel {
+        channel_id: String,
+        query: String,
+        continuation: Option<String>,
+    },
     Search {
         query: String,
         continuation: Option<String>,
@@ -63,6 +68,13 @@ pub enum Request {
         text: String,
         params: String,
         reload_continuation: Option<String>,
+    },
+    PostCommentReply {
+        video_id: String,
+        comment_id: String,
+        text: String,
+        params: String,
+        replies_continuation: Option<String>,
     },
     LoadLiveChat {
         video_id: String,
@@ -161,6 +173,13 @@ pub enum Response {
         continuation: Option<String>,
         append: bool,
     },
+    ChannelSearchLoaded {
+        channel_id: String,
+        query: String,
+        items: Vec<VideoItem>,
+        continuation: Option<String>,
+        append: bool,
+    },
     SearchLoaded {
         query: String,
         items: Vec<VideoItem>,
@@ -194,6 +213,11 @@ pub enum Response {
     },
     CommentPosted {
         video_id: String,
+    },
+    CommentReplyPosted {
+        video_id: String,
+        comment_id: String,
+        text: String,
     },
     LiveChatLoaded {
         video_id: String,
@@ -716,6 +740,47 @@ impl Backend {
                                 }
                                 wake();
                             }
+                            Request::SearchChannel {
+                                channel_id,
+                                query,
+                                continuation,
+                            } => {
+                                let append = continuation.is_some();
+                                let cfg_clone = cfg.clone();
+                                let sess_clone = session.clone();
+                                tokio::spawn(async move {
+                                    match innertube::search_channel(
+                                        &http,
+                                        &channel_id,
+                                        &query,
+                                        continuation.as_deref(),
+                                        &cfg_clone,
+                                        sess_clone.as_ref(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(FeedPage {
+                                            items,
+                                            continuation,
+                                            ..
+                                        }) => {
+                                            let _ = resp_tx.send(Response::ChannelSearchLoaded {
+                                                channel_id,
+                                                query,
+                                                items,
+                                                continuation,
+                                                append,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = resp_tx.send(Response::Error(format!(
+                                                "Channel search failed: {e:#}"
+                                            )));
+                                        }
+                                    }
+                                    wake();
+                                });
+                            }
                             Request::LoadComments {
                                 video_id,
                                 continuation,
@@ -841,6 +906,67 @@ impl Backend {
                                     wake();
                                 });
                             }
+                            Request::PostCommentReply {
+                                video_id,
+                                comment_id,
+                                text,
+                                params,
+                                replies_continuation,
+                            } => {
+                                let Some(s) = session.clone() else {
+                                    let _ = resp_tx.send(Response::Error(
+                                        "Sign in to reply to comments".into(),
+                                    ));
+                                    wake();
+                                    continue;
+                                };
+                                let cfg_clone = cfg.clone();
+                                tokio::spawn(async move {
+                                    match innertube::create_comment_reply(
+                                        &http,
+                                        &text,
+                                        &params,
+                                        &cfg_clone,
+                                        &s,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            let _ = resp_tx.send(Response::CommentReplyPosted {
+                                                video_id: video_id.clone(),
+                                                comment_id: comment_id.clone(),
+                                                text,
+                                            });
+                                            if let Some(tok) = replies_continuation {
+                                                if let Ok((replies, next_token)) =
+                                                    innertube::fetch_comment_replies(
+                                                        &http,
+                                                        &tok,
+                                                        &cfg_clone,
+                                                        Some(&s),
+                                                    )
+                                                    .await
+                                                {
+                                                    let _ = resp_tx.send(
+                                                        Response::CommentRepliesLoaded {
+                                                            video_id,
+                                                            comment_id,
+                                                            replies,
+                                                            next_token,
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let _ = resp_tx.send(Response::Error(format!(
+                                                "Reply failed: {e:#}"
+                                            )));
+                                        }
+                                    }
+                                    wake();
+                                });
+                            }
                             Request::LoadLiveChat {
                                 video_id,
                                 continuation,
@@ -904,7 +1030,7 @@ impl Backend {
                                 });
                             }
                             Request::RemoveFromHistory {
-                                video_id,
+                                video_id: _,
                                 feedback_token,
                             } => {
                                 let Some(s) = session.clone() else {
@@ -1585,8 +1711,16 @@ fn apply_ytdlp_streams(
     data: &mut WatchData,
     yt: ytdlp::YtdlpStreams,
     max_height: u32,
-    wrap: &impl Fn(&str, u64) -> String,
+    proxy: Option<&StreamProxy>,
 ) -> (String, Option<String>, Option<usize>) {
+    let ua = yt.user_agent.as_deref().unwrap_or("");
+    let wrap_yt = |url: &str, len: u64| -> String {
+        let is_hls = url.contains(".m3u8") || url.contains("/manifest/hls");
+        match proxy {
+            Some(p) if !is_hls => p.register_with_ua(url, len, ua),
+            _ => url.to_owned(),
+        }
+    };
     if !yt.video_formats.is_empty() {
         data.video_formats = yt.video_formats;
     }
@@ -1600,21 +1734,21 @@ fn apply_ytdlp_streams(
     let fmt_idx = pick_format_index(&data.video_formats, max_height);
     let (v_url, a_url) = if let Some(idx) = fmt_idx {
         let fmt = &data.video_formats[idx];
-        let v = wrap(&fmt.url, fmt.content_length);
+        let v = wrap_yt(&fmt.url, fmt.content_length);
         let a = if fmt.has_audio {
             None
         } else {
             data.audio_url
                 .as_deref()
-                .map(|u| wrap(u, data.audio_content_length))
+                .map(|u| wrap_yt(u, data.audio_content_length))
         };
         (v, a)
     } else {
         (
-            wrap(&yt.video_url, yt.video_content_length),
+            wrap_yt(&yt.video_url, yt.video_content_length),
             yt.audio_url
                 .as_deref()
-                .map(|u| wrap(u, yt.audio_content_length)),
+                .map(|u| wrap_yt(u, yt.audio_content_length)),
         )
     };
     (v_url, a_url, fmt_idx)
@@ -1686,7 +1820,7 @@ async fn resolve_watch(
             )
             .await?;
             let (selected_video_url, selected_audio_url, fmt_idx) =
-                apply_ytdlp_streams(&mut data, yt, quality.max_height(), &wrap);
+                apply_ytdlp_streams(&mut data, yt, quality.max_height(), proxy);
             Ok(Response::WatchReady {
                 selected_video_url,
                 selected_audio_url,
@@ -1757,7 +1891,7 @@ async fn resolve_watch(
                 data.duration_secs = yt.duration_secs;
             }
             let (selected_video_url, selected_audio_url, fmt_idx) =
-                apply_ytdlp_streams(&mut data, yt, quality.max_height(), &wrap);
+                apply_ytdlp_streams(&mut data, yt, quality.max_height(), proxy);
             Ok(Response::WatchReady {
                 selected_video_url,
                 selected_audio_url,

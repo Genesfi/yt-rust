@@ -6,8 +6,8 @@ use serde_json::{Value, json};
 use crate::auth::Session;
 use crate::model::{
     AudioTrack, CaptionTrack, Chapter, ChannelInfo, ChannelTab, CommentItem, FeedChip,
-    LiveChatMessage, PlaylistOption, PlaylistSummary, SidebarChannel, StoryboardSpec, VideoFormat,
-    VideoItem, WatchData,
+    LiveChatMessage, LiveChatRun, PlaylistOption, PlaylistSummary, SidebarChannel, StoryboardSpec,
+    VideoFormat, VideoItem, WatchData,
 };
 
 const ORIGIN: &str = "https://www.youtube.com";
@@ -1316,6 +1316,39 @@ pub async fn channel_videos(
     ))
 }
 
+pub async fn search_channel(
+    http: &reqwest::Client,
+    channel_id: &str,
+    query: &str,
+    continuation: Option<&str>,
+    cfg: &WebConfig,
+    session: Option<&Session>,
+) -> anyhow::Result<FeedPage> {
+    let body = match continuation {
+        Some(token) => json!({ "continuation": token }),
+        None => json!({
+            "browseId": channel_id,
+            "params": "EgZzZWFyY2jyBgQKAloA",
+            "query": query,
+        }),
+    };
+    let v = post_web(http, "browse", body, cfg, session).await?;
+    let new_vd = v["responseContext"]["visitorData"]
+        .as_str()
+        .map(str::to_owned);
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    collect_videos_with_channel_items(&v, &mut items, &mut seen, "", channel_id);
+    let cont = find_continuation(&v);
+    Ok(FeedPage {
+        items,
+        chips: Vec::new(),
+        continuation: cont,
+        visitor_data: new_vd,
+        is_fallback_trending: false,
+    })
+}
+
 fn find_is_subscribed(v: &Value) -> bool {
     match v {
         Value::Object(map) => {
@@ -1346,7 +1379,7 @@ fn parse_channel_tabs(v: &Value) -> Vec<ChannelTab> {
         let lower = title.to_ascii_lowercase();
         if !matches!(
             lower.as_str(),
-            "videos" | "shorts" | "live" | "playlists" | "podcasts" | "releases"
+            "home" | "videos" | "shorts" | "live" | "playlists" | "podcasts" | "releases"
         ) {
             continue;
         }
@@ -1567,6 +1600,7 @@ fn find_nested_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
 fn parse_comment_entry(
     entry: &Value,
     entity_map: &std::collections::HashMap<String, Value>,
+    surface_map: &std::collections::HashMap<String, Value>,
 ) -> Option<CommentItem> {
     let thread = if entry["commentThreadRenderer"].is_object() {
         &entry["commentThreadRenderer"]
@@ -1611,6 +1645,9 @@ fn parse_comment_entry(
         if body_txt.is_empty() {
             return None;
         }
+        let reply_params = find_nested_str(cr, "createReplyParams")
+            .or_else(|| find_nested_str(thread, "createReplyParams"))
+            .map(str::to_owned);
         return Some(CommentItem {
             id,
             author,
@@ -1620,14 +1657,18 @@ fn parse_comment_entry(
             text: body_txt,
             reply_count_text,
             replies_token,
+            reply_params,
             replies: Vec::new(),
             replies_loading: false,
         });
     }
 
-    let key = thread["commentViewModel"]["commentViewModel"]["commentKey"]
-        .as_str()
-        .or_else(|| entry["commentViewModel"]["commentKey"].as_str())?;
+    let vm = if thread["commentViewModel"]["commentViewModel"].is_object() {
+        &thread["commentViewModel"]["commentViewModel"]
+    } else {
+        &entry["commentViewModel"]
+    };
+    let key = vm["commentKey"].as_str()?;
     let payload = entity_map.get(key)?;
     let author = payload["author"]["displayName"]
         .as_str()
@@ -1652,6 +1693,13 @@ fn parse_comment_entry(
     if body_txt.is_empty() {
         return None;
     }
+    let reply_params = vm["commentSurfaceKey"]
+        .as_str()
+        .and_then(|sk| surface_map.get(sk))
+        .and_then(|s| find_nested_str(s, "createReplyParams"))
+        .or_else(|| find_nested_str(payload, "createReplyParams"))
+        .or_else(|| find_nested_str(thread, "createReplyParams"))
+        .map(str::to_owned);
     Some(CommentItem {
         id: payload["properties"]["commentId"]
             .as_str()
@@ -1664,6 +1712,7 @@ fn parse_comment_entry(
         text: body_txt,
         reply_count_text,
         replies_token,
+        reply_params,
         replies: Vec::new(),
         replies_loading: false,
     })
@@ -1685,11 +1734,17 @@ pub async fn fetch_comments(
     .await?;
 
     let mut entity_map = std::collections::HashMap::<String, Value>::new();
+    let mut surface_map = std::collections::HashMap::<String, Value>::new();
     if let Some(muts) = v["frameworkUpdates"]["entityBatchUpdate"]["mutations"].as_array() {
         for m in muts {
             if let Some(p) = m["payload"]["commentEntityPayload"].as_object() {
                 if let Some(key) = p.get("key").and_then(|k| k.as_str()) {
                     entity_map.insert(key.to_owned(), Value::Object(p.clone()));
+                }
+            }
+            if let Some(p) = m["payload"]["commentSurfaceEntityPayload"].as_object() {
+                if let Some(key) = p.get("key").and_then(|k| k.as_str()) {
+                    surface_map.insert(key.to_owned(), Value::Object(p.clone()));
                 }
             }
         }
@@ -1739,7 +1794,7 @@ pub async fn fetch_comments(
                     next_token = Some(tok.to_owned());
                     continue;
                 }
-                if let Some(item) = parse_comment_entry(entry, &entity_map) {
+                if let Some(item) = parse_comment_entry(entry, &entity_map, &surface_map) {
                     out.push(item);
                 }
             }
@@ -1777,6 +1832,27 @@ pub async fn create_comment(
         json!({
             "commentText": text_body,
             "createCommentParams": create_params,
+        }),
+        cfg,
+        Some(session),
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn create_comment_reply(
+    http: &reqwest::Client,
+    text_body: &str,
+    reply_params: &str,
+    cfg: &WebConfig,
+    session: &Session,
+) -> anyhow::Result<()> {
+    post_web(
+        http,
+        "comment/create_comment_reply",
+        json!({
+            "commentText": text_body,
+            "createReplyParams": reply_params,
         }),
         cfg,
         Some(session),
@@ -1903,8 +1979,40 @@ pub async fn fetch_live_chat(
                 continue;
             };
             let author = text(&r["authorName"]).unwrap_or_else(|| "User".to_owned());
-            let body = text(&r["message"]).unwrap_or_default();
+            let avatar_url = r["authorPhoto"]["thumbnails"]
+                .as_array()
+                .and_then(|a| a.last())
+                .and_then(|t| t["url"].as_str())
+                .map(normalize_url);
+            let mut runs = Vec::new();
+            let mut body = String::new();
+            if let Some(arr) = r["message"]["runs"].as_array() {
+                for run in arr {
+                    if let Some(t) = run["text"].as_str() {
+                        body.push_str(t);
+                        runs.push(LiveChatRun::Text(t.to_owned()));
+                    } else if let Some(em) = run.get("emoji") {
+                        let url = em["image"]["thumbnails"]
+                            .as_array()
+                            .and_then(|a| a.last())
+                            .and_then(|t| t["url"].as_str())
+                            .map(normalize_url);
+                        let alt = em["shortcuts"]
+                            .as_array()
+                            .and_then(|a| a.first())
+                            .and_then(|s| s.as_str())
+                            .or_else(|| em["emojiId"].as_str())
+                            .unwrap_or("")
+                            .to_owned();
+                        body.push_str(&alt);
+                        runs.push(LiveChatRun::Emoji { alt, url });
+                    }
+                }
+            }
             if body.is_empty() {
+                body = text(&r["message"]).unwrap_or_default();
+            }
+            if body.is_empty() && runs.is_empty() {
                 continue;
             }
             let badges = r["authorBadges"].as_array();
@@ -1921,7 +2029,9 @@ pub async fn fetch_live_chat(
             msgs.push(LiveChatMessage {
                 id,
                 author,
+                avatar_url,
                 text: body,
+                runs,
                 is_owner,
                 is_mod,
             });
