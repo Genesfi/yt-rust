@@ -5,6 +5,8 @@ use std::time::{Duration, SystemTime};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::model::{AudioTrack, VideoFormat};
+
 #[cfg(windows)]
 const BIN: &str = "yt-dlp.exe";
 #[cfg(not(windows))]
@@ -22,11 +24,36 @@ const ASSET: &str = "yt-dlp_linux";
 const REPO: &str = "yt-dlp/yt-dlp";
 const MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 
+#[cfg(windows)]
+const QJS: &str = "qjs.exe";
+#[cfg(not(windows))]
+const QJS: &str = "qjs";
+#[cfg(all(windows, target_arch = "x86"))]
+const QJS_ASSET: &str = "qjs-windows-x86.exe";
+#[cfg(all(windows, not(target_arch = "x86")))]
+const QJS_ASSET: &str = "qjs-windows-x86_64.exe";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const QJS_ASSET: &str = "qjs-darwin-arm64";
+#[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+const QJS_ASSET: &str = "qjs-darwin-x86_64";
+#[cfg(all(unix, not(target_os = "macos"), target_arch = "aarch64"))]
+const QJS_ASSET: &str = "qjs-linux-aarch64";
+#[cfg(all(unix, not(target_os = "macos"), not(target_arch = "aarch64")))]
+const QJS_ASSET: &str = "qjs-linux-x86_64";
+const QJS_REPO: &str = "quickjs-ng/quickjs";
+const QJS_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
+
 pub struct YtdlpStreams {
     pub video_url: String,
+    pub video_content_length: u64,
     pub audio_url: Option<String>,
+    pub audio_content_length: u64,
+    pub video_formats: Vec<VideoFormat>,
+    pub audio_tracks: Vec<AudioTrack>,
     pub title: Option<String>,
     pub channel: Option<String>,
+    pub channel_id: Option<String>,
+    pub description: String,
     pub duration_secs: f64,
 }
 
@@ -97,20 +124,81 @@ async fn ensure_ytdlp(http: &reqwest::Client, data_dir: &Path) -> anyhow::Result
             return Ok(existing);
         }
     }
-    let bin = data_dir.join(BIN);
-    match fetch_latest(http, &bin).await {
+    ensure_github_tool(http, data_dir, BIN, REPO, ASSET, MAX_AGE).await
+}
+
+async fn resolve_js_runtime(http: &reqwest::Client, data_dir: &Path) -> Option<String> {
+    let exe = |name: &str| {
+        if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_owned()
+        }
+    };
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            for name in ["node", "deno"] {
+                let p = dir.join(exe(name));
+                if p.is_file() {
+                    return Some(format!("{name}:{}", p.display()));
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let mut cands = vec![PathBuf::from(r"C:\Program Files\nodejs\node.exe")];
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            cands.push(PathBuf::from(local).join("Programs").join("nodejs").join("node.exe"));
+        }
+        for c in cands {
+            if c.is_file() {
+                return Some(format!("node:{}", c.display()));
+            }
+        }
+    }
+    match ensure_github_tool(http, data_dir, QJS, QJS_REPO, QJS_ASSET, QJS_MAX_AGE).await {
+        Ok(p) => Some(format!("quickjs:{}", p.display())),
+        Err(e) => {
+            log::warn!("No Node/Deno found and QuickJS download failed: {e:#}");
+            None
+        }
+    }
+}
+
+async fn ensure_github_tool(
+    http: &reqwest::Client,
+    data_dir: &Path,
+    bin_name: &str,
+    repo: &str,
+    asset: &str,
+    max_age: Duration,
+) -> anyhow::Result<PathBuf> {
+    let bin = data_dir.join(bin_name);
+    let fresh = std::fs::metadata(&bin)
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| SystemTime::now().duration_since(t).unwrap_or_default() < max_age);
+    if fresh {
+        return Ok(bin);
+    }
+    match fetch_release_asset(http, &bin, repo, asset).await {
         Ok(()) => Ok(bin),
         Err(e) if bin.is_file() => {
-            log::warn!("yt-dlp update failed, keeping existing binary: {e:#}");
+            log::warn!("{bin_name} update failed, keeping existing binary: {e:#}");
             Ok(bin)
         }
         Err(e) => Err(e),
     }
 }
 
-async fn fetch_latest(http: &reqwest::Client, dest: &Path) -> anyhow::Result<()> {
+async fn fetch_release_asset(
+    http: &reqwest::Client,
+    dest: &Path,
+    repo: &str,
+    asset_name: &str,
+) -> anyhow::Result<()> {
     let release: Value = http
-        .get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
+        .get(format!("https://api.github.com/repos/{repo}/releases/latest"))
         .header("User-Agent", "yt-rust")
         .timeout(Duration::from_secs(15))
         .send()
@@ -121,17 +209,17 @@ async fn fetch_latest(http: &reqwest::Client, dest: &Path) -> anyhow::Result<()>
 
     let asset = release["assets"]
         .as_array()
-        .and_then(|a| a.iter().find(|x| x["name"] == ASSET))
-        .ok_or_else(|| anyhow::anyhow!("No {ASSET} found in yt-dlp release"))?;
+        .and_then(|a| a.iter().find(|x| x["name"] == asset_name))
+        .ok_or_else(|| anyhow::anyhow!("No {asset_name} found in {repo} release"))?;
     let url = asset["browser_download_url"]
         .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing download URL for {ASSET}"))?;
+        .ok_or_else(|| anyhow::anyhow!("Missing download URL for {asset_name}"))?;
     let expected_sha = asset["digest"]
         .as_str()
         .and_then(|d| d.strip_prefix("sha256:"))
         .map(str::to_ascii_lowercase);
 
-    log::info!("Downloading {ASSET}...");
+    log::info!("Downloading {asset_name}...");
     let bytes = http
         .get(url)
         .timeout(Duration::from_secs(120))
@@ -143,7 +231,7 @@ async fn fetch_latest(http: &reqwest::Client, dest: &Path) -> anyhow::Result<()>
 
     if let Some(want) = expected_sha {
         let got = format!("{:x}", Sha256::digest(&bytes));
-        anyhow::ensure!(got == want, "yt-dlp SHA-256 mismatch: {got} != {want}");
+        anyhow::ensure!(got == want, "{asset_name} SHA-256 mismatch: {got} != {want}");
     }
 
     if let Some(parent) = dest.parent() {
@@ -168,40 +256,49 @@ pub async fn resolve_video(
     video_id: &str,
     max_height: u32,
 ) -> anyhow::Result<YtdlpStreams> {
-    let bin = ensure_ytdlp(http, data_dir).await?;
+    let (bin_res, runtime) = tokio::join!(
+        ensure_ytdlp(http, data_dir),
+        resolve_js_runtime(http, data_dir),
+    );
+    let bin = bin_res?;
     let data_dir = data_dir.to_owned();
     let cookie = cookie.filter(|c| !c.trim().is_empty()).map(str::to_owned);
     let vid = video_id.to_owned();
     tokio::task::spawn_blocking(move || {
-        run_ytdlp(&bin, &data_dir, cookie.as_deref(), &vid, max_height)
+        run_ytdlp(
+            &bin,
+            runtime.as_deref(),
+            &data_dir,
+            cookie.as_deref(),
+            &vid,
+            max_height,
+        )
     })
     .await?
 }
 
-fn run_ytdlp(
+fn apply_js_runtime(cmd: &mut Command, runtime: Option<&str>) {
+    cmd.args(["--js-runtimes", "node"]);
+    if let Some(rt) = runtime.filter(|r| !r.starts_with("node") || r.contains(':')) {
+        cmd.args(["--js-runtimes", rt]);
+    }
+}
+
+fn invoke_ytdlp_json(
     bin: &Path,
-    data_dir: &Path,
-    cookie: Option<&str>,
+    runtime: Option<&str>,
+    jar_path: Option<&Path>,
     video_id: &str,
-    max_height: u32,
-) -> anyhow::Result<YtdlpStreams> {
-    let _jar = cookie
-        .map(|c| TempCookieJar::create(data_dir, c))
-        .transpose()?;
-    let selector = format!(
-        "bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best"
-    );
+    selector: &str,
+    extra_args: &[&str],
+) -> anyhow::Result<std::process::Output> {
     let mut cmd = Command::new(bin);
-    cmd.args([
-        "--no-warnings",
-        "--no-playlist",
-        "--no-cache-dir",
-        "-f",
-        &selector,
-        "-j",
-    ]);
-    if let Some(ref jar) = _jar {
-        cmd.arg("--cookies").arg(&jar.path);
+    cmd.args(["--no-warnings", "--no-playlist", "--no-cache-dir"]);
+    apply_js_runtime(&mut cmd, runtime);
+    cmd.args(extra_args);
+    cmd.args(["-f", selector, "-j"]);
+    if let Some(jar) = jar_path {
+        cmd.arg("--cookies").arg(jar);
     }
     cmd.arg(format!("https://www.youtube.com/watch?v={video_id}"));
 
@@ -211,7 +308,41 @@ fn run_ytdlp(
         cmd.creation_flags(0x0800_0000);
     }
 
-    let out = cmd.output()?;
+    Ok(cmd.output()?)
+}
+
+fn run_ytdlp(
+    bin: &Path,
+    runtime: Option<&str>,
+    data_dir: &Path,
+    cookie: Option<&str>,
+    video_id: &str,
+    max_height: u32,
+) -> anyhow::Result<YtdlpStreams> {
+    let _jar = cookie
+        .map(|c| TempCookieJar::create(data_dir, c))
+        .transpose()?;
+    let jar_path = _jar.as_ref().map(|j| j.path.as_path());
+    let selector = format!(
+        "bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best"
+    );
+    let mut out = invoke_ytdlp_json(bin, runtime, jar_path, video_id, &selector, &[])?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("Requested format is not available") {
+            let hls_sel = format!(
+                "bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best[protocol^=m3u8]/best"
+            );
+            out = invoke_ytdlp_json(
+                bin,
+                runtime,
+                jar_path,
+                video_id,
+                &hls_sel,
+                &["--extractor-args", "youtube:player_client=web_safari,web"],
+            )?;
+        }
+    }
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let msg = err
@@ -225,43 +356,205 @@ fn run_ytdlp(
     }
 
     let v: Value = serde_json::from_slice(&out.stdout)?;
+    parse_ytdlp_streams(&v)
+}
+
+fn codec_mime(vcodec: &str) -> String {
+    let lc = vcodec.to_ascii_lowercase();
+    if lc.contains("av01") || lc.contains("av1") {
+        "video/mp4; codecs=\"av01.0.08M.08\"".to_owned()
+    } else if lc.contains("vp9") || lc.contains("vp09") {
+        "video/webm; codecs=\"vp9\"".to_owned()
+    } else if lc.contains("avc1") || lc.contains("h264") {
+        "video/mp4; codecs=\"avc1.640028\"".to_owned()
+    } else {
+        format!("video/mp4; codecs=\"{vcodec}\"")
+    }
+}
+
+fn ytdlp_codec_rank(mime: &str) -> u8 {
+    if mime.contains("avc1") {
+        3
+    } else if mime.contains("vp9") || mime.contains("vp09") {
+        2
+    } else if mime.contains("av01") {
+        1
+    } else {
+        0
+    }
+}
+
+fn parse_ytdlp_streams(v: &Value) -> anyhow::Result<YtdlpStreams> {
     let title = v["title"].as_str().map(str::to_owned);
     let channel = v["uploader"]
         .as_str()
         .or_else(|| v["channel"].as_str())
         .map(str::to_owned);
+    let channel_id = v["channel_id"]
+        .as_str()
+        .filter(|s| s.starts_with("UC"))
+        .map(str::to_owned);
+    let description = v["description"].as_str().unwrap_or_default().to_owned();
     let duration_secs = v["duration"].as_f64().unwrap_or(0.0);
 
-    if let Some(req_formats) = v["requested_formats"].as_array() {
-        let video_url = req_formats
-            .iter()
-            .find(|f| f["vcodec"].as_str().is_some_and(|c| c != "none"))
-            .and_then(|f| f["url"].as_str())
-            .ok_or_else(|| anyhow::anyhow!("yt-dlp returned no video URL"))?
-            .to_owned();
-        let audio_url = req_formats
-            .iter()
-            .find(|f| f["acodec"].as_str().is_some_and(|c| c != "none"))
-            .and_then(|f| f["url"].as_str())
-            .map(str::to_owned);
-        return Ok(YtdlpStreams {
-            video_url,
-            audio_url,
-            title,
-            channel,
-            duration_secs,
-        });
+    let mut video_formats = Vec::new();
+    let mut audio_cands: Vec<(bool, u64, AudioTrack)> = Vec::new();
+
+    if let Some(formats) = v["formats"].as_array() {
+        for f in formats {
+            let protocol = f["protocol"].as_str().unwrap_or_default();
+            if protocol != "https" && protocol != "http" {
+                continue;
+            }
+            let Some(url) = f["url"].as_str() else {
+                continue;
+            };
+            let vcodec = f["vcodec"].as_str().unwrap_or("none");
+            let acodec = f["acodec"].as_str().unwrap_or("none");
+            let content_length = f["filesize"]
+                .as_u64()
+                .or_else(|| f["filesize_approx"].as_u64())
+                .unwrap_or(0);
+
+            if vcodec != "none" {
+                let height = f["height"].as_u64().unwrap_or(0) as u32;
+                if height == 0 {
+                    continue;
+                }
+                let width = f["width"].as_u64().unwrap_or(0) as u32;
+                let fps = f["fps"].as_f64().map_or(30, |x| x.round() as u32).max(1);
+                let bitrate = f["tbr"]
+                    .as_f64()
+                    .or_else(|| f["vbr"].as_f64())
+                    .map_or(0, |b| (b * 1000.0) as u64);
+                let itag = f["format_id"]
+                    .as_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                video_formats.push(VideoFormat {
+                    itag,
+                    url: url.to_owned(),
+                    mime: codec_mime(vcodec),
+                    width,
+                    height,
+                    fps,
+                    bitrate,
+                    content_length,
+                    has_audio: acodec != "none",
+                });
+            } else if acodec != "none" {
+                let abr = f["abr"]
+                    .as_f64()
+                    .or_else(|| f["tbr"].as_f64())
+                    .map_or(0, |b| (b * 1000.0) as u64);
+                let lang = f["language"].as_str().unwrap_or_default();
+                let note = f["format_note"].as_str().unwrap_or_default();
+                let is_default = note.to_ascii_lowercase().contains("original")
+                    || f["language_preference"].as_i64().unwrap_or(0) >= 0;
+                let label = if !lang.is_empty() && !note.is_empty() {
+                    format!("{lang} ({note})")
+                } else if !note.is_empty() {
+                    note.to_owned()
+                } else if !lang.is_empty() {
+                    lang.to_owned()
+                } else {
+                    format!("Audio ({acodec})")
+                };
+                audio_cands.push((
+                    is_default,
+                    abr,
+                    AudioTrack {
+                        id: f["format_id"].as_str().unwrap_or_default().to_owned(),
+                        label,
+                        is_default,
+                        url: url.to_owned(),
+                        content_length,
+                    },
+                ));
+            }
+        }
     }
 
-    let video_url = v["url"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("yt-dlp returned no URL"))?
-        .to_owned();
+    video_formats.sort_by(|a, b| {
+        b.height
+            .cmp(&a.height)
+            .then_with(|| b.fps.cmp(&a.fps))
+            .then_with(|| ytdlp_codec_rank(&b.mime).cmp(&ytdlp_codec_rank(&a.mime)))
+            .then_with(|| b.bitrate.cmp(&a.bitrate))
+    });
+    let mut deduped_v = Vec::new();
+    for f in video_formats {
+        let same = deduped_v.iter().any(|d: &VideoFormat| {
+            d.height == f.height
+                && d.fps == f.fps
+                && ytdlp_codec_rank(&d.mime) == ytdlp_codec_rank(&f.mime)
+                && d.has_audio == f.has_audio
+        });
+        if !same {
+            deduped_v.push(f);
+        }
+    }
+
+    audio_cands.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    let mut audio_tracks: Vec<AudioTrack> = Vec::new();
+    for (_, _, tr) in audio_cands {
+        if !audio_tracks.iter().any(|x| x.label == tr.label) {
+            audio_tracks.push(tr);
+        }
+    }
+
+    let (fallback_video_url, fallback_vlen, fallback_audio_url, fallback_alen) =
+        if let Some(req_formats) = v["requested_formats"].as_array() {
+            let vf = req_formats
+                .iter()
+                .find(|f| f["vcodec"].as_str().is_some_and(|c| c != "none"));
+            let af = req_formats
+                .iter()
+                .find(|f| f["acodec"].as_str().is_some_and(|c| c != "none"));
+            (
+                vf.and_then(|f| f["url"].as_str()).map(str::to_owned),
+                vf.and_then(|f| f["filesize"].as_u64().or_else(|| f["filesize_approx"].as_u64()))
+                    .unwrap_or(0),
+                af.and_then(|f| f["url"].as_str()).map(str::to_owned),
+                af.and_then(|f| f["filesize"].as_u64().or_else(|| f["filesize_approx"].as_u64()))
+                    .unwrap_or(0),
+            )
+        } else {
+            (
+                v["url"].as_str().map(str::to_owned),
+                v["filesize"]
+                    .as_u64()
+                    .or_else(|| v["filesize_approx"].as_u64())
+                    .unwrap_or(0),
+                None,
+                0,
+            )
+        };
+
+    let audio_url = audio_tracks
+        .first()
+        .map(|t| t.url.clone())
+        .or(fallback_audio_url);
+    let audio_content_length = audio_tracks
+        .first()
+        .map(|t| t.content_length)
+        .filter(|&n| n > 0)
+        .unwrap_or(fallback_alen);
+    let video_url = fallback_video_url
+        .or_else(|| deduped_v.first().map(|f| f.url.clone()))
+        .ok_or_else(|| anyhow::anyhow!("yt-dlp returned no video URL"))?;
+
     Ok(YtdlpStreams {
         video_url,
-        audio_url: None,
+        video_content_length: fallback_vlen,
+        audio_url,
+        audio_content_length,
+        video_formats: deduped_v,
+        audio_tracks,
         title,
         channel,
+        channel_id,
+        description,
         duration_secs,
     })
 }
@@ -287,7 +580,11 @@ pub async fn download_video(
     audio_only: bool,
     max_height: u32,
 ) -> anyhow::Result<PathBuf> {
-    let bin = ensure_ytdlp(http, data_dir).await?;
+    let (bin_res, runtime) = tokio::join!(
+        ensure_ytdlp(http, data_dir),
+        resolve_js_runtime(http, data_dir),
+    );
+    let bin = bin_res?;
     let data_dir_owned = data_dir.to_path_buf();
     let cookie = cookie.filter(|c| !c.trim().is_empty()).map(str::to_owned);
     let out_dir = custom_dir
@@ -317,6 +614,7 @@ pub async fn download_video(
             "--print",
             "after_move:filepath",
         ]);
+        apply_js_runtime(&mut cmd, runtime.as_deref());
         if let Some(ref jar) = _jar {
             cmd.arg("--cookies").arg(&jar.path);
         }

@@ -21,7 +21,7 @@ A fast, lightweight native Windows desktop YouTube client written in Rust with [
 - **Channel Pages, Playlists & Queue**
   - Full Channel pages with banner, avatar, subscriber count, subscribe toggle, and `Videos` / `Shorts` / `Live` / `Playlists` tabs.
   - Library **Playlists** view & interactive **Save to Playlist** modal with playlist search filter, playlist thumbnails, existing playlist membership checkmarks, Watch Later sync, and playlist creation.
-  - Persistent Play Queue (`Up Next` / `Queue` / `Live Chat`) with right-click drag reordering, crash-safe Last-Watched + Queue resume, auto-PiP on scroll with corner-snapping mini-player, mouse Back/Forward navigation (`XButton1` / `XButton2`), and SponsorBlock auto-skip.
+  - Persistent Play Queue (`Up Next` / `Queue` / `Live Chat`) with drag-to-reorder, crash-safe Last-Watched + Queue resume, auto-PiP on scroll with corner-snapping mini-player, mouse Back/Forward navigation (`XButton1` / `XButton2`), and SponsorBlock auto-skip.
 - **Search, Comments & Offline Downloads**
   - Live YouTube search autocomplete suggestions, direct URL/video-ID paste, comments pagination, live chat polling, Like/Dislike, and optional `yt-dlp` stream fallback / MP4 & M4A downloads (configurable folder in Settings).
 

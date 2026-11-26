@@ -1968,7 +1968,7 @@ impl YtApp {
                 );
                 if self.queue.len() > 1 {
                     ui.label(
-                        RichText::new("· Right-drag to reorder")
+                        RichText::new("· Hold & drag to reorder")
                             .font(theme::regular(11.5))
                             .color(theme::TEXT_FAINT),
                     );
@@ -2009,6 +2009,8 @@ impl YtApp {
             if clear_queue {
                 self.queue.clear();
                 self.queue_drag_idx = None;
+                self.queue_drag_origin = None;
+                self.queue_drag_active = false;
                 self.persist_queue();
                 self.right_tab = RightTab::UpNext;
                 return;
@@ -2017,8 +2019,16 @@ impl YtApp {
             let q_items = self.queue.clone();
             let mut play_idx = None;
             let mut remove_idx = None;
+            let mut move_top_idx = None;
             let mut queue_reordered = false;
             let mut row_rects: Vec<(usize, Rect)> = Vec::with_capacity(q_items.len());
+            let (prim_pressed, prim_down, ptr_pos) = ui.ctx().input(|i| {
+                (
+                    i.pointer.primary_pressed(),
+                    i.pointer.primary_down(),
+                    i.pointer.interact_pos(),
+                )
+            });
             ScrollArea::vertical().id_salt("queue_scroll").show(ui, |ui| {
                 for (qi, item) in q_items.iter().enumerate() {
                     let (row_rect, row_resp) = ui.allocate_exact_size(
@@ -2027,10 +2037,21 @@ impl YtApp {
                     );
                     row_rects.push((qi, row_rect));
 
-                    if row_resp.drag_started_by(egui::PointerButton::Secondary) {
+                    let inner = row_rect.shrink(6.0);
+                    let num_w = 18.0;
+                    let remove_w = 28.0;
+                    let x_rect = Rect::from_center_size(
+                        pos2(inner.right() - remove_w * 0.5, inner.center().y),
+                        Vec2::splat(remove_w),
+                    );
+                    if prim_pressed
+                        && ptr_pos.is_some_and(|p| row_rect.contains(p) && !x_rect.contains(p))
+                    {
                         self.queue_drag_idx = Some(qi);
+                        self.queue_drag_origin = ptr_pos.map(|p| (p, Instant::now()));
+                        self.queue_drag_active = false;
                     }
-                    let is_dragging = self.queue_drag_idx == Some(qi);
+                    let is_dragging = self.queue_drag_idx == Some(qi) && self.queue_drag_active;
                     let hover_t = ui
                         .ctx()
                         .animate_bool_with_time(row_resp.id, row_resp.hovered(), 0.12);
@@ -2059,9 +2080,6 @@ impl YtApp {
                         );
                     }
 
-                    let inner = row_rect.shrink(6.0);
-                    let num_w = 18.0;
-                    let remove_w = 28.0;
                     let thumb_w = 122.0;
                     let thumb_h = 68.0;
                     let idx_pos = pos2(inner.left() + num_w * 0.5, inner.center().y);
@@ -2095,10 +2113,6 @@ impl YtApp {
                         item.watched_percent,
                     );
 
-                    let x_rect = Rect::from_center_size(
-                        pos2(inner.right() - remove_w * 0.5, inner.center().y),
-                        Vec2::splat(remove_w),
-                    );
                     let x_resp = ui.interact(
                         x_rect,
                         ui.scope_id().with(("q_rm", qi, &item.id)),
@@ -2134,8 +2148,8 @@ impl YtApp {
                     }
 
                     let text_rect = Rect::from_min_max(
-                        pos2(thumb_rect.right() + 8.0, inner.top() + 2.0),
-                        pos2(x_rect.left() - 6.0, inner.bottom() - 2.0),
+                        pos2(thumb_rect.right() + 8.0, inner.top() + 8.0),
+                        pos2(x_rect.left() - 6.0, inner.bottom() - 4.0),
                     );
                     let mut text_ui = ui.new_child(
                         egui::UiBuilder::new()
@@ -2144,68 +2158,100 @@ impl YtApp {
                     );
                     let tclip = text_ui.clip_rect().intersect(text_rect);
                     text_ui.set_clip_rect(tclip);
-                    text_ui.vertical_centered_justified(|ui| {
-                        ui.spacing_mut().item_spacing.y = 3.0;
-                        let clamped = clamp_two_lines(
-                            ui,
-                            &item.title,
-                            theme::medium(12.5),
-                            (text_rect.width() - 4.0).max(40.0),
-                        );
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(clamped)
-                                    .font(theme::medium(12.5))
-                                    .color(theme::TEXT),
-                            )
-                            .wrap(),
-                        );
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&item.channel)
-                                    .font(theme::regular(11.5))
-                                    .color(theme::TEXT_DIM),
-                            )
-                            .truncate(),
-                        );
-                    });
+                    text_ui.spacing_mut().item_spacing.y = 4.0;
+                    let clamped = clamp_two_lines(
+                        &text_ui,
+                        &item.title,
+                        theme::medium(12.5),
+                        (text_rect.width() - 4.0).max(40.0),
+                    );
+                    text_ui.add(
+                        egui::Label::new(
+                            RichText::new(clamped)
+                                .font(theme::medium(12.5))
+                                .color(theme::TEXT),
+                        )
+                        .wrap(),
+                    );
+                    text_ui.add(
+                        egui::Label::new(
+                            RichText::new(&item.channel)
+                                .font(theme::regular(11.5))
+                                .color(theme::TEXT_DIM),
+                        )
+                        .truncate(),
+                    );
 
-                    if row_resp.clicked() && !x_hovered && self.queue_drag_idx.is_none() {
+                    row_resp.context_menu(|ui| {
+                        if ui.button("Play now").clicked() {
+                            play_idx = Some(qi);
+                            ui.close();
+                        }
+                        if qi > 0 && ui.button("Move to top").clicked() {
+                            move_top_idx = Some(qi);
+                            ui.close();
+                        }
+                        if ui.button("Remove from queue").clicked() {
+                            remove_idx = Some(qi);
+                            ui.close();
+                        }
+                    });
+                    if row_resp.clicked() && !x_hovered && !self.queue_drag_active {
                         play_idx = Some(qi);
                     }
                     ui.add_space(4.0);
                 }
             });
 
-            // Live right-click drag reordering across Queue items
-            let (sec_down, ptr_pos) = ui
-                .ctx()
-                .input(|i| (i.pointer.secondary_down(), i.pointer.interact_pos()));
-            if sec_down {
+            // Live left-click hold & drag reordering across Queue items
+            if prim_down {
                 if let (Some(drag_i), Some(pos)) = (self.queue_drag_idx, ptr_pos) {
-                    ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
-                    if let Some(&(target_i, _)) = row_rects
-                        .iter()
-                        .find(|&&(i, r)| i != drag_i && pos.y >= r.top() && pos.y <= r.bottom())
-                    {
-                        if drag_i < self.queue.len() && target_i < self.queue.len() {
-                            let moved = self.queue.remove(drag_i);
-                            self.queue.insert(target_i, moved);
-                            self.queue_drag_idx = Some(target_i);
-                            queue_reordered = true;
+                    if !self.queue_drag_active {
+                        if let Some((orig, started_at)) = self.queue_drag_origin {
+                            if orig.distance(pos) >= 6.0
+                                || started_at.elapsed() >= Duration::from_millis(180)
+                            {
+                                self.queue_drag_active = true;
+                            } else {
+                                ui.ctx().request_repaint_after(Duration::from_millis(30));
+                            }
+                        }
+                    }
+                    if self.queue_drag_active {
+                        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                        if let Some(&(target_i, _)) = row_rects.iter().find(|&&(i, r)| {
+                            i != drag_i && pos.y >= r.top() + 4.0 && pos.y <= r.bottom() - 4.0
+                        }) {
+                            if drag_i < self.queue.len() && target_i < self.queue.len() {
+                                let moved = self.queue.remove(drag_i);
+                                self.queue.insert(target_i, moved);
+                                self.queue_drag_idx = Some(target_i);
+                                queue_reordered = true;
+                            }
                         }
                     }
                 }
-            } else if self.queue_drag_idx.is_some() {
+            } else if self.queue_drag_idx.is_some() || self.queue_drag_active {
                 self.queue_drag_idx = None;
+                self.queue_drag_origin = None;
+                self.queue_drag_active = false;
             }
 
             if queue_reordered {
                 self.persist_queue();
             }
+            if let Some(i) = move_top_idx {
+                if i < self.queue.len() {
+                    let item = self.queue.remove(i);
+                    self.queue.insert(0, item);
+                    self.persist_queue();
+                }
+            }
             if let Some(i) = remove_idx {
                 self.queue.remove(i);
                 self.queue_drag_idx = None;
+                self.queue_drag_origin = None;
+                self.queue_drag_active = false;
                 self.persist_queue();
                 if self.queue.is_empty() {
                     self.right_tab = RightTab::UpNext;
@@ -2213,6 +2259,8 @@ impl YtApp {
             } else if let Some(i) = play_idx {
                 let next = self.queue.remove(i);
                 self.queue_drag_idx = None;
+                self.queue_drag_origin = None;
+                self.queue_drag_active = false;
                 self.persist_queue();
                 self.open_video(next);
             }

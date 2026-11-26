@@ -1724,6 +1724,78 @@ pub async fn fetch_account_info(
     Some((name, avatar))
 }
 
+pub async fn fetch_next_watch_fallback(
+    http: &reqwest::Client,
+    video_id: &str,
+    cfg: &WebConfig,
+    session: Option<&Session>,
+) -> Option<WatchData> {
+    let next = post_web(http, "next", json!({ "videoId": video_id }), cfg, session)
+        .await
+        .ok()?;
+    let contents = next["contents"]["twoColumnWatchNextResults"]["results"]["results"]["contents"]
+        .as_array()?;
+    let title = contents
+        .iter()
+        .find_map(|c| text(&c["videoPrimaryInfoRenderer"]["title"]))
+        .unwrap_or_else(|| format!("Video {video_id}"));
+    let owner_run = contents.iter().find_map(|c| {
+        let r = &c["videoSecondaryInfoRenderer"]["owner"]["videoOwnerRenderer"]["title"]["runs"][0];
+        r["text"].as_str().map(|_| r)
+    });
+    let channel = owner_run
+        .and_then(|r| r["text"].as_str())
+        .unwrap_or("Unknown")
+        .to_owned();
+    let channel_id = owner_run
+        .and_then(|r| r["navigationEndpoint"]["browseEndpoint"]["browseId"].as_str())
+        .map(str::to_owned);
+    let (
+        views_text,
+        published_text,
+        likes_text,
+        is_liked,
+        is_disliked,
+        is_subscribed,
+        subscribers_text,
+        channel_avatar_url,
+        comments_token,
+        live_chat_token,
+        related,
+    ) = parse_next_metadata(&next, video_id);
+    let resume_secs = as_secs_f64(&next["currentVideoEndpoint"]["watchEndpoint"]["startTimeSeconds"])
+        .filter(|&s| s > 2.0);
+    Some(WatchData {
+        id: video_id.to_owned(),
+        title,
+        channel,
+        channel_id,
+        channel_avatar_url,
+        subscribers_text,
+        views_text,
+        published_text,
+        likes_text,
+        is_liked,
+        is_disliked,
+        is_subscribed,
+        description: String::new(),
+        duration_secs: 0.0,
+        video_formats: Vec::new(),
+        audio_url: None,
+        audio_content_length: 0,
+        audio_tracks: Vec::new(),
+        hls_url: None,
+        captions: Vec::new(),
+        chapters: Vec::new(),
+        storyboard: None,
+        comments_token,
+        live_chat_token,
+        related,
+        is_live: false,
+        resume_secs,
+    })
+}
+
 pub async fn watch(
     http: &reqwest::Client,
     video_id: &str,

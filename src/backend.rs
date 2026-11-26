@@ -1362,6 +1362,45 @@ async fn report_history_loop(
     }
 }
 
+fn apply_ytdlp_streams(
+    data: &mut WatchData,
+    yt: ytdlp::YtdlpStreams,
+    max_height: u32,
+    wrap: &impl Fn(&str, u64) -> String,
+) -> (String, Option<String>, Option<usize>) {
+    if !yt.video_formats.is_empty() {
+        data.video_formats = yt.video_formats;
+    }
+    if !yt.audio_tracks.is_empty() {
+        data.audio_tracks = yt.audio_tracks;
+    }
+    if yt.audio_url.is_some() {
+        data.audio_url = yt.audio_url.clone();
+        data.audio_content_length = yt.audio_content_length;
+    }
+    let fmt_idx = pick_format_index(&data.video_formats, max_height);
+    let (v_url, a_url) = if let Some(idx) = fmt_idx {
+        let fmt = &data.video_formats[idx];
+        let v = wrap(&fmt.url, fmt.content_length);
+        let a = if fmt.has_audio {
+            None
+        } else {
+            data.audio_url
+                .as_deref()
+                .map(|u| wrap(u, data.audio_content_length))
+        };
+        (v, a)
+    } else {
+        (
+            wrap(&yt.video_url, yt.video_content_length),
+            yt.audio_url
+                .as_deref()
+                .map(|u| wrap(u, yt.audio_content_length)),
+        )
+    };
+    (v_url, a_url, fmt_idx)
+}
+
 async fn resolve_watch(
     http: &reqwest::Client,
     data_dir: &PathBuf,
@@ -1372,13 +1411,14 @@ async fn resolve_watch(
     proxy: Option<&StreamProxy>,
 ) -> anyhow::Result<Response> {
     let wrap = |url: &str, len: u64| -> String {
+        let is_hls = url.contains(".m3u8") || url.contains("/manifest/hls");
         match proxy {
-            Some(p) => p.register(url, len),
-            None => url.to_owned(),
+            Some(p) if !is_hls => p.register(url, len),
+            _ => url.to_owned(),
         }
     };
     match innertube::watch(http, video_id, cfg, session).await {
-        Ok(data) => {
+        Ok(mut data) => {
             // Livestreams play much more reliably via HLS manifest than raw adaptive URLs
             if data.is_live {
                 if let Some(hls) = data.hls_url.clone() {
@@ -1426,28 +1466,33 @@ async fn resolve_watch(
                 quality.max_height(),
             )
             .await?;
+            let (selected_video_url, selected_audio_url, fmt_idx) =
+                apply_ytdlp_streams(&mut data, yt, quality.max_height(), &wrap);
             Ok(Response::WatchReady {
-                selected_video_url: yt.video_url,
-                selected_audio_url: yt.audio_url,
-                selected_format_idx: None,
+                selected_video_url,
+                selected_audio_url,
+                selected_format_idx: fmt_idx,
                 data: Box::new(data),
                 used_ytdlp: true,
             })
         }
         Err(inner_err) => {
             log::warn!("InnerTube watch failed ({inner_err:#}), falling back to yt-dlp");
-            let yt = ytdlp::resolve_video(
-                http,
-                data_dir,
-                session.map(|s| s.cookie.as_str()),
-                video_id,
-                quality.max_height(),
-            )
-            .await?;
-            let data = WatchData {
+            let (yt_res, next_opt) = tokio::join!(
+                ytdlp::resolve_video(
+                    http,
+                    data_dir,
+                    session.map(|s| s.cookie.as_str()),
+                    video_id,
+                    quality.max_height(),
+                ),
+                innertube::fetch_next_watch_fallback(http, video_id, cfg, session),
+            );
+            let yt = yt_res?;
+            let mut data = next_opt.unwrap_or_else(|| WatchData {
                 id: video_id.to_owned(),
-                title: yt.title.unwrap_or_else(|| format!("Video {video_id}")),
-                channel: yt.channel.unwrap_or_else(|| "Unknown".to_owned()),
+                title: format!("Video {video_id}"),
+                channel: "Unknown".to_owned(),
                 channel_id: None,
                 channel_avatar_url: None,
                 subscribers_text: String::new(),
@@ -1458,9 +1503,9 @@ async fn resolve_watch(
                 is_disliked: false,
                 is_subscribed: false,
                 description: String::new(),
-                duration_secs: yt.duration_secs,
+                duration_secs: 0.0,
                 video_formats: Vec::new(),
-                audio_url: yt.audio_url.clone(),
+                audio_url: None,
                 audio_content_length: 0,
                 audio_tracks: Vec::new(),
                 hls_url: None,
@@ -1472,11 +1517,32 @@ async fn resolve_watch(
                 related: Vec::new(),
                 is_live: false,
                 resume_secs: None,
-            };
+            });
+            if let Some(t) = yt.title.as_deref().filter(|s| !s.is_empty()) {
+                if data.title.starts_with("Video ") || data.title.is_empty() {
+                    data.title = t.to_owned();
+                }
+            }
+            if let Some(c) = yt.channel.as_deref().filter(|s| !s.is_empty()) {
+                if data.channel == "Unknown" || data.channel.is_empty() {
+                    data.channel = c.to_owned();
+                }
+            }
+            if data.channel_id.is_none() {
+                data.channel_id = yt.channel_id.clone();
+            }
+            if data.description.is_empty() && !yt.description.is_empty() {
+                data.description = yt.description.clone();
+            }
+            if data.duration_secs <= 0.0 {
+                data.duration_secs = yt.duration_secs;
+            }
+            let (selected_video_url, selected_audio_url, fmt_idx) =
+                apply_ytdlp_streams(&mut data, yt, quality.max_height(), &wrap);
             Ok(Response::WatchReady {
-                selected_video_url: yt.video_url,
-                selected_audio_url: yt.audio_url,
-                selected_format_idx: None,
+                selected_video_url,
+                selected_audio_url,
+                selected_format_idx: fmt_idx,
                 data: Box::new(data),
                 used_ytdlp: true,
             })

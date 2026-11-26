@@ -159,6 +159,8 @@ pub struct YtApp {
     pub(super) saved: Vec<VideoItem>,
     pub(super) queue: Vec<VideoItem>,
     pub(super) queue_drag_idx: Option<usize>,
+    pub(super) queue_drag_origin: Option<(egui::Pos2, Instant)>,
+    pub(super) queue_drag_active: bool,
     pub(super) resume_positions: HashMap<String, f64>,
     pub(super) pending_resume: Option<(String, f64, Option<f32>)>,
 
@@ -407,6 +409,8 @@ impl YtApp {
             saved,
             queue: Vec::new(),
             queue_drag_idx: None,
+            queue_drag_origin: None,
+            queue_drag_active: false,
             resume_positions,
             pending_resume: None,
             watch_loading: false,
