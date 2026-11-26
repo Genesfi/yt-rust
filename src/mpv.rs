@@ -176,6 +176,15 @@ impl MpvVtable {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct MpvVideoTrack {
+    pub id: i64,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    pub selected: bool,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct PlaybackState {
     pub time_pos: f64,
     pub duration: f64,
@@ -400,8 +409,9 @@ impl MpvPlayer {
         self.set_property_str("audio-files", "");
         self.set_property_str("sub-files", "");
         self.set_property_str("sub-visibility", "no");
+        self.set_property_str("vid", "auto");
         if let Some(start) = start_at {
-            self.set_property_str("start", &format!("{start:.2}"));
+            self.set_property_str("start", &format!("{:.2}", start.max(0.0)));
         } else {
             self.set_property_str("start", "none");
         }
@@ -410,6 +420,56 @@ impl MpvPlayer {
         }
         self.command(&["loadfile", video_url, "replace"]);
         self.set_paused(false);
+    }
+
+    pub fn set_hls_bitrate(&self, max_bps: Option<u64>) {
+        match max_bps {
+            Some(bps) if bps > 0 => self.set_property_str("hls-bitrate", &bps.to_string()),
+            _ => self.set_property_str("hls-bitrate", "max"),
+        }
+    }
+
+    pub fn set_vid(&self, id: Option<i64>) {
+        match id {
+            Some(vid) => self.set_property_str("vid", &vid.to_string()),
+            None => self.set_property_str("vid", "auto"),
+        }
+    }
+
+    pub fn video_tracks(&self) -> Vec<MpvVideoTrack> {
+        let count = self.get_double("track-list/count").unwrap_or(0.0) as usize;
+        let mut out = Vec::new();
+        for i in 0..count.min(64) {
+            let Some(ty) = self.get_string(&format!("track-list/{i}/type")) else {
+                continue;
+            };
+            if ty != "video" {
+                continue;
+            }
+            let Some(id) = self.get_double(&format!("track-list/{i}/id")) else {
+                continue;
+            };
+            let width = self
+                .get_double(&format!("track-list/{i}/demux-w"))
+                .unwrap_or(0.0) as u32;
+            let height = self
+                .get_double(&format!("track-list/{i}/demux-h"))
+                .unwrap_or(0.0) as u32;
+            let fps = self
+                .get_double(&format!("track-list/{i}/demux-fps"))
+                .unwrap_or(0.0);
+            let selected = self
+                .get_flag(&format!("track-list/{i}/selected"))
+                .unwrap_or(false);
+            out.push(MpvVideoTrack {
+                id: id as i64,
+                width,
+                height,
+                fps,
+                selected,
+            });
+        }
+        out
     }
 
     pub fn set_subtitle(&self, vtt_url: Option<&str>) {

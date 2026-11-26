@@ -3176,11 +3176,13 @@ async fn fetch_player(
 ) -> anyhow::Result<Value> {
     let visitor_data = cfg.visitor_data.as_deref();
     let mut last_err: Option<anyhow::Error> = None;
+    let mut playable_fallback: Option<Value> = None;
     let mut non_playable: Option<Value> = None;
     let mut tried_auth = false;
 
     match player_visionos(http, video_id, visitor_data).await {
-        Ok(v) if has_playable_url(&v) => return Ok(v),
+        Ok(v) if is_preferred_player_response(&v) => return Ok(v),
+        Ok(v) if has_playable_url(&v) => playable_fallback = Some(v),
         Ok(v) => non_playable = Some(v),
         Err(e) => {
             if is_login_or_age_error(&e) {
@@ -3196,7 +3198,12 @@ async fn fetch_player(
     }
 
     match player_android_vr(http, video_id, visitor_data).await {
-        Ok(vr) if has_playable_url(&vr) => return Ok(vr),
+        Ok(vr) if is_preferred_player_response(&vr) => return Ok(vr),
+        Ok(vr) if has_playable_url(&vr) => {
+            if playable_fallback.is_none() {
+                playable_fallback = Some(vr);
+            }
+        }
         Ok(vr) => {
             if non_playable.is_none() {
                 non_playable = Some(vr);
@@ -3212,12 +3219,14 @@ async fn fetch_player(
     if !tried_auth {
         if let Some(sess) = session {
             if let Some(v) = try_authenticated_players(http, video_id, cfg, sess).await {
-                return Ok(v);
+                if is_preferred_player_response(&v) || playable_fallback.is_none() {
+                    return Ok(v);
+                }
             }
         }
     }
 
-    if let Some(v) = non_playable {
+    if let Some(v) = playable_fallback.or(non_playable) {
         return Ok(v);
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("All InnerTube player clients failed")))
@@ -3325,12 +3334,34 @@ async fn player_web_safari(
     Ok(resp)
 }
 
+fn has_adaptive_video_url(v: &Value) -> bool {
+    v["streamingData"]["adaptiveFormats"]
+        .as_array()
+        .is_some_and(|a| {
+            a.iter().any(|f| {
+                f["mimeType"]
+                    .as_str()
+                    .is_some_and(|m| m.starts_with("video/"))
+                    && f["url"].is_string()
+            })
+        })
+}
+
 fn has_playable_url(v: &Value) -> bool {
     let has_adaptive = v["streamingData"]["adaptiveFormats"]
         .as_array()
         .is_some_and(|a| a.iter().any(|f| f["url"].is_string()));
     let has_hls = v["streamingData"]["hlsManifestUrl"].is_string();
     has_adaptive || has_hls
+}
+
+fn is_preferred_player_response(v: &Value) -> bool {
+    let is_live = v["videoDetails"]["isLive"].as_bool().unwrap_or(false);
+    if is_live {
+        has_playable_url(v)
+    } else {
+        has_adaptive_video_url(v)
+    }
 }
 
 async fn player_visionos(
@@ -4389,6 +4420,14 @@ mod tests {
             }
         });
         assert!(has_playable_url(&with_url));
+        assert!(!is_preferred_player_response(&with_url));
+        let live_hls = json!({
+            "videoDetails": { "isLive": true },
+            "streamingData": {
+                "hlsManifestUrl": "https://manifest.googlevideo.com/live.m3u8"
+            }
+        });
+        assert!(is_preferred_player_response(&live_hls));
     }
 
     #[test]

@@ -2051,7 +2051,9 @@ async fn populate_hls_variants_if_needed(http: &reqwest::Client, data: &mut Watc
     if !fmts.is_empty() {
         data.video_formats = fmts;
     }
-    if data.audio_tracks.is_empty() && !audio.is_empty() {
+    if (data.is_live || data.audio_tracks.is_empty() || data.video_formats.is_empty())
+        && !audio.is_empty()
+    {
         data.audio_url = audio.first().map(|t| t.url.clone());
         data.audio_content_length = 0;
         data.audio_tracks = audio;
@@ -2088,9 +2090,14 @@ fn apply_ytdlp_streams(
     if let Some(live) = yt.is_live {
         data.is_live = live;
     }
-    if data.is_live && quality == PreferredQuality::Best4K {
+    if data.is_live {
         if let Some(hls) = data.hls_url.clone() {
-            return (hls, None, None);
+            let hint_idx = if quality != PreferredQuality::Best4K {
+                pick_format_index(&data.video_formats, quality.max_height())
+            } else {
+                None
+            };
+            return (hls, None, hint_idx);
         }
     }
     let fmt_idx = pick_format_index(&data.video_formats, quality.max_height());
@@ -2141,34 +2148,18 @@ async fn resolve_watch(
     match innertube::watch(http, video_id, cfg, session).await {
         Ok(mut data) => {
             populate_hls_variants_if_needed(http, &mut data).await;
-            // Livestreams play much more reliably via HLS manifest than raw adaptive URLs
+            // Livestreams play much more reliably (with synced audio) via master HLS manifest
             if data.is_live {
-                if quality != PreferredQuality::Best4K {
-                    if let Some(idx) = pick_format_index(&data.video_formats, quality.max_height())
-                    {
-                        let fmt = &data.video_formats[idx];
-                        let video_url = wrap(&fmt.url, fmt.content_length);
-                        let audio = if fmt.has_audio {
-                            None
-                        } else {
-                            data.audio_url
-                                .as_deref()
-                                .map(|u| wrap(u, data.audio_content_length))
-                        };
-                        return Ok(Response::WatchReady {
-                            selected_video_url: video_url,
-                            selected_audio_url: audio,
-                            selected_format_idx: Some(idx),
-                            data: Box::new(data),
-                            used_ytdlp: false,
-                        });
-                    }
-                }
                 if let Some(hls) = data.hls_url.clone() {
+                    let hint_idx = if quality != PreferredQuality::Best4K {
+                        pick_format_index(&data.video_formats, quality.max_height())
+                    } else {
+                        None
+                    };
                     return Ok(Response::WatchReady {
                         selected_video_url: hls,
                         selected_audio_url: None,
-                        selected_format_idx: None,
+                        selected_format_idx: hint_idx,
                         data: Box::new(data),
                         used_ytdlp: false,
                     });

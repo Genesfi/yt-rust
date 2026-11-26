@@ -669,6 +669,9 @@ impl YtApp {
                     };
                     if let Some(mpv) = &self.mpv {
                         mpv.seek_abs(seek_to);
+                        if self.playback.eof {
+                            mpv.set_paused(false);
+                        }
                     }
                 }
             }

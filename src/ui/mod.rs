@@ -236,6 +236,8 @@ pub struct YtApp {
     pub(super) playback: PlaybackState,
     pub(super) watch_started_at: Option<Instant>,
     pub(super) active_stream_urls: (String, Option<String>),
+    pub(super) playing_hls_master: bool,
+    pub(super) pending_hls_target_height: Option<u32>,
     pub(super) stream_recovery_attempts: u8,
     pub(super) stream_recovering: Option<String>,
     pub(super) seeking_pos: Option<f64>,
@@ -521,6 +523,8 @@ impl YtApp {
             playback: PlaybackState::default(),
             watch_started_at: None,
             active_stream_urls: (String::new(), None),
+            playing_hls_master: false,
+            pending_hls_target_height: None,
             stream_recovery_attempts: 0,
             stream_recovering: None,
             seeking_pos: None,
@@ -818,6 +822,8 @@ impl YtApp {
         self.watch_loading = false;
         self.watch_started_at = None;
         self.active_stream_urls = (path_str.clone(), None);
+        self.playing_hls_master = false;
+        self.pending_hls_target_height = None;
         self.stream_recovery_attempts = 0;
         self.stream_recovering = None;
         self.last_error = None;
@@ -901,6 +907,8 @@ impl YtApp {
         self.watch_loading = true;
         self.watch_started_at = None;
         self.active_stream_urls = (String::new(), None);
+        self.playing_hls_master = false;
+        self.pending_hls_target_height = None;
         self.stream_recovery_attempts = 0;
         self.stream_recovering = None;
         self.last_error = None;
@@ -977,33 +985,80 @@ impl YtApp {
     pub(super) fn switch_quality(&mut self, idx: usize) {
         let Some(w) = &self.watch else { return };
         let Some(fmt) = w.video_formats.get(idx) else { return };
+        let label = fmt.label();
+        let target_h = fmt.height;
+        let target_fps = fmt.fps;
+        let target_bps = fmt.bitrate;
+
+        if self.playing_hls_master {
+            if let Some(mpv) = &self.mpv {
+                let tracks = mpv.video_tracks();
+                let picked = tracks
+                    .iter()
+                    .filter(|t| t.height == target_h)
+                    .min_by_key(|t| (t.fps.round() as i32 - target_fps as i32).abs())
+                    .or_else(|| {
+                        tracks
+                            .iter()
+                            .filter(|t| t.height > 0 && t.height <= target_h)
+                            .max_by_key(|t| t.height)
+                    });
+                if let Some(tr) = picked {
+                    mpv.set_vid(Some(tr.id));
+                    self.pending_hls_target_height = None;
+                    self.selected_format_idx = Some(idx);
+                    self.toast(format!("Quality: {label}"));
+                    return;
+                }
+                if let Some(hls) = w.hls_url.as_deref() {
+                    let pos = self.playback.time_pos.max(0.0);
+                    mpv.set_hls_bitrate((target_bps > 0).then_some(target_bps));
+                    mpv.load_stream(hls, None, (!w.is_live).then_some(pos));
+                    self.pending_hls_target_height = Some(target_h);
+                    self.selected_format_idx = Some(idx);
+                    self.toast(format!("Quality: {label}"));
+                    return;
+                }
+            }
+        }
+
         let video_url = self.backend.proxy_url(&fmt.url, fmt.content_length);
         let audio = if fmt.has_audio {
             None
         } else {
             self.selected_audio_stream(w)
         };
-        let pos = self.playback.time_pos;
+        let pos = self.playback.time_pos.max(0.0);
         if let Some(mpv) = &self.mpv {
+            mpv.set_hls_bitrate(None);
             mpv.load_stream(
                 &video_url,
                 audio.as_deref(),
-                (pos > 1.0 && !w.is_live).then_some(pos),
+                (!w.is_live).then_some(pos),
             );
         }
+        self.playing_hls_master = false;
+        self.pending_hls_target_height = None;
         self.active_stream_urls = (video_url, audio);
         self.selected_format_idx = Some(idx);
-        self.toast(format!("Quality: {}", fmt.label()));
+        self.toast(format!("Quality: {label}"));
     }
 
     pub(super) fn switch_quality_auto(&mut self) {
         let Some(w) = &self.watch else { return };
         let Some(hls) = w.hls_url.as_deref() else { return };
-        let pos = self.playback.time_pos;
         if let Some(mpv) = &self.mpv {
-            mpv.load_stream(hls, None, (pos > 1.0 && !w.is_live).then_some(pos));
+            mpv.set_hls_bitrate(None);
+            if self.playing_hls_master {
+                mpv.set_vid(None);
+            } else {
+                let pos = self.playback.time_pos.max(0.0);
+                mpv.load_stream(hls, None, (!w.is_live).then_some(pos));
+                self.playing_hls_master = true;
+                self.active_stream_urls = (hls.to_owned(), None);
+            }
         }
-        self.active_stream_urls = (hls.to_owned(), None);
+        self.pending_hls_target_height = None;
         self.selected_format_idx = None;
         self.toast("Quality: Auto");
     }
@@ -1026,9 +1081,9 @@ impl YtApp {
             if let Some(fmt) = w.video_formats.get(fmt_idx) {
                 let video_url = self.backend.proxy_url(&fmt.url, fmt.content_length);
                 let audio = self.backend.proxy_url(&tr.url, tr.content_length);
-                let pos = self.playback.time_pos;
+                let pos = self.playback.time_pos.max(0.0);
                 if let Some(mpv) = &self.mpv {
-                    mpv.load_stream(&video_url, Some(&audio), (pos > 1.0).then_some(pos));
+                    mpv.load_stream(&video_url, Some(&audio), (!w.is_live).then_some(pos));
                 }
                 self.active_stream_urls = (video_url, Some(audio));
             }
@@ -1662,33 +1717,65 @@ impl YtApp {
                     self.selected_caption_idx = None;
                     self.used_ytdlp = used_ytdlp;
 
-                    let start_at = self
-                        .pending_resume
-                        .take()
-                        .filter(|(id, _, _)| id == &data.id)
-                        .and_then(|(_, secs, pct)| {
-                            if secs > 2.0 {
-                                Some(secs)
-                            } else if let Some(p) =
-                                pct.filter(|&p| p > 0.02 && p < 0.94 && data.duration_secs > 10.0)
-                            {
-                                Some(f64::from(p) * data.duration_secs)
-                            } else {
-                                None
-                            }
-                        })
-                        .or(data.resume_secs)
-                        .or_else(|| {
-                            self.resume_positions.get(&data.id).copied().filter(|&s| {
-                                s > 2.0 && (data.duration_secs <= 0.0 || s < data.duration_secs * 0.94)
+                    let start_at = if data.is_live {
+                        None
+                    } else {
+                        let valid_resume = |s: f64| -> bool {
+                            s > 2.0
+                                && (data.duration_secs <= 0.0 || s < data.duration_secs * 0.94)
+                        };
+                        let res = self
+                            .pending_resume
+                            .take()
+                            .filter(|(id, _, _)| id == &data.id)
+                            .and_then(|(_, secs, pct)| {
+                                if valid_resume(secs) {
+                                    Some(secs)
+                                } else if let Some(p) = pct
+                                    .filter(|&p| p > 0.02 && p < 0.94 && data.duration_secs > 10.0)
+                                {
+                                    Some(f64::from(p) * data.duration_secs)
+                                } else {
+                                    None
+                                }
                             })
-                        });
+                            .or_else(|| data.resume_secs.filter(|&s| valid_resume(s)))
+                            .or_else(|| {
+                                self.resume_positions
+                                    .get(&data.id)
+                                    .copied()
+                                    .filter(|&s| valid_resume(s))
+                            });
+                        if res.is_none() {
+                            if let Some(&saved) = self.resume_positions.get(&data.id) {
+                                if data.duration_secs > 10.0 && saved >= data.duration_secs * 0.94 {
+                                    self.resume_positions.remove(&data.id);
+                                }
+                            }
+                        }
+                        res
+                    };
 
+                    let is_hls_master =
+                        data.hls_url.as_deref() == Some(selected_video_url.as_str());
+                    self.playing_hls_master = is_hls_master;
+                    let target_fmt = if is_hls_master {
+                        selected_format_idx.and_then(|i| data.video_formats.get(i))
+                    } else {
+                        None
+                    };
+                    self.pending_hls_target_height = target_fmt.map(|f| f.height);
                     if let Some(mpv) = &self.mpv {
+                        mpv.set_hls_bitrate(target_fmt.map(|f| f.bitrate));
+                        let mpv_start = if data.is_live {
+                            None
+                        } else {
+                            Some(start_at.unwrap_or(0.0))
+                        };
                         mpv.load_stream(
                             &selected_video_url,
                             selected_audio_url.as_deref(),
-                            start_at,
+                            mpv_start,
                         );
                         mpv.set_speed(self.speed);
                     }
@@ -1769,7 +1856,7 @@ impl YtApp {
                         self.selected_audio_idx = selected_audio_idx;
                         self.used_ytdlp = used_ytdlp;
                         self.last_error = None;
-                        let start_at = (resume_secs > 1.0 && !w.is_live).then_some(resume_secs);
+                        let start_at = (!w.is_live).then_some(resume_secs.max(0.0));
                         if let Some(mpv) = &self.mpv {
                             mpv.load_stream(
                                 &selected_video_url,
@@ -2376,6 +2463,27 @@ impl YtApp {
         let was_eof = self.playback.eof;
         if let Some(mpv) = &self.mpv {
             self.playback = mpv.poll_state();
+            if self.playing_hls_master {
+                if let Some(target_h) = self.pending_hls_target_height {
+                    let tracks = mpv.video_tracks();
+                    if !tracks.is_empty() {
+                        let picked = tracks
+                            .iter()
+                            .filter(|t| t.height > 0 && t.height <= target_h)
+                            .max_by_key(|t| (t.height, t.fps.round() as i32))
+                            .or_else(|| {
+                                tracks
+                                    .iter()
+                                    .filter(|t| t.height > 0)
+                                    .min_by_key(|t| t.height)
+                            });
+                        if let Some(tr) = picked {
+                            mpv.set_vid(Some(tr.id));
+                        }
+                        self.pending_hls_target_height = None;
+                    }
+                }
+            }
         }
         let is_live = self.watch.as_ref().is_some_and(|w| w.is_live);
         let is_remote_watch = self
@@ -2570,6 +2678,9 @@ impl YtApp {
             && self.playback.eof
             && !was_eof
             && self.playback.duration > 1.0
+            && self
+                .watch_started_at
+                .is_some_and(|t| t.elapsed() >= Duration::from_secs(2))
         {
             if !self.queue.is_empty() {
                 let next = self.queue.remove(0);
