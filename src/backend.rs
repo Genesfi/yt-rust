@@ -2147,9 +2147,11 @@ async fn resolve_watch(
     };
     match innertube::watch(http, video_id, cfg, session).await {
         Ok(mut data) => {
+            let had_direct_formats = !data.video_formats.is_empty();
             populate_hls_variants_if_needed(http, &mut data).await;
-            // Livestreams play much more reliably (with synced audio) via master HLS manifest
-            if data.is_live {
+            // Livestreams and HLS-only VODs (e.g. post-live broadcasts with noclen=1 adaptive URLs)
+            // play with synced audio via master HLS manifest and native libmpv `vid` track switching.
+            if data.is_live || !had_direct_formats {
                 if let Some(hls) = data.hls_url.clone() {
                     let hint_idx = if quality != PreferredQuality::Best4K {
                         pick_format_index(&data.video_formats, quality.max_height())

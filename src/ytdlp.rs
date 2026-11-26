@@ -550,6 +550,13 @@ fn parse_ytdlp_streams(v: &Value) -> anyhow::Result<YtdlpStreams> {
                 .as_u64()
                 .or_else(|| f["filesize_approx"].as_u64())
                 .unwrap_or(0);
+            if !is_hls
+                && content_length == 0
+                && (url.contains("noclen=1")
+                    || (url.contains("yt_live_broadcast") && url.contains("&live=1")))
+            {
+                continue;
+            }
 
             if vcodec != "none" {
                 let height = f["height"].as_u64().unwrap_or(0) as u32;

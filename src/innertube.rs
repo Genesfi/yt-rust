@@ -2659,6 +2659,9 @@ pub async fn watch(
         let Some(url) = f["url"].as_str() else {
             continue;
         };
+        if is_noclen_live_tail(f, url) {
+            continue;
+        }
         let Some(itag) = f["itag"].as_u64() else {
             continue;
         };
@@ -3018,6 +3021,9 @@ fn parse_audio_tracks(adaptive: &[Value]) -> Vec<AudioTrack> {
             continue;
         }
         let Some(url) = f["url"].as_str() else { continue };
+        if is_noclen_live_tail(f, url) {
+            continue;
+        }
         let itag = f["itag"].as_u64().unwrap_or(0);
         let bitrate = f["bitrate"].as_u64().unwrap_or(0);
         let content_length = f["contentLength"]
@@ -3334,6 +3340,17 @@ async fn player_web_safari(
     Ok(resp)
 }
 
+fn is_noclen_live_tail(f: &Value, url: &str) -> bool {
+    let has_clen = f["contentLength"]
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| f["contentLength"].as_u64())
+        .is_some_and(|n| n > 0);
+    !has_clen
+        && (url.contains("noclen=1")
+            || (url.contains("yt_live_broadcast") && url.contains("&live=1")))
+}
+
 fn has_adaptive_video_url(v: &Value) -> bool {
     v["streamingData"]["adaptiveFormats"]
         .as_array()
@@ -3342,7 +3359,9 @@ fn has_adaptive_video_url(v: &Value) -> bool {
                 f["mimeType"]
                     .as_str()
                     .is_some_and(|m| m.starts_with("video/"))
-                    && f["url"].is_string()
+                    && f["url"]
+                        .as_str()
+                        .is_some_and(|u| !is_noclen_live_tail(f, u))
             })
         })
 }
@@ -3350,7 +3369,13 @@ fn has_adaptive_video_url(v: &Value) -> bool {
 fn has_playable_url(v: &Value) -> bool {
     let has_adaptive = v["streamingData"]["adaptiveFormats"]
         .as_array()
-        .is_some_and(|a| a.iter().any(|f| f["url"].is_string()));
+        .is_some_and(|a| {
+            a.iter().any(|f| {
+                f["url"]
+                    .as_str()
+                    .is_some_and(|u| !is_noclen_live_tail(f, u))
+            })
+        });
     let has_hls = v["streamingData"]["hlsManifestUrl"].is_string();
     has_adaptive || has_hls
 }
@@ -4428,6 +4453,21 @@ mod tests {
             }
         });
         assert!(is_preferred_player_response(&live_hls));
+
+        let post_live_noclen = json!({
+            "videoDetails": { "isLive": false, "lengthSeconds": "11456" },
+            "streamingData": {
+                "adaptiveFormats": [{
+                    "itag": 299,
+                    "mimeType": "video/mp4; codecs=\"avc1.64002a\"",
+                    "url": "https://rr4.googlevideo.com/videoplayback?source=yt_live_broadcast&live=1&noclen=1"
+                }],
+                "hlsManifestUrl": "https://manifest.googlevideo.com/vod.m3u8"
+            }
+        });
+        assert!(!has_adaptive_video_url(&post_live_noclen));
+        assert!(has_playable_url(&post_live_noclen));
+        assert!(!is_preferred_player_response(&post_live_noclen));
     }
 
     #[test]
