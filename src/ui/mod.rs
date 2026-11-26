@@ -15,9 +15,9 @@ use egui::{Align, Color32, Frame, Key, Layout, Margin, ViewportCommand};
 use crate::backend::{Backend, Request, Response};
 use crate::innertube;
 use crate::model::{
-    ChannelInfo, CommentItem, FeedChip, HwdecMode, LastWatched, LiveChatMessage, PlaylistOption,
-    PlaylistSummary, PreferredQuality, SidebarChannel, SponsorCategory, SponsorSegment, VideoItem,
-    WatchData,
+    ChannelInfo, CommentItem, FeedChip, HwdecMode, LastWatched, LiveChatEmote, LiveChatMessage,
+    PlaylistOption, PlaylistSummary, PreferredQuality, SidebarChannel, SponsorCategory,
+    SponsorSegment, VideoItem, WatchData,
 };
 use crate::mpv::{GlProcAddrFn, MpvPlayer, PlaybackState};
 use crate::os_media::OsMedia;
@@ -142,6 +142,11 @@ pub struct YtApp {
     pub(super) playlist_items: Vec<VideoItem>,
     pub(super) playlist_continuation: Option<String>,
     pub(super) playlist_loading: bool,
+    pub(super) playlist_is_editable: bool,
+    pub(super) playlist_manage_mode: bool,
+    pub(super) playlist_drag_idx: Option<usize>,
+    pub(super) playlist_drag_origin: Option<(egui::Pos2, Instant)>,
+    pub(super) playlist_drag_active: bool,
 
     pub(super) home_items: Vec<VideoItem>,
     pub(super) home_chips: Vec<FeedChip>,
@@ -216,6 +221,11 @@ pub struct YtApp {
     pub(super) live_chat_next_poll: Option<Instant>,
     pub(super) live_chat_send_params: Option<String>,
     pub(super) live_chat_draft: String,
+    pub(super) live_chat_emotes: Vec<LiveChatEmote>,
+    pub(super) live_chat_is_replay: bool,
+    pub(super) live_chat_replay_initial_token: Option<String>,
+    pub(super) live_chat_last_replay_pos: f64,
+    pub(super) live_chat_emote_picker_open: bool,
     pub(super) right_tab: RightTab,
     pub(super) shorts_mode: bool,
     pub(super) shorts_queue: Vec<VideoItem>,
@@ -225,6 +235,9 @@ pub struct YtApp {
 
     pub(super) playback: PlaybackState,
     pub(super) watch_started_at: Option<Instant>,
+    pub(super) active_stream_urls: (String, Option<String>),
+    pub(super) stream_recovery_attempts: u8,
+    pub(super) stream_recovering: Option<String>,
     pub(super) seeking_pos: Option<f64>,
     pub(super) volume: f64,
     pub(super) muted: bool,
@@ -422,6 +435,11 @@ impl YtApp {
             playlist_items: Vec::new(),
             playlist_continuation: None,
             playlist_loading: false,
+            playlist_is_editable: false,
+            playlist_manage_mode: false,
+            playlist_drag_idx: None,
+            playlist_drag_origin: None,
+            playlist_drag_active: false,
             home_items: Vec::new(),
             home_chips: Vec::new(),
             home_is_fallback: false,
@@ -487,6 +505,11 @@ impl YtApp {
             live_chat_next_poll: None,
             live_chat_send_params: None,
             live_chat_draft: String::new(),
+            live_chat_emotes: Vec::new(),
+            live_chat_is_replay: false,
+            live_chat_replay_initial_token: None,
+            live_chat_last_replay_pos: 0.0,
+            live_chat_emote_picker_open: false,
             shorts_mode: false,
             shorts_queue: Vec::new(),
             shorts_idx: 0,
@@ -497,6 +520,9 @@ impl YtApp {
             right_tab: RightTab::UpNext,
             playback: PlaybackState::default(),
             watch_started_at: None,
+            active_stream_urls: (String::new(), None),
+            stream_recovery_attempts: 0,
+            stream_recovering: None,
             seeking_pos: None,
             volume,
             muted: false,
@@ -667,11 +693,92 @@ impl YtApp {
         self.playlist_items.clear();
         self.playlist_continuation = None;
         self.playlist_loading = true;
+        self.playlist_is_editable = false;
+        self.playlist_manage_mode = false;
+        self.playlist_drag_idx = None;
+        self.playlist_drag_origin = None;
+        self.playlist_drag_active = false;
         self.last_error = None;
         let _ = self.backend.tx.send(Request::LoadPlaylist {
             browse_id,
             continuation: None,
         });
+    }
+
+    pub(super) fn play_all(&mut self, items: &[VideoItem], shuffle: bool, playlist_cont: Option<(String, String)>) {
+        let mut list: Vec<VideoItem> = items
+            .iter()
+            .filter(|it| it.playlist_browse_id.is_none())
+            .cloned()
+            .collect();
+        if list.is_empty() {
+            return;
+        }
+        if shuffle {
+            let seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0x9e37_79b9_7f4a_7c15, |d| d.as_nanos() as u64);
+            shuffle_vec(&mut list, seed);
+        }
+        let total_loaded = list.len();
+        let first = list.remove(0);
+        self.queue = list;
+        self.persist_queue();
+        self.right_tab = RightTab::Queue;
+        self.open_video(first);
+        if let Some((browse_id, continuation)) = playlist_cont {
+            let _ = self.backend.tx.send(Request::LoadFullPlaylistForQueue {
+                browse_id,
+                continuation,
+                shuffle,
+            });
+        }
+        self.toast(if shuffle {
+            format!("Shuffling {total_loaded} videos")
+        } else {
+            format!("Playing {total_loaded} videos")
+        });
+    }
+
+    pub(super) fn move_playlist_item(&mut self, from: usize, to: usize) {
+        if from >= self.playlist_items.len() || to >= self.playlist_items.len() || from == to {
+            return;
+        }
+        let Some(pid) = self.active_playlist_id.clone() else {
+            return;
+        };
+        let Some(set_id) = self.playlist_items[from].playlist_set_video_id.clone() else {
+            return;
+        };
+        let item = self.playlist_items.remove(from);
+        self.playlist_items.insert(to, item);
+        let successor = self
+            .playlist_items
+            .get(to + 1)
+            .and_then(|x| x.playlist_set_video_id.clone());
+        let _ = self.backend.tx.send(Request::PlaylistMoveItem {
+            playlist_id: pid,
+            set_video_id: set_id,
+            successor_set_video_id: successor,
+        });
+    }
+
+    pub(super) fn remove_playlist_item(&mut self, item: &VideoItem) {
+        let Some(pid) = self.active_playlist_id.clone() else {
+            return;
+        };
+        if let Some(sid) = item.playlist_set_video_id.as_deref() {
+            self.playlist_items
+                .retain(|x| x.playlist_set_video_id.as_deref() != Some(sid));
+        } else {
+            self.playlist_items.retain(|x| x.id != item.id);
+        }
+        let _ = self.backend.tx.send(Request::PlaylistRemoveItem {
+            playlist_id: pid,
+            video_id: item.id.clone(),
+            set_video_id: item.playlist_set_video_id.clone(),
+        });
+        self.toast(format!("Removed \"{}\"", item.title));
     }
 
     pub(super) fn open_video(&mut self, item: VideoItem) {
@@ -709,6 +816,10 @@ impl YtApp {
         self.watch_scrolled_into_pip = false;
         self.scroll_watch_to_top = true;
         self.watch_loading = false;
+        self.watch_started_at = None;
+        self.active_stream_urls = (path_str.clone(), None);
+        self.stream_recovery_attempts = 0;
+        self.stream_recovering = None;
         self.last_error = None;
         self.sponsor_segments.clear();
         self.last_skipped_end = -1.0;
@@ -736,6 +847,11 @@ impl YtApp {
         self.live_chat_next_poll = None;
         self.live_chat_send_params = None;
         self.live_chat_draft.clear();
+        self.live_chat_emotes.clear();
+        self.live_chat_is_replay = false;
+        self.live_chat_replay_initial_token = None;
+        self.live_chat_last_replay_pos = 0.0;
+        self.live_chat_emote_picker_open = false;
         if !(self.right_tab == RightTab::Queue && !self.queue.is_empty()) {
             self.right_tab = RightTab::UpNext;
         }
@@ -784,6 +900,9 @@ impl YtApp {
         self.scroll_watch_to_top = true;
         self.watch_loading = true;
         self.watch_started_at = None;
+        self.active_stream_urls = (String::new(), None);
+        self.stream_recovery_attempts = 0;
+        self.stream_recovering = None;
         self.last_error = None;
         self.sponsor_segments.clear();
         self.last_skipped_end = -1.0;
@@ -809,7 +928,11 @@ impl YtApp {
         self.live_chat_next_poll = None;
         self.live_chat_send_params = None;
         self.live_chat_draft.clear();
-        self.live_chat_next_poll = None;
+        self.live_chat_emotes.clear();
+        self.live_chat_is_replay = false;
+        self.live_chat_replay_initial_token = None;
+        self.live_chat_last_replay_pos = 0.0;
+        self.live_chat_emote_picker_open = false;
         if !(self.right_tab == RightTab::Queue && !self.queue.is_empty()) {
             self.right_tab = RightTab::UpNext;
         }
@@ -862,10 +985,27 @@ impl YtApp {
         };
         let pos = self.playback.time_pos;
         if let Some(mpv) = &self.mpv {
-            mpv.load_stream(&video_url, audio.as_deref(), (pos > 1.0).then_some(pos));
+            mpv.load_stream(
+                &video_url,
+                audio.as_deref(),
+                (pos > 1.0 && !w.is_live).then_some(pos),
+            );
         }
+        self.active_stream_urls = (video_url, audio);
         self.selected_format_idx = Some(idx);
         self.toast(format!("Quality: {}", fmt.label()));
+    }
+
+    pub(super) fn switch_quality_auto(&mut self) {
+        let Some(w) = &self.watch else { return };
+        let Some(hls) = w.hls_url.as_deref() else { return };
+        let pos = self.playback.time_pos;
+        if let Some(mpv) = &self.mpv {
+            mpv.load_stream(hls, None, (pos > 1.0 && !w.is_live).then_some(pos));
+        }
+        self.active_stream_urls = (hls.to_owned(), None);
+        self.selected_format_idx = None;
+        self.toast("Quality: Auto");
     }
 
     fn selected_audio_stream(&self, w: &WatchData) -> Option<String> {
@@ -890,6 +1030,7 @@ impl YtApp {
                 if let Some(mpv) = &self.mpv {
                     mpv.load_stream(&video_url, Some(&audio), (pos > 1.0).then_some(pos));
                 }
+                self.active_stream_urls = (video_url, Some(audio));
             }
         }
         self.toast(format!("Audio: {label}"));
@@ -1095,6 +1236,9 @@ impl YtApp {
                 } else {
                     self.toast("Removed from Watch History");
                 }
+            }
+            GridAction::RemoveFromPlaylist(it) => {
+                self.remove_playlist_item(&it);
             }
             GridAction::LoadMore => load_more(self),
         }
@@ -1358,6 +1502,7 @@ impl YtApp {
                 Response::PlaylistLoaded {
                     browse_id,
                     title,
+                    is_editable,
                     mut items,
                     continuation,
                     append,
@@ -1375,6 +1520,7 @@ impl YtApp {
                     }
                     if self.active_playlist_id.as_deref() == Some(browse_id.as_str()) {
                         self.playlist_loading = false;
+                        self.playlist_is_editable = is_editable;
                         self.ingest_resume_metadata(&mut items);
                         self.ingest_and_request_avatars(&mut items);
                         if !title.is_empty() {
@@ -1392,6 +1538,27 @@ impl YtApp {
                         self.playlist_continuation = continuation;
                     }
                 }
+                Response::FullPlaylistQueueLoaded { mut items, shuffle } => {
+                    self.ingest_resume_metadata(&mut items);
+                    self.ingest_and_request_avatars(&mut items);
+                    let cur_id = self.watch.as_ref().map(|w| w.id.as_str());
+                    items.retain(|it| {
+                        it.playlist_browse_id.is_none()
+                            && cur_id != Some(it.id.as_str())
+                            && !self.queue.iter().any(|q| q.id == it.id)
+                    });
+                    if shuffle {
+                        let seed = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0x9e37_79b9_7f4a_7c15, |d| d.as_nanos() as u64);
+                        shuffle_vec(&mut items, seed);
+                    }
+                    if !items.is_empty() {
+                        self.queue.extend(items);
+                        self.persist_queue();
+                    }
+                }
+                Response::PlaylistItemRemoved | Response::PlaylistReordered => {}
                 Response::TrendingLoaded { mut items } => {
                     self.trending_loading = false;
                     self.ingest_resume_metadata(&mut items);
@@ -1525,6 +1692,7 @@ impl YtApp {
                         );
                         mpv.set_speed(self.speed);
                     }
+                    self.active_stream_urls = (selected_video_url, selected_audio_url);
                     self.watch_started_at = Some(Instant::now());
                     if let Some(s) = start_at {
                         self.toast(format!("Resumed at {}", format_duration(s)));
@@ -1546,6 +1714,7 @@ impl YtApp {
                         }),
                         resume_secs: start_at,
                         playlist_browse_id: None,
+                        playlist_set_video_id: None,
                     };
                     self.record_history(hist_item);
                     if let Some(tok) = data.comments_token.clone() {
@@ -1558,14 +1727,67 @@ impl YtApp {
                     }
                     if let Some(chat_tok) = data.live_chat_token.clone() {
                         self.live_chat_token = Some(chat_tok.clone());
+                        self.live_chat_replay_initial_token = Some(chat_tok.clone());
+                        self.live_chat_is_replay = !data.is_live;
+                        self.live_chat_last_replay_pos = start_at.unwrap_or(0.0);
                         self.live_chat_next_poll = Some(Instant::now() + Duration::from_secs(3));
-                        self.right_tab = RightTab::LiveChat;
+                        if data.is_live {
+                            self.right_tab = RightTab::LiveChat;
+                        }
+                        let replay_offset_ms = (!data.is_live)
+                            .then(|| (start_at.unwrap_or(0.0).max(0.0) * 1000.0) as u64);
                         let _ = self.backend.tx.send(Request::LoadLiveChat {
                             video_id: data.id.clone(),
                             continuation: chat_tok,
+                            replay_offset_ms,
                         });
                     }
                     self.watch = Some(*data);
+                }
+                Response::StreamRecovered {
+                    video_id,
+                    video_formats,
+                    audio_url,
+                    audio_content_length,
+                    audio_tracks,
+                    hls_url,
+                    selected_video_url,
+                    selected_audio_url,
+                    selected_format_idx,
+                    selected_audio_idx,
+                    used_ytdlp,
+                    resume_secs,
+                } => {
+                    self.stream_recovering = None;
+                    if let Some(w) = self.watch.as_mut().filter(|w| w.id == video_id) {
+                        w.video_formats = video_formats;
+                        w.audio_url = audio_url;
+                        w.audio_content_length = audio_content_length;
+                        w.audio_tracks = audio_tracks;
+                        w.hls_url = hls_url;
+                        self.selected_format_idx = selected_format_idx;
+                        self.selected_audio_idx = selected_audio_idx;
+                        self.used_ytdlp = used_ytdlp;
+                        self.last_error = None;
+                        let start_at = (resume_secs > 1.0 && !w.is_live).then_some(resume_secs);
+                        if let Some(mpv) = &self.mpv {
+                            mpv.load_stream(
+                                &selected_video_url,
+                                selected_audio_url.as_deref(),
+                                start_at,
+                            );
+                            mpv.set_speed(self.speed);
+                        }
+                        self.active_stream_urls = (selected_video_url, selected_audio_url);
+                        self.watch_started_at = Some(Instant::now());
+                        self.toast("Refreshed expired stream");
+                    }
+                }
+                Response::StreamRecoverFailed { video_id, message } => {
+                    self.stream_recovering = None;
+                    if self.watch.as_ref().is_some_and(|w| w.id == video_id) {
+                        self.last_error = Some(message);
+                    }
                 }
                 Response::CommentsLoaded {
                     video_id,
@@ -1632,9 +1854,32 @@ impl YtApp {
                                 reply_params: None,
                                 replies: Vec::new(),
                                 replies_loading: false,
+                                is_liked: false,
+                                like_action_params: None,
+                                unlike_action_params: None,
+                                is_pinned: false,
+                                has_creator_heart: false,
                             });
                         }
                         self.toast("Reply posted");
+                    }
+                }
+                Response::CommentActionUpdated {
+                    video_id,
+                    comment_id,
+                    liked,
+                } => {
+                    if self.watch.as_ref().is_some_and(|w| w.id == video_id) {
+                        for c in &mut self.comments {
+                            if c.id == comment_id {
+                                c.is_liked = liked;
+                            }
+                            for r in &mut c.replies {
+                                if r.id == comment_id {
+                                    r.is_liked = liked;
+                                }
+                            }
+                        }
                     }
                 }
                 Response::LiveChatLoaded {
@@ -1642,10 +1887,22 @@ impl YtApp {
                     messages,
                     next_token,
                     send_params,
+                    emotes,
+                    is_replay,
                 } => {
                     if self.watch.as_ref().is_some_and(|w| w.id == video_id) {
                         if send_params.is_some() {
                             self.live_chat_send_params = send_params;
+                        }
+                        self.live_chat_is_replay |= is_replay;
+                        for em in emotes {
+                            if !self
+                                .live_chat_emotes
+                                .iter()
+                                .any(|x| x.emoji_id == em.emoji_id)
+                            {
+                                self.live_chat_emotes.push(em);
+                            }
                         }
                         for m in messages {
                             if !self.live_chat.iter().any(|x| x.id == m.id) {
@@ -2120,21 +2377,74 @@ impl YtApp {
         if let Some(mpv) = &self.mpv {
             self.playback = mpv.poll_state();
         }
-        if !self.watch_loading
-            && self.playback.idle
+        let is_live = self.watch.as_ref().is_some_and(|w| w.is_live);
+        let is_remote_watch = self
+            .watch
+            .as_ref()
+            .is_some_and(|w| !w.id.starts_with("local:"));
+        let proxy_403 = self.backend.is_proxy_forbidden(&self.active_stream_urls.0)
+            || self
+                .active_stream_urls
+                .1
+                .as_deref()
+                .is_some_and(|u| self.backend.is_proxy_forbidden(u));
+        let proxy_failed = proxy_403
+            || self.backend.is_proxy_failed(&self.active_stream_urls.0)
+            || self
+                .active_stream_urls
+                .1
+                .as_deref()
+                .is_some_and(|u| self.backend.is_proxy_failed(u));
+        let start_stalled = self.playback.idle
             && !self.playback.eof
             && self.playback.duration <= 0.0
             && self.playback.video_h == 0
-            && self.last_error.is_none()
             && self
                 .watch_started_at
-                .is_some_and(|t| t.elapsed() >= Duration::from_secs(2))
+                .is_some_and(|t| t.elapsed() >= Duration::from_secs(2));
+        let mid_eof_drop = !is_live
+            && self.playback.eof
+            && !was_eof
+            && self.playback.duration > 20.0
+            && self.playback.time_pos > 1.0
+            && self.playback.time_pos + 10.0 < self.playback.duration
+            && proxy_failed;
+
+        if !self.watch_loading
+            && is_remote_watch
+            && self.stream_recovering.is_none()
+            && self.last_error.is_none()
+            && (proxy_403 || start_stalled || mid_eof_drop)
         {
-            self.watch_started_at = None;
-            self.last_error = Some(
-                "Stream stopped before playback started (HTTP 403 or network error). Try switching quality or reopening."
-                    .to_owned(),
-            );
+            if self.stream_recovery_attempts < 2 {
+                if let Some(w) = &self.watch {
+                    self.stream_recovery_attempts += 1;
+                    self.stream_recovering = Some(w.id.clone());
+                    self.watch_started_at = None;
+                    let preferred_height = self
+                        .selected_format_idx
+                        .and_then(|i| w.video_formats.get(i))
+                        .map(|f| f.height);
+                    let preferred_audio_id = w
+                        .audio_tracks
+                        .get(self.selected_audio_idx)
+                        .map(|t| t.id.clone());
+                    let _ = self.backend.tx.send(Request::RecoverStream {
+                        video_id: w.id.clone(),
+                        quality: self.preferred_quality,
+                        preferred_height,
+                        preferred_audio_id,
+                        resume_secs: self.playback.time_pos.max(0.0),
+                    });
+                    self.toast("Stream expired — refreshing...");
+                }
+            } else if start_stalled || proxy_403 || mid_eof_drop {
+                self.watch_started_at = None;
+                self.last_error = Some(
+                    "Stream stopped (HTTP 403 or network error). Try switching quality or reopening."
+                        .to_owned(),
+                );
+            }
         }
         if !self.watch_loading {
             self.backend
@@ -2176,19 +2486,54 @@ impl YtApp {
         }
 
         if self.page == Page::Watch && self.right_tab == RightTab::LiveChat {
-            if let (Some(w), Some(tok), Some(due)) = (
-                &self.watch,
-                &self.live_chat_token,
-                self.live_chat_next_poll,
-            ) {
-                if Instant::now() >= due {
-                    self.live_chat_next_poll = Some(Instant::now() + Duration::from_secs(4));
-                    let _ = self.backend.tx.send(Request::LoadLiveChat {
-                        video_id: w.id.clone(),
-                        continuation: tok.clone(),
-                    });
-                } else {
-                    ctx.request_repaint_after(Duration::from_secs(1));
+            if let Some(w) = &self.watch {
+                if self.live_chat_is_replay {
+                    let pos = self.playback.time_pos.max(0.0);
+                    let jumped = (pos - self.live_chat_last_replay_pos).abs() > 10.0;
+                    if jumped {
+                        if let Some(init_tok) = self.live_chat_replay_initial_token.clone() {
+                            self.live_chat.clear();
+                            self.live_chat_token = Some(init_tok.clone());
+                            self.live_chat_last_replay_pos = pos;
+                            self.live_chat_next_poll =
+                                Some(Instant::now() + Duration::from_secs(3));
+                            let _ = self.backend.tx.send(Request::LoadLiveChat {
+                                video_id: w.id.clone(),
+                                continuation: init_tok,
+                                replay_offset_ms: Some((pos * 1000.0) as u64),
+                            });
+                        }
+                    } else if !self.playback.paused {
+                        if let (Some(tok), Some(due)) =
+                            (&self.live_chat_token, self.live_chat_next_poll)
+                        {
+                            if Instant::now() >= due {
+                                self.live_chat_last_replay_pos = pos;
+                                self.live_chat_next_poll =
+                                    Some(Instant::now() + Duration::from_secs(3));
+                                let _ = self.backend.tx.send(Request::LoadLiveChat {
+                                    video_id: w.id.clone(),
+                                    continuation: tok.clone(),
+                                    replay_offset_ms: Some((pos * 1000.0) as u64),
+                                });
+                            } else {
+                                ctx.request_repaint_after(Duration::from_secs(1));
+                            }
+                        }
+                    }
+                } else if let (Some(tok), Some(due)) =
+                    (&self.live_chat_token, self.live_chat_next_poll)
+                {
+                    if Instant::now() >= due {
+                        self.live_chat_next_poll = Some(Instant::now() + Duration::from_secs(4));
+                        let _ = self.backend.tx.send(Request::LoadLiveChat {
+                            video_id: w.id.clone(),
+                            continuation: tok.clone(),
+                            replay_offset_ms: None,
+                        });
+                    } else {
+                        ctx.request_repaint_after(Duration::from_secs(1));
+                    }
                 }
             }
         }
@@ -2385,25 +2730,7 @@ impl eframe::App for YtApp {
                         }
                     }
                     Page::Playlists => self.draw_playlists_library_page(ui),
-                    Page::Playlist => {
-                        let heading = self.active_playlist_title.clone();
-                        let items = self.playlist_items.clone();
-                        let loading = self.playlist_loading;
-                        let cont = self.playlist_continuation.clone();
-                        if let Some(act) =
-                            draw_video_grid(ui, &heading, &items, loading, cont.is_some())
-                        {
-                            self.handle_grid_action(&ctx, act, |app| {
-                                if let Some(bid) = app.active_playlist_id.clone() {
-                                    app.playlist_loading = true;
-                                    let _ = app.backend.tx.send(Request::LoadPlaylist {
-                                        browse_id: bid,
-                                        continuation: cont,
-                                    });
-                                }
-                            });
-                        }
-                    }
+                    Page::Playlist => self.draw_playlist_page(ui, &ctx),
                     Page::Channel => self.draw_channel_page(ui, &ctx),
                     Page::Search => {
                         let heading = format!("Results for \"{}\"", self.active_query);
@@ -2553,5 +2880,34 @@ fn save_queue_file(data_dir: &std::path::Path, queue: &[VideoItem]) {
                 let _ = std::fs::remove_file(&tmp);
             }
         }
+    }
+}
+
+pub(super) fn shuffle_vec<T>(items: &mut [T], mut seed: u64) {
+    if items.len() <= 1 {
+        return;
+    }
+    if seed == 0 {
+        seed = 0x9e37_79b9_7f4a_7c15;
+    }
+    for i in (1..items.len()).rev() {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let j = (seed as usize) % (i + 1);
+        items.swap(i, j);
+    }
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use super::shuffle_vec;
+
+    #[test]
+    fn shuffle_preserves_all_elements() {
+        let mut v = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        shuffle_vec(&mut v, 12345);
+        v.sort();
+        assert_eq!(v, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 }

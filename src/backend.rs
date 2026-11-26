@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::auth::Session;
 use crate::innertube::{self, FeedPage, WebConfig};
 use crate::model::{
-    ChannelInfo, CommentItem, FeedChip, LiveChatMessage, PlaylistOption, PlaylistSummary,
-    PreferredQuality, SidebarChannel, SponsorSegment, VideoFormat, VideoItem, WatchData,
+    AudioTrack, ChannelInfo, CommentItem, FeedChip, LiveChatEmote, LiveChatMessage,
+    PlaylistOption, PlaylistSummary, PreferredQuality, SidebarChannel, SponsorSegment, VideoFormat,
+    VideoItem, WatchData,
 };
 use crate::proxy::StreamProxy;
 use crate::{login, mpv, sponsorblock, ytdlp};
@@ -29,6 +30,21 @@ pub enum Request {
     LoadPlaylist {
         browse_id: String,
         continuation: Option<String>,
+    },
+    LoadFullPlaylistForQueue {
+        browse_id: String,
+        continuation: String,
+        shuffle: bool,
+    },
+    PlaylistRemoveItem {
+        playlist_id: String,
+        video_id: String,
+        set_video_id: Option<String>,
+    },
+    PlaylistMoveItem {
+        playlist_id: String,
+        set_video_id: String,
+        successor_set_video_id: Option<String>,
     },
     LoadTrending,
     LoadChannel {
@@ -52,6 +68,13 @@ pub enum Request {
         video_id: String,
         quality: PreferredQuality,
         sync_history: bool,
+    },
+    RecoverStream {
+        video_id: String,
+        quality: PreferredQuality,
+        preferred_height: Option<u32>,
+        preferred_audio_id: Option<String>,
+        resume_secs: f64,
     },
     LoadComments {
         video_id: String,
@@ -79,11 +102,19 @@ pub enum Request {
     LoadLiveChat {
         video_id: String,
         continuation: String,
+        replay_offset_ms: Option<u64>,
     },
     SendLiveChat {
         video_id: String,
         params: String,
         message: String,
+        emotes: Vec<LiveChatEmote>,
+    },
+    PerformCommentAction {
+        video_id: String,
+        comment_id: String,
+        action_params: String,
+        liked: bool,
     },
     RemoveFromHistory {
         video_id: String,
@@ -159,10 +190,17 @@ pub enum Response {
     PlaylistLoaded {
         browse_id: String,
         title: String,
+        is_editable: bool,
         items: Vec<VideoItem>,
         continuation: Option<String>,
         append: bool,
     },
+    FullPlaylistQueueLoaded {
+        items: Vec<VideoItem>,
+        shuffle: bool,
+    },
+    PlaylistItemRemoved,
+    PlaylistReordered,
     TrendingLoaded {
         items: Vec<VideoItem>,
     },
@@ -197,6 +235,24 @@ pub enum Response {
         selected_format_idx: Option<usize>,
         used_ytdlp: bool,
     },
+    StreamRecovered {
+        video_id: String,
+        video_formats: Vec<VideoFormat>,
+        audio_url: Option<String>,
+        audio_content_length: u64,
+        audio_tracks: Vec<AudioTrack>,
+        hls_url: Option<String>,
+        selected_video_url: String,
+        selected_audio_url: Option<String>,
+        selected_format_idx: Option<usize>,
+        selected_audio_idx: usize,
+        used_ytdlp: bool,
+        resume_secs: f64,
+    },
+    StreamRecoverFailed {
+        video_id: String,
+        message: String,
+    },
     CommentsLoaded {
         video_id: String,
         comments: Vec<CommentItem>,
@@ -224,9 +280,16 @@ pub enum Response {
         messages: Vec<LiveChatMessage>,
         next_token: Option<String>,
         send_params: Option<String>,
+        emotes: Vec<LiveChatEmote>,
+        is_replay: bool,
     },
     LiveChatSent {
         video_id: String,
+    },
+    CommentActionUpdated {
+        video_id: String,
+        comment_id: String,
+        liked: bool,
     },
     HistoryRemoved,
     LikeUpdated {
@@ -447,6 +510,18 @@ impl Backend {
         }
     }
 
+    pub fn is_proxy_forbidden(&self, url: &str) -> bool {
+        self.proxy
+            .as_ref()
+            .is_some_and(|p| p.is_session_forbidden(url))
+    }
+
+    pub fn is_proxy_failed(&self, url: &str) -> bool {
+        self.proxy
+            .as_ref()
+            .is_some_and(|p| p.is_session_failed(url))
+    }
+
     pub fn spawn(data_dir: PathBuf, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
         let (req_tx, req_rx) = unbounded::<Request>();
         let (resp_tx, resp_rx) = unbounded::<Response>();
@@ -653,6 +728,7 @@ impl Backend {
                                     {
                                         Ok((
                                             title,
+                                            is_editable,
                                             FeedPage {
                                                 items,
                                                 continuation,
@@ -662,6 +738,7 @@ impl Backend {
                                             let _ = resp_tx.send(Response::PlaylistLoaded {
                                                 browse_id,
                                                 title,
+                                                is_editable,
                                                 items,
                                                 continuation,
                                                 append,
@@ -670,6 +747,115 @@ impl Backend {
                                         Err(e) => {
                                             let _ = resp_tx.send(Response::Error(format!(
                                                 "Playlist failed: {e:#}"
+                                            )));
+                                        }
+                                    }
+                                    wake();
+                                });
+                            }
+                            Request::LoadFullPlaylistForQueue {
+                                browse_id,
+                                continuation,
+                                shuffle,
+                            } => {
+                                let cfg_clone = cfg.clone();
+                                let sess_clone = session.clone();
+                                tokio::spawn(async move {
+                                    let mut all = Vec::new();
+                                    let mut cont = Some(continuation);
+                                    for _ in 0..8 {
+                                        let Some(tok) = cont.take() else { break };
+                                        match innertube::playlist_feed(
+                                            &http,
+                                            &browse_id,
+                                            Some(&tok),
+                                            &cfg_clone,
+                                            sess_clone.as_ref(),
+                                        )
+                                        .await
+                                        {
+                                            Ok((_, _, page)) => {
+                                                all.extend(page.items);
+                                                cont = page.continuation;
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                    if !all.is_empty() {
+                                        let _ = resp_tx.send(Response::FullPlaylistQueueLoaded {
+                                            items: all,
+                                            shuffle,
+                                        });
+                                        wake();
+                                    }
+                                });
+                            }
+                            Request::PlaylistRemoveItem {
+                                playlist_id,
+                                video_id,
+                                set_video_id,
+                            } => {
+                                let Some(s) = session.clone() else {
+                                    let _ = resp_tx.send(Response::Error(
+                                        "Sign in to edit playlists".into(),
+                                    ));
+                                    wake();
+                                    continue;
+                                };
+                                let cfg_clone = cfg.clone();
+                                tokio::spawn(async move {
+                                    match innertube::remove_playlist_item(
+                                        &http,
+                                        &playlist_id,
+                                        &video_id,
+                                        set_video_id.as_deref(),
+                                        &cfg_clone,
+                                        &s,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            let _ = resp_tx.send(Response::PlaylistItemRemoved);
+                                        }
+                                        Err(e) => {
+                                            let _ = resp_tx.send(Response::Error(format!(
+                                                "Remove from playlist failed: {e:#}"
+                                            )));
+                                        }
+                                    }
+                                    wake();
+                                });
+                            }
+                            Request::PlaylistMoveItem {
+                                playlist_id,
+                                set_video_id,
+                                successor_set_video_id,
+                            } => {
+                                let Some(s) = session.clone() else {
+                                    let _ = resp_tx.send(Response::Error(
+                                        "Sign in to reorder playlists".into(),
+                                    ));
+                                    wake();
+                                    continue;
+                                };
+                                let cfg_clone = cfg.clone();
+                                tokio::spawn(async move {
+                                    match innertube::reorder_playlist_item(
+                                        &http,
+                                        &playlist_id,
+                                        &set_video_id,
+                                        successor_set_video_id.as_deref(),
+                                        &cfg_clone,
+                                        &s,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            let _ = resp_tx.send(Response::PlaylistReordered);
+                                        }
+                                        Err(e) => {
+                                            let _ = resp_tx.send(Response::Error(format!(
+                                                "Reorder playlist failed: {e:#}"
                                             )));
                                         }
                                     }
@@ -970,6 +1156,7 @@ impl Backend {
                             Request::LoadLiveChat {
                                 video_id,
                                 continuation,
+                                replay_offset_ms,
                             } => {
                                 let cfg_clone = cfg.clone();
                                 let sess_clone = session.clone();
@@ -977,6 +1164,7 @@ impl Backend {
                                     if let Ok(page) = innertube::fetch_live_chat(
                                         &http,
                                         &continuation,
+                                        replay_offset_ms,
                                         &cfg_clone,
                                         sess_clone.as_ref(),
                                     )
@@ -987,6 +1175,8 @@ impl Backend {
                                             messages: page.messages,
                                             next_token: page.next_token,
                                             send_params: page.send_params,
+                                            emotes: page.emotes,
+                                            is_replay: page.is_replay,
                                         });
                                         wake();
                                     }
@@ -996,6 +1186,7 @@ impl Backend {
                                 video_id,
                                 params,
                                 message,
+                                emotes,
                             } => {
                                 let Some(s) = session.clone() else {
                                     let _ = resp_tx.send(Response::Error(
@@ -1010,6 +1201,7 @@ impl Backend {
                                         &http,
                                         &params,
                                         &message,
+                                        &emotes,
                                         &cfg_clone,
                                         &s,
                                     )
@@ -1023,6 +1215,45 @@ impl Backend {
                                         Err(e) => {
                                             let _ = resp_tx.send(Response::Error(format!(
                                                 "Live chat send failed: {e:#}"
+                                            )));
+                                        }
+                                    }
+                                    wake();
+                                });
+                            }
+                            Request::PerformCommentAction {
+                                video_id,
+                                comment_id,
+                                action_params,
+                                liked,
+                            } => {
+                                let Some(s) = session.clone() else {
+                                    let _ = resp_tx.send(Response::Error(
+                                        "Sign in to like comments".into(),
+                                    ));
+                                    wake();
+                                    continue;
+                                };
+                                let cfg_clone = cfg.clone();
+                                tokio::spawn(async move {
+                                    match innertube::perform_comment_action(
+                                        &http,
+                                        &action_params,
+                                        &cfg_clone,
+                                        &s,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            let _ = resp_tx.send(Response::CommentActionUpdated {
+                                                video_id,
+                                                comment_id,
+                                                liked,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = resp_tx.send(Response::Error(format!(
+                                                "Comment action failed: {e:#}"
                                             )));
                                         }
                                     }
@@ -1498,6 +1729,108 @@ impl Backend {
                                     }
                                 });
                             }
+                            Request::RecoverStream {
+                                video_id,
+                                quality,
+                                preferred_height,
+                                preferred_audio_id,
+                                resume_secs,
+                            } => {
+                                let cfg_clone = cfg.clone();
+                                let sess_clone = session.clone();
+                                let proxy_clone = proxy.clone();
+                                tokio::spawn(async move {
+                                    let effective_quality = match preferred_height {
+                                        Some(h) if h <= 480 => PreferredQuality::P480,
+                                        Some(h) if h <= 720 => PreferredQuality::P720,
+                                        Some(h) if h <= 1080 => PreferredQuality::P1080,
+                                        Some(h) if h <= 1440 => PreferredQuality::P1440,
+                                        Some(_) => PreferredQuality::Best4K,
+                                        None => quality,
+                                    };
+                                    match resolve_watch(
+                                        &http,
+                                        &data_dir,
+                                        &video_id,
+                                        effective_quality,
+                                        &cfg_clone,
+                                        sess_clone.as_ref(),
+                                        proxy_clone.as_ref(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Response::WatchReady {
+                                            data,
+                                            mut selected_video_url,
+                                            mut selected_audio_url,
+                                            mut selected_format_idx,
+                                            used_ytdlp,
+                                        }) => {
+                                            let mut selected_audio_idx = 0;
+                                            if let Some(aid) = preferred_audio_id.as_deref() {
+                                                if let Some(aidx) =
+                                                    data.audio_tracks.iter().position(|t| t.id == aid)
+                                                {
+                                                    selected_audio_idx = aidx;
+                                                }
+                                            }
+                                            if let Some(h) = preferred_height {
+                                                if let Some(idx) =
+                                                    pick_format_index(&data.video_formats, h)
+                                                {
+                                                    let fmt = &data.video_formats[idx];
+                                                    let wrap = |url: &str, len: u64| -> String {
+                                                        let is_hls = url.contains(".m3u8")
+                                                            || url.contains("/manifest/hls");
+                                                        match proxy_clone.as_ref() {
+                                                            Some(p) if !is_hls => {
+                                                                p.register(url, len)
+                                                            }
+                                                            _ => url.to_owned(),
+                                                        }
+                                                    };
+                                                    selected_format_idx = Some(idx);
+                                                    selected_video_url =
+                                                        wrap(&fmt.url, fmt.content_length);
+                                                    selected_audio_url = if fmt.has_audio {
+                                                        None
+                                                    } else if let Some(tr) =
+                                                        data.audio_tracks.get(selected_audio_idx)
+                                                    {
+                                                        Some(wrap(&tr.url, tr.content_length))
+                                                    } else {
+                                                        data.audio_url.as_deref().map(|u| {
+                                                            wrap(u, data.audio_content_length)
+                                                        })
+                                                    };
+                                                }
+                                            }
+                                            let _ = resp_tx.send(Response::StreamRecovered {
+                                                video_id,
+                                                video_formats: data.video_formats,
+                                                audio_url: data.audio_url,
+                                                audio_content_length: data.audio_content_length,
+                                                audio_tracks: data.audio_tracks,
+                                                hls_url: data.hls_url,
+                                                selected_video_url,
+                                                selected_audio_url,
+                                                selected_format_idx,
+                                                selected_audio_idx,
+                                                used_ytdlp,
+                                                resume_secs,
+                                            });
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            let _ = resp_tx.send(Response::StreamRecoverFailed {
+                                                video_id,
+                                                message: format!("Stream recovery failed: {e:#}"),
+                                            });
+                                        }
+                                    }
+                                    wake();
+                                });
+                            }
                             Request::SignIn => {
                                 let profile = data_dir.join("login-webview");
                                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1707,10 +2040,28 @@ async fn report_history_loop(
     }
 }
 
+async fn populate_hls_variants_if_needed(http: &reqwest::Client, data: &mut WatchData) {
+    let Some(hls) = data.hls_url.as_deref() else {
+        return;
+    };
+    if !data.is_live && !data.video_formats.is_empty() {
+        return;
+    }
+    let (fmts, audio) = innertube::fetch_hls_variants(http, hls).await;
+    if !fmts.is_empty() {
+        data.video_formats = fmts;
+    }
+    if data.audio_tracks.is_empty() && !audio.is_empty() {
+        data.audio_url = audio.first().map(|t| t.url.clone());
+        data.audio_content_length = 0;
+        data.audio_tracks = audio;
+    }
+}
+
 fn apply_ytdlp_streams(
     data: &mut WatchData,
     yt: ytdlp::YtdlpStreams,
-    max_height: u32,
+    quality: PreferredQuality,
     proxy: Option<&StreamProxy>,
 ) -> (String, Option<String>, Option<usize>) {
     let ua = yt.user_agent.as_deref().unwrap_or("");
@@ -1734,7 +2085,15 @@ fn apply_ytdlp_streams(
     if yt.hls_url.is_some() {
         data.hls_url = yt.hls_url.clone();
     }
-    let fmt_idx = pick_format_index(&data.video_formats, max_height);
+    if let Some(live) = yt.is_live {
+        data.is_live = live;
+    }
+    if data.is_live && quality == PreferredQuality::Best4K {
+        if let Some(hls) = data.hls_url.clone() {
+            return (hls, None, None);
+        }
+    }
+    let fmt_idx = pick_format_index(&data.video_formats, quality.max_height());
     let (v_url, a_url) = if let Some(idx) = fmt_idx {
         let fmt = &data.video_formats[idx];
         let v = wrap_yt(&fmt.url, fmt.content_length);
@@ -1781,8 +2140,30 @@ async fn resolve_watch(
     };
     match innertube::watch(http, video_id, cfg, session).await {
         Ok(mut data) => {
+            populate_hls_variants_if_needed(http, &mut data).await;
             // Livestreams play much more reliably via HLS manifest than raw adaptive URLs
             if data.is_live {
+                if quality != PreferredQuality::Best4K {
+                    if let Some(idx) = pick_format_index(&data.video_formats, quality.max_height())
+                    {
+                        let fmt = &data.video_formats[idx];
+                        let video_url = wrap(&fmt.url, fmt.content_length);
+                        let audio = if fmt.has_audio {
+                            None
+                        } else {
+                            data.audio_url
+                                .as_deref()
+                                .map(|u| wrap(u, data.audio_content_length))
+                        };
+                        return Ok(Response::WatchReady {
+                            selected_video_url: video_url,
+                            selected_audio_url: audio,
+                            selected_format_idx: Some(idx),
+                            data: Box::new(data),
+                            used_ytdlp: false,
+                        });
+                    }
+                }
                 if let Some(hls) = data.hls_url.clone() {
                     return Ok(Response::WatchReady {
                         selected_video_url: hls,
@@ -1829,7 +2210,7 @@ async fn resolve_watch(
             )
             .await?;
             let (selected_video_url, selected_audio_url, fmt_idx) =
-                apply_ytdlp_streams(&mut data, yt, quality.max_height(), proxy);
+                apply_ytdlp_streams(&mut data, yt, quality, proxy);
             Ok(Response::WatchReady {
                 selected_video_url,
                 selected_audio_url,
@@ -1900,7 +2281,7 @@ async fn resolve_watch(
                 data.duration_secs = yt.duration_secs;
             }
             let (selected_video_url, selected_audio_url, fmt_idx) =
-                apply_ytdlp_streams(&mut data, yt, quality.max_height(), proxy);
+                apply_ytdlp_streams(&mut data, yt, quality, proxy);
             Ok(Response::WatchReady {
                 selected_video_url,
                 selected_audio_url,

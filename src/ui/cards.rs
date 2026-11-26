@@ -19,6 +19,7 @@ pub(super) enum GridAction {
     Download { item: VideoItem, audio_only: bool },
     CopyUrl(String),
     RemoveFromHistory(VideoItem),
+    RemoveFromPlaylist(VideoItem),
     LoadMore,
 }
 
@@ -323,6 +324,26 @@ pub(super) fn draw_video_grid_opts(
     has_more: bool,
     show_remove_history: bool,
 ) -> Option<GridAction> {
+    draw_video_grid_with_flags(
+        ui,
+        heading,
+        items,
+        loading,
+        has_more,
+        show_remove_history,
+        false,
+    )
+}
+
+pub(super) fn draw_video_grid_with_flags(
+    ui: &mut egui::Ui,
+    heading: &str,
+    items: &[VideoItem],
+    loading: bool,
+    has_more: bool,
+    show_remove_history: bool,
+    show_remove_playlist: bool,
+) -> Option<GridAction> {
     let mut action = None;
     if !heading.is_empty() || loading {
         ui.horizontal(|ui| {
@@ -507,6 +528,17 @@ pub(super) fn draw_video_grid_opts(
                                             action = Some(GridAction::RemoveFromHistory(item.clone()));
                                             ui.close();
                                         }
+                                        if show_remove_playlist
+                                            && ui
+                                                .button(format!(
+                                                    "{}  Remove from playlist",
+                                                    icon::TRASH_2
+                                                ))
+                                                .clicked()
+                                        {
+                                            action = Some(GridAction::RemoveFromPlaylist(item.clone()));
+                                            ui.close();
+                                        }
                                     });
                                     if mresp.hovered() || mresp.clicked() {
                                         child_clicked_override = true;
@@ -524,6 +556,14 @@ pub(super) fn draw_video_grid_opts(
                                 .clicked()
                         {
                             action = Some(GridAction::RemoveFromHistory(item.clone()));
+                            ui.close();
+                        }
+                        if show_remove_playlist
+                            && ui
+                                .button(format!("{}  Remove from playlist", icon::TRASH_2))
+                                .clicked()
+                        {
+                            action = Some(GridAction::RemoveFromPlaylist(item.clone()));
                             ui.close();
                         }
                     });

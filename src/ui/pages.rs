@@ -8,7 +8,10 @@ use crate::model::{ChannelInfo, HwdecMode, PreferredQuality, VideoItem};
 use crate::theme::{self, icon};
 use crate::ytdlp;
 
-use super::cards::{draw_avatar, draw_thumbnail, draw_video_grid, icon_circle_button, settings_card};
+use super::cards::{
+    draw_avatar, draw_thumbnail, draw_video_grid, draw_video_grid_with_flags, icon_circle_button,
+    settings_card,
+};
 use super::{GUEST_TOPICS, Page, SubsFilter, YtApp, format_duration};
 
 impl YtApp {
@@ -516,23 +519,78 @@ impl YtApp {
                             Color32::from_rgb(15, 15, 15),
                         )
                     };
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new(sub_label)
-                                    .font(theme::semibold(13.0))
-                                    .color(sub_text_col),
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(sub_label)
+                                        .font(theme::semibold(13.0))
+                                        .color(sub_text_col),
+                                )
+                                .fill(sub_fill)
+                                .corner_radius(18),
                             )
-                            .fill(sub_fill)
-                            .corner_radius(18),
-                        )
-                        .clicked()
-                    {
-                        let _ = self.backend.tx.send(Request::SetSubscribe {
-                            channel_id: cid,
-                            subscribe: !info.is_subscribed,
-                        });
-                    }
+                            .clicked()
+                        {
+                            let _ = self.backend.tx.send(Request::SetSubscribe {
+                                channel_id: cid,
+                                subscribe: !info.is_subscribed,
+                            });
+                        }
+                        if self
+                            .channel_items
+                            .iter()
+                            .any(|it| it.playlist_browse_id.is_none())
+                        {
+                            let items_snap = self.channel_items.clone();
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(format!("{}  Play All", icon::PLAY))
+                                            .font(theme::medium(12.5))
+                                            .color(theme::TEXT),
+                                    )
+                                    .fill(theme::CHIP)
+                                    .corner_radius(18),
+                                )
+                                .clicked()
+                            {
+                                self.play_all(&items_snap, false, None);
+                            }
+                            let (sh_rect, sh_resp) = ui.allocate_exact_size(
+                                Vec2::new(88.0, 30.0),
+                                Sense::click(),
+                            );
+                            if sh_resp.hovered() {
+                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                            }
+                            ui.painter().rect_filled(
+                                sh_rect,
+                                15.0,
+                                if sh_resp.hovered() {
+                                    theme::CHIP_HOVER
+                                } else {
+                                    theme::CHIP
+                                },
+                            );
+                            theme::draw_shuffle_icon(
+                                ui.painter(),
+                                pos2(sh_rect.left() + 17.0, sh_rect.center().y),
+                                14.0,
+                                theme::TEXT,
+                            );
+                            ui.painter().text(
+                                pos2(sh_rect.left() + 30.0, sh_rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                "Shuffle",
+                                theme::medium(12.5),
+                                theme::TEXT,
+                            );
+                            if sh_resp.clicked() {
+                                self.play_all(&items_snap, true, None);
+                            }
+                        }
+                    });
                 }
             });
         });
@@ -1314,6 +1372,332 @@ impl YtApp {
 
         if let Some((bid, title)) = open_pl {
             self.open_playlist(bid, title);
+        }
+    }
+
+    pub(super) fn draw_playlist_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let heading = self.active_playlist_title.clone();
+        let items = self.playlist_items.clone();
+        let loading = self.playlist_loading;
+        let cont = self.playlist_continuation.clone();
+        let editable = self.playlist_is_editable && self.signed_in;
+        let has_videos = items.iter().any(|it| it.playlist_browse_id.is_none());
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(&heading).font(theme::bold(20.0)));
+            if !items.is_empty() {
+                ui.label(
+                    RichText::new(format!(
+                        "{} video{}",
+                        items.len(),
+                        if items.len() == 1 { "" } else { "s" }
+                    ))
+                    .font(theme::regular(13.0))
+                    .color(theme::TEXT_DIM),
+                );
+            }
+            if loading {
+                ui.spinner();
+            }
+            if has_videos {
+                ui.add_space(10.0);
+                let pl_cont = self
+                    .active_playlist_id
+                    .clone()
+                    .zip(cont.clone());
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(format!("{}  Play All", icon::PLAY))
+                                .font(theme::semibold(13.0))
+                                .color(Color32::from_rgb(15, 15, 15)),
+                        )
+                        .fill(Color32::from_rgb(241, 241, 241))
+                        .corner_radius(18),
+                    )
+                    .clicked()
+                {
+                    self.play_all(&items, false, pl_cont.clone());
+                }
+                let (sh_rect, sh_resp) =
+                    ui.allocate_exact_size(Vec2::new(92.0, 32.0), Sense::click());
+                if sh_resp.hovered() {
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                }
+                ui.painter().rect_filled(
+                    sh_rect,
+                    16.0,
+                    if sh_resp.hovered() {
+                        theme::CHIP_HOVER
+                    } else {
+                        theme::CHIP
+                    },
+                );
+                theme::draw_shuffle_icon(
+                    ui.painter(),
+                    pos2(sh_rect.left() + 18.0, sh_rect.center().y),
+                    14.0,
+                    theme::TEXT,
+                );
+                ui.painter().text(
+                    pos2(sh_rect.left() + 31.0, sh_rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    "Shuffle",
+                    theme::semibold(13.0),
+                    theme::TEXT,
+                );
+                if sh_resp.clicked() {
+                    self.play_all(&items, true, pl_cont);
+                }
+            }
+            if editable && !items.is_empty() {
+                let manage_fill = if self.playlist_manage_mode {
+                    theme::YT_BLUE.gamma_multiply(0.24)
+                } else {
+                    theme::CHIP
+                };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(format!(
+                                "{}  {}",
+                                icon::LIST_MUSIC,
+                                if self.playlist_manage_mode {
+                                    "Done editing"
+                                } else {
+                                    "Reorder / Edit"
+                                }
+                            ))
+                            .font(theme::medium(12.5))
+                            .color(if self.playlist_manage_mode {
+                                theme::YT_BLUE
+                            } else {
+                                theme::TEXT
+                            }),
+                        )
+                        .fill(manage_fill)
+                        .corner_radius(18),
+                    )
+                    .clicked()
+                {
+                    self.playlist_manage_mode = !self.playlist_manage_mode;
+                }
+            }
+        });
+        ui.add_space(10.0);
+
+        if self.playlist_manage_mode && editable {
+            let mut move_pair: Option<(usize, usize)> = None;
+            let mut remove_item: Option<VideoItem> = None;
+            let mut open_item: Option<VideoItem> = None;
+            let mut load_more_clicked = false;
+            let mut row_rects: Vec<(usize, Rect)> = Vec::new();
+            let ptr_down = ui.input(|i| i.pointer.primary_down());
+            let ptr_pos = ui.input(|i| i.pointer.interact_pos());
+
+            if !ptr_down {
+                self.playlist_drag_idx = None;
+                self.playlist_drag_origin = None;
+                self.playlist_drag_active = false;
+            }
+
+            ScrollArea::vertical()
+                .id_salt("playlist_manage_scroll")
+                .show(ui, |ui| {
+                    let row_w = ui.available_width().min(860.0);
+                    for (idx, it) in items.iter().enumerate() {
+                        let is_dragged =
+                            self.playlist_drag_active && self.playlist_drag_idx == Some(idx);
+                        let frame_resp = Frame::new()
+                            .fill(if is_dragged {
+                                theme::CHIP_HOVER
+                            } else {
+                                theme::SURFACE
+                            })
+                            .stroke(Stroke::new(
+                                1.0,
+                                if is_dragged {
+                                    theme::YT_BLUE
+                                } else {
+                                    theme::BORDER
+                                },
+                            ))
+                            .corner_radius(10)
+                            .inner_margin(Margin::symmetric(10, 8))
+                            .show(ui, |ui| {
+                                ui.set_width(row_w);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("{:>2}", idx + 1))
+                                            .font(theme::medium(12.5))
+                                            .color(theme::TEXT_DIM),
+                                    );
+                                    let thumb_resp = ui
+                                        .horizontal(|ui| {
+                                            draw_thumbnail(
+                                                ui,
+                                                &it.thumbnail_url,
+                                                &it.duration_text,
+                                                Vec2::new(112.0, 63.0),
+                                                7.0,
+                                                it.watched_percent,
+                                            );
+                                        })
+                                        .response
+                                        .interact(Sense::click());
+                                    if thumb_resp.clicked() {
+                                        open_item = Some(it.clone());
+                                    }
+                                    ui.add_space(8.0);
+                                    ui.vertical(|ui| {
+                                        ui.set_max_width((row_w - 280.0).max(140.0));
+                                        let title_resp = ui
+                                            .add(
+                                                egui::Label::new(
+                                                    RichText::new(&it.title)
+                                                        .font(theme::semibold(13.5))
+                                                        .color(Color32::WHITE),
+                                                )
+                                                .truncate(),
+                                            )
+                                            .interact(Sense::click());
+                                        if title_resp.clicked() {
+                                            open_item = Some(it.clone());
+                                        }
+                                        if !it.channel.is_empty() {
+                                            ui.label(
+                                                RichText::new(&it.channel)
+                                                    .font(theme::regular(12.0))
+                                                    .color(theme::TEXT_DIM),
+                                            );
+                                        }
+                                    });
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if icon_circle_button(
+                                            ui,
+                                            icon::TRASH_2,
+                                            15.0,
+                                            "Remove from playlist",
+                                        ) {
+                                            remove_item = Some(it.clone());
+                                        }
+                                        if it.playlist_set_video_id.is_some() {
+                                            if idx + 1 < items.len()
+                                                && icon_circle_button(
+                                                    ui,
+                                                    icon::CHEVRON_DOWN,
+                                                    15.0,
+                                                    "Move down",
+                                                )
+                                            {
+                                                move_pair = Some((idx, idx + 1));
+                                            }
+                                            if idx > 0
+                                                && icon_circle_button(
+                                                    ui,
+                                                    icon::CHEVRON_UP,
+                                                    15.0,
+                                                    "Move up",
+                                                )
+                                            {
+                                                move_pair = Some((idx, idx - 1));
+                                            }
+                                        }
+                                    });
+                                });
+                            });
+                        let rect = frame_resp.response.rect;
+                        row_rects.push((idx, rect));
+                        if it.playlist_set_video_id.is_some()
+                            && frame_resp.response.hovered()
+                            && ui.input(|i| i.pointer.primary_pressed())
+                        {
+                            self.playlist_drag_idx = Some(idx);
+                            self.playlist_drag_origin =
+                                ptr_pos.map(|p| (p, std::time::Instant::now()));
+                            self.playlist_drag_active = false;
+                        }
+                        ui.add_space(6.0);
+                    }
+                    if cont.is_some() && !loading {
+                        ui.add_space(6.0);
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Load more").font(theme::medium(13.0)),
+                                )
+                                .fill(theme::CHIP)
+                                .corner_radius(18),
+                            )
+                            .clicked()
+                        {
+                            load_more_clicked = true;
+                        }
+                    }
+                });
+
+            if let (Some(from), Some(p)) = (self.playlist_drag_idx, ptr_pos) {
+                if !self.playlist_drag_active {
+                    if let Some((orig, started)) = self.playlist_drag_origin {
+                        if started.elapsed() >= std::time::Duration::from_millis(180)
+                            || (p - orig).length() > 8.0
+                        {
+                            self.playlist_drag_active = true;
+                        }
+                    }
+                }
+                if self.playlist_drag_active {
+                    ctx.set_cursor_icon(CursorIcon::Grabbing);
+                    if let Some((target_idx, _)) =
+                        row_rects.iter().find(|(_, r)| r.contains(p))
+                    {
+                        if *target_idx != from {
+                            move_pair = Some((from, *target_idx));
+                            self.playlist_drag_idx = Some(*target_idx);
+                        }
+                    }
+                }
+            }
+
+            if let Some((from, to)) = move_pair {
+                self.move_playlist_item(from, to);
+            }
+            if let Some(it) = remove_item {
+                self.remove_playlist_item(&it);
+            }
+            if let Some(it) = open_item {
+                self.open_video(it);
+            }
+            if load_more_clicked {
+                if let Some(bid) = self.active_playlist_id.clone() {
+                    self.playlist_loading = true;
+                    let _ = self.backend.tx.send(Request::LoadPlaylist {
+                        browse_id: bid,
+                        continuation: cont,
+                    });
+                }
+            }
+            return;
+        }
+
+        if let Some(act) = draw_video_grid_with_flags(
+            ui,
+            "",
+            &items,
+            loading,
+            cont.is_some(),
+            false,
+            editable,
+        ) {
+            self.handle_grid_action(ctx, act, |app| {
+                if let Some(bid) = app.active_playlist_id.clone() {
+                    app.playlist_loading = true;
+                    let _ = app.backend.tx.send(Request::LoadPlaylist {
+                        browse_id: bid,
+                        continuation: cont,
+                    });
+                }
+            });
         }
     }
 }

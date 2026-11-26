@@ -108,6 +108,7 @@ pub struct YtdlpStreams {
     pub channel_id: Option<String>,
     pub description: String,
     pub duration_secs: f64,
+    pub is_live: Option<bool>,
 }
 
 pub fn remove_leftover_cookies(data_dir: &Path) {
@@ -516,9 +517,18 @@ fn parse_ytdlp_streams(v: &Value) -> anyhow::Result<YtdlpStreams> {
         .map(str::to_owned);
     let description = v["description"].as_str().unwrap_or_default().to_owned();
     let duration_secs = v["duration"].as_f64().unwrap_or(0.0);
+    let is_live = v["is_live"]
+        .as_bool()
+        .or_else(|| match v["live_status"].as_str() {
+            Some("is_live") => Some(true),
+            Some("was_live") | Some("not_live") | Some("post_live") | Some("is_upcoming") => {
+                Some(false)
+            }
+            _ => None,
+        });
 
-    let mut video_formats = Vec::new();
-    let mut audio_cands: Vec<(bool, u64, AudioTrack)> = Vec::new();
+    let mut video_formats: Vec<(bool, VideoFormat)> = Vec::new();
+    let mut audio_cands: Vec<(bool, bool, u64, AudioTrack)> = Vec::new();
     let mut best_hls_url: Option<String> = v["manifest_url"].as_str().map(str::to_owned);
 
     if let Some(formats) = v["formats"].as_array() {
@@ -527,13 +537,11 @@ fn parse_ytdlp_streams(v: &Value) -> anyhow::Result<YtdlpStreams> {
             let Some(url) = f["url"].as_str() else {
                 continue;
             };
-            if protocol.contains("m3u8") {
-                if f["vcodec"].as_str().is_some_and(|c| c != "none") {
-                    best_hls_url = Some(url.to_owned());
-                }
-                continue;
+            let is_hls = protocol.contains("m3u8");
+            if is_hls && best_hls_url.is_none() && f["vcodec"].as_str().is_some_and(|c| c != "none") {
+                best_hls_url = Some(url.to_owned());
             }
-            if protocol != "https" && protocol != "http" {
+            if protocol != "https" && protocol != "http" && !is_hls {
                 continue;
             }
             let vcodec = f["vcodec"].as_str().unwrap_or("none");
@@ -558,17 +566,20 @@ fn parse_ytdlp_streams(v: &Value) -> anyhow::Result<YtdlpStreams> {
                     .as_str()
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(0);
-                video_formats.push(VideoFormat {
-                    itag,
-                    url: url.to_owned(),
-                    mime: codec_mime(vcodec),
-                    width,
-                    height,
-                    fps,
-                    bitrate,
-                    content_length,
-                    has_audio: acodec != "none",
-                });
+                video_formats.push((
+                    !is_hls,
+                    VideoFormat {
+                        itag,
+                        url: url.to_owned(),
+                        mime: codec_mime(vcodec),
+                        width,
+                        height,
+                        fps,
+                        bitrate,
+                        content_length,
+                        has_audio: acodec != "none",
+                    },
+                ));
             } else if acodec != "none" {
                 let abr = f["abr"]
                     .as_f64()
@@ -589,6 +600,7 @@ fn parse_ytdlp_streams(v: &Value) -> anyhow::Result<YtdlpStreams> {
                 };
                 audio_cands.push((
                     is_default,
+                    !is_hls,
                     abr,
                     AudioTrack {
                         id: f["format_id"].as_str().unwrap_or_default().to_owned(),
@@ -603,14 +615,15 @@ fn parse_ytdlp_streams(v: &Value) -> anyhow::Result<YtdlpStreams> {
     }
 
     video_formats.sort_by(|a, b| {
-        b.height
-            .cmp(&a.height)
-            .then_with(|| b.fps.cmp(&a.fps))
-            .then_with(|| ytdlp_codec_rank(&b.mime).cmp(&ytdlp_codec_rank(&a.mime)))
-            .then_with(|| b.bitrate.cmp(&a.bitrate))
+        b.1.height
+            .cmp(&a.1.height)
+            .then_with(|| b.1.fps.cmp(&a.1.fps))
+            .then_with(|| ytdlp_codec_rank(&b.1.mime).cmp(&ytdlp_codec_rank(&a.1.mime)))
+            .then_with(|| b.0.cmp(&a.0))
+            .then_with(|| b.1.bitrate.cmp(&a.1.bitrate))
     });
     let mut deduped_v = Vec::new();
-    for f in video_formats {
+    for (_, f) in video_formats {
         let same = deduped_v.iter().any(|d: &VideoFormat| {
             d.height == f.height
                 && d.fps == f.fps
@@ -622,9 +635,13 @@ fn parse_ytdlp_streams(v: &Value) -> anyhow::Result<YtdlpStreams> {
         }
     }
 
-    audio_cands.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    audio_cands.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| b.2.cmp(&a.2))
+    });
     let mut audio_tracks: Vec<AudioTrack> = Vec::new();
-    for (_, _, tr) in audio_cands {
+    for (_, _, _, tr) in audio_cands {
         if !audio_tracks.iter().any(|x| x.label == tr.label) {
             audio_tracks.push(tr);
         }
@@ -698,6 +715,7 @@ fn parse_ytdlp_streams(v: &Value) -> anyhow::Result<YtdlpStreams> {
         channel_id,
         description,
         duration_secs,
+        is_live,
     })
 }
 
@@ -838,5 +856,72 @@ mod tests {
         let m = parse_progress_line("[Merger] Merging formats into \"test.mp4\"").unwrap();
         assert_eq!(m.percent, 1.0);
         assert_eq!(m.status, "Merging & finalizing...");
+    }
+
+    #[test]
+    fn distinguishes_archived_vod_from_live_stream() {
+        let vod = serde_json::json!({
+            "id": "vod123",
+            "duration": 7200.0,
+            "is_live": false,
+            "live_status": "was_live",
+            "url": "https://example.com/vod.mp4"
+        });
+        let s_vod = super::parse_ytdlp_streams(&vod).unwrap();
+        assert_eq!(s_vod.is_live, Some(false));
+
+        let was_live_null = serde_json::json!({
+            "id": "vod456",
+            "duration": 3600.0,
+            "is_live": null,
+            "live_status": "was_live",
+            "url": "https://example.com/vod2.mp4"
+        });
+        let s_null = super::parse_ytdlp_streams(&was_live_null).unwrap();
+        assert_eq!(s_null.is_live, Some(false));
+
+        let live = serde_json::json!({
+            "id": "live123",
+            "is_live": true,
+            "live_status": "is_live",
+            "manifest_url": "https://example.com/live.m3u8"
+        });
+        let s_live = super::parse_ytdlp_streams(&live).unwrap();
+        assert_eq!(s_live.is_live, Some(true));
+
+        let hls_vod = serde_json::json!({
+            "id": "hls123",
+            "duration": 120.0,
+            "manifest_url": "https://example.com/master.m3u8",
+            "formats": [
+                {
+                    "format_id": "94",
+                    "protocol": "m3u8_native",
+                    "url": "https://example.com/480.m3u8",
+                    "vcodec": "avc1.4d401f",
+                    "acodec": "mp4a.40.2",
+                    "width": 854,
+                    "height": 480,
+                    "fps": 30.0,
+                    "tbr": 900.0
+                },
+                {
+                    "format_id": "96",
+                    "protocol": "m3u8_native",
+                    "url": "https://example.com/1080.m3u8",
+                    "vcodec": "avc1.640028",
+                    "acodec": "mp4a.40.2",
+                    "width": 1920,
+                    "height": 1080,
+                    "fps": 60.0,
+                    "tbr": 4500.0
+                }
+            ]
+        });
+        let s_hls = super::parse_ytdlp_streams(&hls_vod).unwrap();
+        assert_eq!(s_hls.hls_url.as_deref(), Some("https://example.com/master.m3u8"));
+        assert_eq!(s_hls.video_formats.len(), 2);
+        assert_eq!((s_hls.video_formats[0].height, s_hls.video_formats[0].fps), (1080, 60));
+        assert_eq!(s_hls.video_formats[1].height, 480);
     }
 }

@@ -6,7 +6,7 @@ use egui::{
 };
 
 use crate::backend::Request;
-use crate::model::{LiveChatRun, SponsorCategory, VideoItem, WatchData};
+use crate::model::{LiveChatKind, LiveChatRun, SponsorCategory, VideoItem, WatchData};
 use crate::theme::{self, icon};
 
 use super::cards::{
@@ -976,7 +976,8 @@ impl YtApp {
             let is_hd = self
                 .selected_format_idx
                 .and_then(|i| self.watch.as_ref()?.video_formats.get(i))
-                .is_some_and(|f| f.height >= 720);
+                .is_some_and(|f| f.height >= 720)
+                || (self.selected_format_idx.is_none() && self.playback.video_h >= 720);
             if is_hd {
                 let hd_rect = Rect::from_min_size(
                     pos2(gear_rect.right() - 15.0, gear_rect.top() + 4.0),
@@ -1191,9 +1192,10 @@ impl YtApp {
 
                                 // Quality list
                                 let mut picked_qual = None;
+                                let mut picked_auto = false;
                                 let mut picked_audio = None;
                                 if let Some(w) = &self.watch {
-                                    if !w.video_formats.is_empty() {
+                                    if !w.video_formats.is_empty() || w.hls_url.is_some() {
                                         ui.add_space(8.0);
                                         ui.separator();
                                         ui.add_space(6.0);
@@ -1207,6 +1209,15 @@ impl YtApp {
                                             .id_salt("popover_quality_scroll")
                                             .max_height(145.0)
                                             .show(ui, |ui| {
+                                                if w.hls_url.is_some()
+                                                    && popover_option_row(
+                                                        ui,
+                                                        "Auto",
+                                                        self.selected_format_idx.is_none(),
+                                                    )
+                                                {
+                                                    picked_auto = true;
+                                                }
                                                 for (i, f) in w.video_formats.iter().enumerate() {
                                                     let active = self.selected_format_idx == Some(i);
                                                     if popover_option_row(ui, &f.label(), active) {
@@ -1232,6 +1243,11 @@ impl YtApp {
                                             }
                                         }
                                     }
+                                }
+                                if picked_auto {
+                                    self.switch_quality_auto();
+                                    self.player_menu = PlayerMenu::None;
+                                    interacted = true;
                                 }
                                 if let Some(idx) = picked_qual {
                                     self.switch_quality(idx);
@@ -1791,6 +1807,7 @@ impl YtApp {
             let mut open_reply_for: Option<(String, String)> = None;
             let mut submit_reply: Option<(String, String, String, Option<String>)> = None;
             let mut cancel_reply = false;
+            let mut toggle_like_comment: Option<(String, String, bool)> = None;
             let active_reply_id = self.comment_reply_target_id.clone();
 
             for c in &self.comments {
@@ -1798,6 +1815,22 @@ impl YtApp {
                     draw_avatar(ui, c.avatar_url.as_deref(), &c.author, 34.0);
                     ui.add_space(10.0);
                     ui.vertical(|ui| {
+                        if c.is_pinned {
+                            ui.horizontal(|ui| {
+                                let (prect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                                theme::draw_pin_icon(
+                                    ui.painter(),
+                                    prect.center(),
+                                    11.0,
+                                    theme::TEXT_DIM,
+                                );
+                                ui.label(
+                                    RichText::new("Pinned")
+                                        .font(theme::medium(11.0))
+                                        .color(theme::TEXT_DIM),
+                                );
+                            });
+                        }
                         ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new(&c.author).font(theme::semibold(12.5)));
                             if !c.published.is_empty() {
@@ -1814,12 +1847,59 @@ impl YtApp {
                                 .color(theme::TEXT),
                         );
                         ui.horizontal(|ui| {
+                            let can_like = self.signed_in
+                                && if c.is_liked {
+                                    c.unlike_action_params.is_some()
+                                } else {
+                                    c.like_action_params.is_some()
+                                };
+                            let like_col = if c.is_liked {
+                                theme::YT_BLUE
+                            } else {
+                                theme::TEXT_DIM
+                            };
+                            let (lrect, lresp) = ui.allocate_exact_size(
+                                vec2(22.0, 22.0),
+                                if can_like { Sense::click() } else { Sense::hover() },
+                            );
+                            if can_like && lresp.hovered() {
+                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                            }
+                            theme::draw_thumbs_up(
+                                ui.painter(),
+                                lrect.center(),
+                                13.0,
+                                like_col,
+                                c.is_liked,
+                            );
+                            if can_like && lresp.on_hover_text("Like comment").clicked() {
+                                if let Some(act) = if c.is_liked {
+                                    c.unlike_action_params.clone()
+                                } else {
+                                    c.like_action_params.clone()
+                                } {
+                                    toggle_like_comment = Some((c.id.clone(), act, !c.is_liked));
+                                }
+                            }
                             if !c.likes.is_empty() {
                                 ui.label(
-                                    RichText::new(format!("{} likes", c.likes))
+                                    RichText::new(&c.likes)
                                         .font(theme::regular(11.5))
-                                        .color(theme::TEXT_DIM),
+                                        .color(like_col),
                                 );
+                            }
+                            if c.has_creator_heart {
+                                ui.add_space(4.0);
+                                let (hrect, hresp) =
+                                    ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+                                theme::draw_icon_centered(
+                                    ui.painter(),
+                                    hrect.center(),
+                                    icon::HEART,
+                                    12.5,
+                                    theme::YT_RED,
+                                );
+                                hresp.on_hover_text("Hearted by creator");
                             }
                             if self.signed_in && c.reply_params.is_some() {
                                 if ui
@@ -1917,6 +1997,69 @@ impl YtApp {
                                                 .font(theme::regular(12.5))
                                                 .color(theme::TEXT),
                                         );
+                                        ui.horizontal(|ui| {
+                                            let can_like = self.signed_in
+                                                && if r.is_liked {
+                                                    r.unlike_action_params.is_some()
+                                                } else {
+                                                    r.like_action_params.is_some()
+                                                };
+                                            let like_col = if r.is_liked {
+                                                theme::YT_BLUE
+                                            } else {
+                                                theme::TEXT_DIM
+                                            };
+                                            let (lrect, lresp) = ui.allocate_exact_size(
+                                                vec2(20.0, 20.0),
+                                                if can_like {
+                                                    Sense::click()
+                                                } else {
+                                                    Sense::hover()
+                                                },
+                                            );
+                                            if can_like && lresp.hovered() {
+                                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                            }
+                                            theme::draw_thumbs_up(
+                                                ui.painter(),
+                                                lrect.center(),
+                                                12.0,
+                                                like_col,
+                                                r.is_liked,
+                                            );
+                                            if can_like && lresp.on_hover_text("Like reply").clicked()
+                                            {
+                                                if let Some(act) = if r.is_liked {
+                                                    r.unlike_action_params.clone()
+                                                } else {
+                                                    r.like_action_params.clone()
+                                                } {
+                                                    toggle_like_comment =
+                                                        Some((r.id.clone(), act, !r.is_liked));
+                                                }
+                                            }
+                                            if !r.likes.is_empty() {
+                                                ui.label(
+                                                    RichText::new(&r.likes)
+                                                        .font(theme::regular(11.0))
+                                                        .color(like_col),
+                                                );
+                                            }
+                                            if r.has_creator_heart {
+                                                let (hrect, hresp) = ui.allocate_exact_size(
+                                                    vec2(16.0, 16.0),
+                                                    Sense::hover(),
+                                                );
+                                                theme::draw_icon_centered(
+                                                    ui.painter(),
+                                                    hrect.center(),
+                                                    icon::HEART,
+                                                    11.5,
+                                                    theme::YT_RED,
+                                                );
+                                                hresp.on_hover_text("Hearted by creator");
+                                            }
+                                        });
                                     });
                                 });
                                 ui.add_space(4.0);
@@ -1949,6 +2092,24 @@ impl YtApp {
                     });
                 });
                 ui.add_space(10.0);
+            }
+            if let Some((cid, act, next_liked)) = toggle_like_comment {
+                for c in &mut self.comments {
+                    if c.id == cid {
+                        c.is_liked = next_liked;
+                    }
+                    for r in &mut c.replies {
+                        if r.id == cid {
+                            r.is_liked = next_liked;
+                        }
+                    }
+                }
+                let _ = self.backend.tx.send(Request::PerformCommentAction {
+                    video_id: w.id.clone(),
+                    comment_id: cid,
+                    action_params: act,
+                    liked: next_liked,
+                });
             }
             if let Some((cid, author)) = open_reply_for {
                 self.comment_reply_target_id = Some(cid);
@@ -2167,6 +2328,7 @@ impl YtApp {
                         watched_percent: None,
                         resume_secs: None,
                         playlist_browse_id: None,
+                        playlist_set_video_id: None,
                     });
                 }
             };
@@ -2391,7 +2553,8 @@ impl YtApp {
                     && ui
                         .selectable_label(
                             self.right_tab == RightTab::LiveChat,
-                            RichText::new("Live Chat").font(theme::semibold(14.0)),
+                            RichText::new(if w.is_live { "Live Chat" } else { "Chat Replay" })
+                                .font(theme::semibold(14.0)),
                         )
                         .clicked()
                 {
@@ -2816,8 +2979,15 @@ impl YtApp {
         }
 
         if has_chat && self.right_tab == RightTab::LiveChat {
-            let can_send = self.signed_in && self.live_chat_send_params.is_some();
-            let input_reserve = if can_send { 54.0 } else { 16.0 };
+            let can_send = !self.live_chat_is_replay
+                && self.signed_in
+                && self.live_chat_send_params.is_some();
+            let picker_reserve = if can_send && self.live_chat_emote_picker_open {
+                104.0
+            } else {
+                0.0
+            };
+            let input_reserve = if can_send { 54.0 + picker_reserve } else { 16.0 };
             Frame::new()
                 .fill(theme::SURFACE)
                 .stroke(Stroke::new(1.0, theme::BORDER))
@@ -2827,81 +2997,248 @@ impl YtApp {
                     ScrollArea::vertical()
                         .id_salt("live_chat_scroll")
                         .stick_to_bottom(true)
-                        .max_height((ui.available_height() - input_reserve).max(200.0))
+                        .max_height((ui.available_height() - input_reserve).max(160.0))
                         .show(ui, |ui| {
                             if self.live_chat.is_empty() {
+                                let wait_msg = if self.live_chat_is_replay {
+                                    "Waiting for chat replay messages..."
+                                } else {
+                                    "Waiting for live chat messages..."
+                                };
                                 ui.label(
-                                    RichText::new("Waiting for live chat messages...")
+                                    RichText::new(wait_msg)
                                         .font(theme::regular(12.5))
                                         .color(theme::TEXT_DIM),
                                 );
                             }
                             for m in &self.live_chat {
-                                ui.horizontal_top(|ui| {
-                                    draw_avatar(ui, m.avatar_url.as_deref(), &m.author, 20.0);
-                                    ui.add_space(4.0);
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 3.0;
-                                        let author_col = if m.is_owner {
-                                            Color32::from_rgb(255, 214, 0)
-                                        } else if m.is_mod {
-                                            theme::YT_BLUE
-                                        } else {
-                                            theme::TEXT_DIM
-                                        };
-                                        ui.label(
-                                            RichText::new(format!("{}:", m.author))
-                                                .font(theme::semibold(12.0))
-                                                .color(author_col),
-                                        );
-                                        if m.runs.is_empty() {
-                                            ui.label(
-                                                RichText::new(&m.text)
-                                                    .font(theme::regular(12.5))
-                                                    .color(theme::TEXT),
-                                            );
-                                        } else {
-                                            for run in &m.runs {
-                                                match run {
-                                                    LiveChatRun::Text(t) => {
-                                                        if !t.is_empty() {
-                                                            ui.label(
-                                                                RichText::new(t)
-                                                                    .font(theme::regular(12.5))
-                                                                    .color(theme::TEXT),
-                                                            );
-                                                        }
-                                                    }
-                                                    LiveChatRun::Emoji { alt, url } => {
-                                                        if let Some(u) = url {
-                                                            let img = egui::Image::new(u)
-                                                                .show_loading_spinner(false)
-                                                                .fit_to_exact_size(vec2(17.0, 17.0));
-                                                            let eresp = ui.add(img);
-                                                            if !alt.is_empty() {
-                                                                eresp.on_hover_text(alt);
-                                                            }
-                                                        } else if !alt.is_empty() {
-                                                            ui.label(
-                                                                RichText::new(alt)
-                                                                    .font(theme::regular(12.5))
-                                                                    .color(theme::TEXT),
-                                                            );
-                                                        }
-                                                    }
+                                match &m.kind {
+                                    LiveChatKind::SuperChat { amount, bg_color } => {
+                                        let r = ((*bg_color >> 16) & 0xFF) as u8;
+                                        let g = ((*bg_color >> 8) & 0xFF) as u8;
+                                        let b = (*bg_color & 0xFF) as u8;
+                                        let accent = Color32::from_rgb(r, g, b);
+                                        let body_bg = Color32::from_rgba_unmultiplied(r, g, b, 55);
+                                        Frame::new()
+                                            .fill(body_bg)
+                                            .stroke(Stroke::new(1.0, accent))
+                                            .corner_radius(8)
+                                            .inner_margin(Margin::symmetric(8, 6))
+                                            .show(ui, |ui| {
+                                                ui.set_width(ui.available_width());
+                                                ui.horizontal(|ui| {
+                                                    draw_avatar(
+                                                        ui,
+                                                        m.avatar_url.as_deref(),
+                                                        &m.author,
+                                                        20.0,
+                                                    );
+                                                    ui.label(
+                                                        RichText::new(&m.author)
+                                                            .font(theme::semibold(12.0))
+                                                            .color(Color32::WHITE),
+                                                    );
+                                                    ui.with_layout(
+                                                        Layout::right_to_left(Align::Center),
+                                                        |ui| {
+                                                            Frame::new()
+                                                                .fill(accent)
+                                                                .corner_radius(6)
+                                                                .inner_margin(Margin::symmetric(
+                                                                    6, 2,
+                                                                ))
+                                                                .show(ui, |ui| {
+                                                                    let lum = 0.299 * f32::from(r)
+                                                                        + 0.587 * f32::from(g)
+                                                                        + 0.114 * f32::from(b);
+                                                                    let fg = if lum > 155.0 {
+                                                                        Color32::BLACK
+                                                                    } else {
+                                                                        Color32::WHITE
+                                                                    };
+                                                                    ui.label(
+                                                                        RichText::new(amount)
+                                                                            .font(theme::bold(11.5))
+                                                                            .color(fg),
+                                                                    );
+                                                                });
+                                                        },
+                                                    );
+                                                });
+                                                if !m.runs.is_empty() || !m.text.is_empty() {
+                                                    ui.add_space(3.0);
+                                                    draw_live_chat_message_runs(ui, m);
                                                 }
-                                            }
-                                        }
-                                    });
-                                });
+                                            });
+                                    }
+                                    LiveChatKind::Membership { header } => {
+                                        let green = Color32::from_rgb(15, 157, 88);
+                                        Frame::new()
+                                            .fill(Color32::from_rgba_unmultiplied(15, 157, 88, 38))
+                                            .stroke(Stroke::new(1.0, green))
+                                            .corner_radius(8)
+                                            .inner_margin(Margin::symmetric(8, 6))
+                                            .show(ui, |ui| {
+                                                ui.set_width(ui.available_width());
+                                                ui.horizontal(|ui| {
+                                                    draw_avatar(
+                                                        ui,
+                                                        m.avatar_url.as_deref(),
+                                                        &m.author,
+                                                        20.0,
+                                                    );
+                                                    theme::draw_icon(ui, icon::SPARKLES, 13.0, green);
+                                                    ui.vertical(|ui| {
+                                                        ui.label(
+                                                            RichText::new(&m.author)
+                                                                .font(theme::semibold(12.0))
+                                                                .color(Color32::WHITE),
+                                                        );
+                                                        ui.label(
+                                                            RichText::new(header)
+                                                                .font(theme::medium(11.5))
+                                                                .color(Color32::from_rgb(
+                                                                    120, 230, 175,
+                                                                )),
+                                                        );
+                                                    });
+                                                });
+                                                if !m.runs.is_empty() || !m.text.is_empty() {
+                                                    ui.add_space(3.0);
+                                                    draw_live_chat_message_runs(ui, m);
+                                                }
+                                            });
+                                    }
+                                    LiveChatKind::Normal => {
+                                        ui.horizontal_top(|ui| {
+                                            draw_avatar(
+                                                ui,
+                                                m.avatar_url.as_deref(),
+                                                &m.author,
+                                                20.0,
+                                            );
+                                            ui.add_space(4.0);
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 3.0;
+                                                let author_col = if m.is_owner {
+                                                    Color32::from_rgb(255, 214, 0)
+                                                } else if m.is_mod {
+                                                    theme::YT_BLUE
+                                                } else {
+                                                    theme::TEXT_DIM
+                                                };
+                                                ui.label(
+                                                    RichText::new(format!("{}:", m.author))
+                                                        .font(theme::semibold(12.0))
+                                                        .color(author_col),
+                                                );
+                                                draw_live_chat_message_runs(ui, m);
+                                            });
+                                        });
+                                    }
+                                }
                                 ui.add_space(5.0);
                             }
                         });
                     if can_send {
                         if let Some(params) = self.live_chat_send_params.clone() {
+                            if self.live_chat_emote_picker_open && !self.live_chat_emotes.is_empty()
+                            {
+                                ui.add_space(6.0);
+                                Frame::new()
+                                    .fill(Color32::from_rgb(30, 30, 36))
+                                    .stroke(Stroke::new(1.0, theme::BORDER))
+                                    .corner_radius(8)
+                                    .inner_margin(Margin::same(6))
+                                    .show(ui, |ui| {
+                                        ScrollArea::vertical()
+                                            .id_salt("live_chat_emote_picker")
+                                            .max_height(82.0)
+                                            .show(ui, |ui| {
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                                                    for em in &self.live_chat_emotes {
+                                                        let (erect, eresp) = ui.allocate_exact_size(
+                                                            vec2(26.0, 26.0),
+                                                            Sense::click(),
+                                                        );
+                                                        if eresp.hovered() {
+                                                            ui.ctx().set_cursor_icon(
+                                                                CursorIcon::PointingHand,
+                                                            );
+                                                            ui.painter().rect_filled(
+                                                                erect,
+                                                                5.0,
+                                                                theme::CHIP_HOVER,
+                                                            );
+                                                        }
+                                                        if let Some(u) = &em.url {
+                                                            egui::Image::new(u)
+                                                                .show_loading_spinner(false)
+                                                                .fit_to_exact_size(vec2(22.0, 22.0))
+                                                                .paint_at(ui, erect.shrink(2.0));
+                                                        } else {
+                                                            ui.painter().text(
+                                                                erect.center(),
+                                                                Align2::CENTER_CENTER,
+                                                                &em.shortcut,
+                                                                theme::regular(10.0),
+                                                                theme::TEXT,
+                                                            );
+                                                        }
+                                                        if eresp
+                                                            .on_hover_text(&em.shortcut)
+                                                            .clicked()
+                                                        {
+                                                            if !self.live_chat_draft.is_empty()
+                                                                && !self
+                                                                    .live_chat_draft
+                                                                    .ends_with(' ')
+                                                            {
+                                                                self.live_chat_draft.push(' ');
+                                                            }
+                                                            self.live_chat_draft
+                                                                .push_str(&em.shortcut);
+                                                            self.live_chat_draft.push(' ');
+                                                        }
+                                                    }
+                                                });
+                                            });
+                                    });
+                            }
                             ui.add_space(8.0);
                             ui.horizontal(|ui| {
-                                let input_w = (ui.available_width() - 64.0).max(100.0);
+                                let has_emotes = !self.live_chat_emotes.is_empty();
+                                if has_emotes {
+                                    let (srect, sresp) =
+                                        ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
+                                    if sresp.hovered() {
+                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                    }
+                                    if self.live_chat_emote_picker_open || sresp.hovered() {
+                                        ui.painter().circle_filled(
+                                            srect.center(),
+                                            13.0,
+                                            theme::CHIP_HOVER,
+                                        );
+                                    }
+                                    theme::draw_smile_icon(
+                                        ui.painter(),
+                                        srect.center(),
+                                        16.0,
+                                        if self.live_chat_emote_picker_open {
+                                            theme::YT_BLUE
+                                        } else {
+                                            theme::TEXT_DIM
+                                        },
+                                    );
+                                    if sresp.on_hover_text("Channel emotes").clicked() {
+                                        self.live_chat_emote_picker_open =
+                                            !self.live_chat_emote_picker_open;
+                                    }
+                                }
+                                let reserve_w = if has_emotes { 98.0 } else { 64.0 };
+                                let input_w = (ui.available_width() - reserve_w).max(90.0);
                                 let te = ui.add_sized(
                                     Vec2::new(input_w, 28.0),
                                     egui::TextEdit::singleline(&mut self.live_chat_draft)
@@ -2928,8 +3265,10 @@ impl YtApp {
                                             video_id: w.id.clone(),
                                             params,
                                             message: msg,
+                                            emotes: self.live_chat_emotes.clone(),
                                         });
                                         self.live_chat_draft.clear();
+                                        self.live_chat_emote_picker_open = false;
                                     }
                                 }
                             });
@@ -3557,4 +3896,50 @@ fn draw_pip_dock_placeholder(ui: &mut egui::Ui, size: Vec2) -> bool {
         });
     });
     dock_clicked
+}
+
+fn draw_live_chat_message_runs(ui: &mut egui::Ui, m: &crate::model::LiveChatMessage) {
+    if m.runs.is_empty() {
+        if !m.text.is_empty() {
+            ui.label(
+                RichText::new(&m.text)
+                    .font(theme::regular(12.5))
+                    .color(theme::TEXT),
+            );
+        }
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        for run in &m.runs {
+            match run {
+                LiveChatRun::Text(t) => {
+                    if !t.is_empty() {
+                        ui.label(
+                            RichText::new(t)
+                                .font(theme::regular(12.5))
+                                .color(theme::TEXT),
+                        );
+                    }
+                }
+                LiveChatRun::Emoji { alt, url } => {
+                    if let Some(u) = url {
+                        let img = egui::Image::new(u)
+                            .show_loading_spinner(false)
+                            .fit_to_exact_size(vec2(17.0, 17.0));
+                        let eresp = ui.add(img);
+                        if !alt.is_empty() {
+                            eresp.on_hover_text(alt);
+                        }
+                    } else if !alt.is_empty() {
+                        ui.label(
+                            RichText::new(alt)
+                                .font(theme::regular(12.5))
+                                .color(theme::TEXT),
+                        );
+                    }
+                }
+            }
+        }
+    });
 }

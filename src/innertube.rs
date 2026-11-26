@@ -6,8 +6,8 @@ use serde_json::{Value, json};
 use crate::auth::Session;
 use crate::model::{
     AudioTrack, CaptionTrack, Chapter, ChannelInfo, ChannelTab, CommentItem, FeedChip,
-    LiveChatMessage, LiveChatRun, PlaylistOption, PlaylistSummary, SidebarChannel, StoryboardSpec,
-    VideoFormat, VideoItem, WatchData,
+    LiveChatEmote, LiveChatKind, LiveChatMessage, LiveChatRun, PlaylistOption, PlaylistSummary,
+    SidebarChannel, StoryboardSpec, VideoFormat, VideoItem, WatchData,
 };
 
 const ORIGIN: &str = "https://www.youtube.com";
@@ -764,7 +764,7 @@ pub async fn playlist_feed(
     continuation: Option<&str>,
     cfg: &WebConfig,
     session: Option<&Session>,
-) -> anyhow::Result<(String, FeedPage)> {
+) -> anyhow::Result<(String, bool, FeedPage)> {
     let body = match continuation {
         Some(token) => json!({ "continuation": token }),
         None => json!({ "browseId": browse_id }),
@@ -777,11 +777,7 @@ pub async fn playlist_feed(
         .as_str()
         .map(str::to_owned)
         .or_else(|| text(&v["header"]["playlistHeaderRenderer"]["title"]))
-        .or_else(|| {
-            text(
-                &v["header"]["pageHeaderRenderer"]["pageTitle"],
-            )
-        })
+        .or_else(|| text(&v["header"]["pageHeaderRenderer"]["pageTitle"]))
         .unwrap_or_else(|| match browse_id {
             "VLWL" => "Watch Later".to_owned(),
             "VLLL" => "Liked Videos".to_owned(),
@@ -791,8 +787,17 @@ pub async fn playlist_feed(
     let mut seen = HashSet::new();
     collect_videos(&v, &mut items, &mut seen);
     let cont = find_continuation(&v);
+    let is_editable = browse_id != "VLLL"
+        && session.is_some()
+        && (v["header"]["playlistHeaderRenderer"]["isEditable"]
+            .as_bool()
+            .unwrap_or(false)
+            || find_nested_bool(&v, "isEditable").unwrap_or(false)
+            || browse_id == "VLWL"
+            || items.iter().any(|it| it.playlist_set_video_id.is_some()));
     Ok((
         title,
+        is_editable,
         FeedPage {
             items,
             chips: Vec::new(),
@@ -801,6 +806,24 @@ pub async fn playlist_feed(
             is_fallback_trending: false,
         },
     ))
+}
+
+fn find_nested_bool(v: &Value, key: &str) -> Option<bool> {
+    match v {
+        Value::Object(map) => {
+            if let Some(b) = map.get(key).and_then(|x| x.as_bool()) {
+                return Some(b);
+            }
+            for val in map.values() {
+                if let Some(b) = find_nested_bool(val, key) {
+                    return Some(b);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => arr.iter().find_map(|val| find_nested_bool(val, key)),
+        _ => None,
+    }
 }
 
 pub async fn set_watch_later(
@@ -833,6 +856,69 @@ pub async fn edit_playlist(
             "removedVideoId": video_id,
         })
     };
+    post_web(
+        http,
+        "browse/edit_playlist",
+        json!({
+            "playlistId": pid,
+            "actions": [action],
+        }),
+        cfg,
+        Some(session),
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn remove_playlist_item(
+    http: &reqwest::Client,
+    playlist_id: &str,
+    video_id: &str,
+    set_video_id: Option<&str>,
+    cfg: &WebConfig,
+    session: &Session,
+) -> anyhow::Result<()> {
+    let pid = playlist_id.strip_prefix("VL").unwrap_or(playlist_id);
+    let action = match set_video_id.filter(|s| !s.is_empty()) {
+        Some(sid) => json!({
+            "action": "ACTION_REMOVE_VIDEO",
+            "setVideoId": sid,
+        }),
+        None => json!({
+            "action": "ACTION_REMOVE_VIDEO_BY_VIDEO_ID",
+            "removedVideoId": video_id,
+        }),
+    };
+    post_web(
+        http,
+        "browse/edit_playlist",
+        json!({
+            "playlistId": pid,
+            "actions": [action],
+        }),
+        cfg,
+        Some(session),
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn reorder_playlist_item(
+    http: &reqwest::Client,
+    playlist_id: &str,
+    set_video_id: &str,
+    successor_set_video_id: Option<&str>,
+    cfg: &WebConfig,
+    session: &Session,
+) -> anyhow::Result<()> {
+    let pid = playlist_id.strip_prefix("VL").unwrap_or(playlist_id);
+    let mut action = json!({
+        "action": "ACTION_MOVE_VIDEO_BEFORE",
+        "setVideoId": set_video_id,
+    });
+    if let Some(succ) = successor_set_video_id.filter(|s| !s.is_empty()) {
+        action["movedSetVideoIdSuccessor"] = json!(succ);
+    }
     post_web(
         http,
         "browse/edit_playlist",
@@ -1466,6 +1552,7 @@ fn collect_videos_with_channel_items(
                                     watched_percent: None,
                                     resume_secs: None,
                                     playlist_browse_id: Some(bid),
+                                    playlist_set_video_id: None,
                                 });
                             }
                         }
@@ -1521,6 +1608,7 @@ fn collect_videos_with_channel_items(
                                 watched_percent: None,
                                 resume_secs: None,
                                 playlist_browse_id: None,
+                                playlist_set_video_id: None,
                             });
                         }
                     }
@@ -1553,6 +1641,7 @@ fn collect_videos_with_channel_items(
                                 watched_percent: None,
                                 resume_secs: None,
                                 playlist_browse_id: Some(bid),
+                                playlist_set_video_id: None,
                             });
                         }
                     }
@@ -1648,6 +1737,23 @@ fn parse_comment_entry(
         let reply_params = find_nested_str(cr, "createReplyParams")
             .or_else(|| find_nested_str(thread, "createReplyParams"))
             .map(str::to_owned);
+        let action_btns = &cr["actionButtons"]["commentActionButtonsRenderer"];
+        let is_liked = cr["isLiked"].as_bool().unwrap_or(false)
+            || action_btns["likeButton"]["toggleButtonRenderer"]["isToggled"]
+                .as_bool()
+                .unwrap_or(false);
+        let like_action_params = action_btns["likeButton"]["toggleButtonRenderer"]
+            ["defaultServiceEndpoint"]["performCommentActionEndpoint"]["action"]
+            .as_str()
+            .map(str::to_owned);
+        let unlike_action_params = action_btns["likeButton"]["toggleButtonRenderer"]
+            ["toggledServiceEndpoint"]["performCommentActionEndpoint"]["action"]
+            .as_str()
+            .map(str::to_owned);
+        let is_pinned = cr["pinnedCommentBadge"].is_object();
+        let has_creator_heart = action_btns["creatorHeart"]["creatorHeartRenderer"]["isHearted"]
+            .as_bool()
+            .unwrap_or(false);
         return Some(CommentItem {
             id,
             author,
@@ -1660,6 +1766,11 @@ fn parse_comment_entry(
             reply_params,
             replies: Vec::new(),
             replies_loading: false,
+            is_liked,
+            like_action_params,
+            unlike_action_params,
+            is_pinned,
+            has_creator_heart,
         });
     }
 
@@ -1681,8 +1792,11 @@ fn parse_comment_entry(
         .as_str()
         .unwrap_or_default()
         .to_owned();
-    let likes = payload["toolbar"]["likeCountNotliked"]
+    let toolbar = &payload["toolbar"];
+    let likes = toolbar["likeCountLiked"]
         .as_str()
+        .filter(|_| toolbar["likeState"].as_str() == Some("TOOLBAR_LIKE_STATE_LIKED"))
+        .or_else(|| toolbar["likeCountNotliked"].as_str())
         .unwrap_or_default()
         .trim()
         .to_owned();
@@ -1693,13 +1807,32 @@ fn parse_comment_entry(
     if body_txt.is_empty() {
         return None;
     }
-    let reply_params = vm["commentSurfaceKey"]
+    let surface = vm["commentSurfaceKey"]
         .as_str()
-        .and_then(|sk| surface_map.get(sk))
+        .and_then(|sk| surface_map.get(sk));
+    let reply_params = surface
         .and_then(|s| find_nested_str(s, "createReplyParams"))
         .or_else(|| find_nested_str(payload, "createReplyParams"))
         .or_else(|| find_nested_str(thread, "createReplyParams"))
         .map(str::to_owned);
+    let is_liked = toolbar["likeState"].as_str() == Some("TOOLBAR_LIKE_STATE_LIKED");
+    let like_action_params = surface
+        .and_then(|s| {
+            find_nested_str(&s["likeCommand"], "action")
+                .or_else(|| find_nested_str(&s["toolbar"]["likeCommand"], "action"))
+        })
+        .map(str::to_owned);
+    let unlike_action_params = surface
+        .and_then(|s| {
+            find_nested_str(&s["unlikeCommand"], "action")
+                .or_else(|| find_nested_str(&s["toolbar"]["unlikeCommand"], "action"))
+        })
+        .map(str::to_owned);
+    let is_pinned = vm["pinnedText"].as_str().is_some_and(|s| !s.is_empty())
+        || payload["pinnedText"].as_str().is_some_and(|s| !s.is_empty())
+        || surface.is_some_and(|s| s["pinnedText"].as_str().is_some_and(|t| !t.is_empty()));
+    let has_creator_heart = toolbar["heartState"].as_str() == Some("TOOLBAR_HEART_STATE_HEARTED")
+        || toolbar["heartActiveTooltip"].as_str().is_some_and(|s| !s.is_empty());
     Some(CommentItem {
         id: payload["properties"]["commentId"]
             .as_str()
@@ -1715,6 +1848,11 @@ fn parse_comment_entry(
         reply_params,
         replies: Vec::new(),
         replies_loading: false,
+        is_liked,
+        like_action_params,
+        unlike_action_params,
+        is_pinned,
+        has_creator_heart,
     })
 }
 
@@ -1861,6 +1999,25 @@ pub async fn create_comment_reply(
     Ok(())
 }
 
+pub async fn perform_comment_action(
+    http: &reqwest::Client,
+    action_params: &str,
+    cfg: &WebConfig,
+    session: &Session,
+) -> anyhow::Result<()> {
+    post_web(
+        http,
+        "comment/perform_comment_action",
+        json!({
+            "actions": [action_params],
+        }),
+        cfg,
+        Some(session),
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn set_like(
     http: &reqwest::Client,
     video_id: &str,
@@ -1930,27 +2087,262 @@ pub struct LiveChatPage {
     pub messages: Vec<LiveChatMessage>,
     pub next_token: Option<String>,
     pub send_params: Option<String>,
+    pub emotes: Vec<LiveChatEmote>,
+    pub is_replay: bool,
 }
 
 pub async fn fetch_live_chat(
     http: &reqwest::Client,
     continuation: &str,
+    player_offset_ms: Option<u64>,
     cfg: &WebConfig,
     session: Option<&Session>,
 ) -> anyhow::Result<LiveChatPage> {
-    let v = post_web(
-        http,
-        "live_chat/get_live_chat",
-        json!({ "continuation": continuation }),
-        cfg,
-        session,
-    )
-    .await?;
+    let (endpoint, body) = match player_offset_ms {
+        Some(ms) => (
+            "live_chat/get_live_chat_replay",
+            json!({
+                "continuation": continuation,
+                "currentPlayerState": { "playerOffsetMs": ms.to_string() },
+            }),
+        ),
+        None => (
+            "live_chat/get_live_chat",
+            json!({ "continuation": continuation }),
+        ),
+    };
+    let v = post_web(http, endpoint, body, cfg, session).await?;
+    Ok(parse_live_chat_response(&v))
+}
+
+fn parse_live_chat_runs(
+    msg_val: &Value,
+    emotes_out: &mut Vec<LiveChatEmote>,
+) -> (Vec<LiveChatRun>, String) {
+    let mut runs = Vec::new();
+    let mut body = String::new();
+    if let Some(arr) = msg_val["runs"].as_array() {
+        for run in arr {
+            if let Some(t) = run["text"].as_str() {
+                body.push_str(t);
+                runs.push(LiveChatRun::Text(t.to_owned()));
+            } else if let Some(em) = run.get("emoji") {
+                let url = em["image"]["thumbnails"]
+                    .as_array()
+                    .and_then(|a| a.last())
+                    .and_then(|t| t["url"].as_str())
+                    .map(normalize_url);
+                let alt = em["shortcuts"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|s| s.as_str())
+                    .or_else(|| em["emojiId"].as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                if em["isCustomEmoji"].as_bool().unwrap_or(false) && !alt.is_empty() {
+                    if let Some(eid) = em["emojiId"].as_str() {
+                        if !emotes_out.iter().any(|e| e.emoji_id == eid) {
+                            emotes_out.push(LiveChatEmote {
+                                shortcut: alt.clone(),
+                                emoji_id: eid.to_owned(),
+                                url: url.clone(),
+                            });
+                        }
+                    }
+                }
+                body.push_str(&alt);
+                runs.push(LiveChatRun::Emoji { alt, url });
+            }
+        }
+    }
+    if body.is_empty() {
+        body = text(msg_val).unwrap_or_default();
+    }
+    (runs, body)
+}
+
+fn parse_live_chat_badges(r: &Value) -> (bool, bool) {
+    let badges = r["authorBadges"].as_array();
+    let is_owner = badges.is_some_and(|b| {
+        b.iter()
+            .any(|x| x["liveChatAuthorBadgeRenderer"]["icon"]["iconType"] == "OWNER")
+    });
+    let is_mod = badges.is_some_and(|b| {
+        b.iter()
+            .any(|x| x["liveChatAuthorBadgeRenderer"]["icon"]["iconType"] == "MODERATOR")
+    });
+    (is_owner, is_mod)
+}
+
+fn collect_picker_emotes(v: &Value, out: &mut Vec<LiveChatEmote>) {
+    match v {
+        Value::Object(map) => {
+            if let Some(em) = map.get("emoji").filter(|e| e.is_object()) {
+                if em["isCustomEmoji"].as_bool().unwrap_or(false) {
+                    if let Some(eid) = em["emojiId"].as_str() {
+                        let shortcut = em["shortcuts"]
+                            .as_array()
+                            .and_then(|a| a.first())
+                            .and_then(|s| s.as_str())
+                            .unwrap_or(eid)
+                            .to_owned();
+                        let url = em["image"]["thumbnails"]
+                            .as_array()
+                            .and_then(|a| a.last())
+                            .and_then(|t| t["url"].as_str())
+                            .map(normalize_url);
+                        if !out.iter().any(|e| e.emoji_id == eid) {
+                            out.push(LiveChatEmote {
+                                shortcut,
+                                emoji_id: eid.to_owned(),
+                                url,
+                            });
+                        }
+                    }
+                }
+            }
+            if let (Some(eid), Some(thumbs)) = (
+                map.get("emojiId").and_then(|s| s.as_str()),
+                map.get("image").and_then(|i| i["thumbnails"].as_array()),
+            ) {
+                if map
+                    .get("isCustomEmoji")
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(false)
+                {
+                    let shortcut = map
+                        .get("shortcuts")
+                        .and_then(|s| s.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|s| s.as_str())
+                        .unwrap_or(eid)
+                        .to_owned();
+                    let url = thumbs
+                        .last()
+                        .and_then(|t| t["url"].as_str())
+                        .map(normalize_url);
+                    if !out.iter().any(|e| e.emoji_id == eid) {
+                        out.push(LiveChatEmote {
+                            shortcut,
+                            emoji_id: eid.to_owned(),
+                            url,
+                        });
+                    }
+                }
+            }
+            for val in map.values() {
+                collect_picker_emotes(val, out);
+            }
+        }
+        Value::Array(arr) => {
+            for val in arr {
+                collect_picker_emotes(val, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn push_chat_item(
+    item: &Value,
+    offset_ms: Option<u64>,
+    msgs: &mut Vec<LiveChatMessage>,
+    emotes: &mut Vec<LiveChatEmote>,
+) {
+    if let Some(r) = item.get("liveChatTextMessageRenderer").filter(|x| x.is_object()) {
+        let Some(id) = r["id"].as_str().map(str::to_owned) else {
+            return;
+        };
+        let author = text(&r["authorName"]).unwrap_or_else(|| "User".to_owned());
+        let avatar_url = r["authorPhoto"]["thumbnails"]
+            .as_array()
+            .and_then(|a| a.last())
+            .and_then(|t| t["url"].as_str())
+            .map(normalize_url);
+        let (runs, body) = parse_live_chat_runs(&r["message"], emotes);
+        if body.is_empty() && runs.is_empty() {
+            return;
+        }
+        let (is_owner, is_mod) = parse_live_chat_badges(r);
+        msgs.push(LiveChatMessage {
+            id,
+            author,
+            avatar_url,
+            text: body,
+            runs,
+            is_owner,
+            is_mod,
+            kind: LiveChatKind::Normal,
+            offset_ms,
+        });
+    } else if let Some(r) = item.get("liveChatPaidMessageRenderer").filter(|x| x.is_object()) {
+        let Some(id) = r["id"].as_str().map(str::to_owned) else {
+            return;
+        };
+        let author = text(&r["authorName"]).unwrap_or_else(|| "User".to_owned());
+        let avatar_url = r["authorPhoto"]["thumbnails"]
+            .as_array()
+            .and_then(|a| a.last())
+            .and_then(|t| t["url"].as_str())
+            .map(normalize_url);
+        let amount = text(&r["purchaseAmountText"]).unwrap_or_else(|| "Super Chat".to_owned());
+        let bg_color = r["bodyBackgroundColor"]
+            .as_u64()
+            .or_else(|| r["headerBackgroundColor"].as_u64())
+            .unwrap_or(0xFF15_65C0) as u32;
+        let (runs, body) = parse_live_chat_runs(&r["message"], emotes);
+        let (is_owner, is_mod) = parse_live_chat_badges(r);
+        msgs.push(LiveChatMessage {
+            id,
+            author,
+            avatar_url,
+            text: body,
+            runs,
+            is_owner,
+            is_mod,
+            kind: LiveChatKind::SuperChat { amount, bg_color },
+            offset_ms,
+        });
+    } else if let Some(r) = item.get("liveChatMembershipItemRenderer").filter(|x| x.is_object()) {
+        let Some(id) = r["id"].as_str().map(str::to_owned) else {
+            return;
+        };
+        let author = text(&r["authorName"]).unwrap_or_else(|| "Member".to_owned());
+        let avatar_url = r["authorPhoto"]["thumbnails"]
+            .as_array()
+            .and_then(|a| a.last())
+            .and_then(|t| t["url"].as_str())
+            .map(normalize_url);
+        let header = text(&r["headerSubtext"])
+            .or_else(|| text(&r["headerPrimaryText"]))
+            .unwrap_or_else(|| "Channel Member".to_owned());
+        let (runs, body) = parse_live_chat_runs(&r["message"], emotes);
+        let (is_owner, is_mod) = parse_live_chat_badges(r);
+        msgs.push(LiveChatMessage {
+            id,
+            author,
+            avatar_url,
+            text: body,
+            runs,
+            is_owner,
+            is_mod,
+            kind: LiveChatKind::Membership { header },
+            offset_ms,
+        });
+    }
+}
+
+pub fn parse_live_chat_response(v: &Value) -> LiveChatPage {
     let lc = &v["continuationContents"]["liveChatContinuation"];
+    let mut is_replay = false;
     let next_tok = lc["continuations"]
         .as_array()
         .and_then(|arr| {
             arr.iter().find_map(|c| {
+                if let Some(tok) = c["liveChatReplayContinuationData"]["continuation"].as_str() {
+                    is_replay = true;
+                    return Some(tok);
+                }
                 c["invalidationContinuationData"]["continuation"]
                     .as_str()
                     .or_else(|| c["timedContinuationData"]["continuation"].as_str())
@@ -1967,100 +2359,99 @@ pub async fn fetch_live_chat(
                 .map(str::to_owned)
         });
 
+    let mut emotes = Vec::new();
+    collect_picker_emotes(&lc["actionPanel"], &mut emotes);
+
     let mut msgs = Vec::new();
     if let Some(actions) = lc["actions"].as_array() {
         for act in actions {
-            let item = &act["addChatItemAction"]["item"];
-            let r = &item["liveChatTextMessageRenderer"];
-            if !r.is_object() {
-                continue;
-            }
-            let Some(id) = r["id"].as_str().map(str::to_owned) else {
-                continue;
-            };
-            let author = text(&r["authorName"]).unwrap_or_else(|| "User".to_owned());
-            let avatar_url = r["authorPhoto"]["thumbnails"]
-                .as_array()
-                .and_then(|a| a.last())
-                .and_then(|t| t["url"].as_str())
-                .map(normalize_url);
-            let mut runs = Vec::new();
-            let mut body = String::new();
-            if let Some(arr) = r["message"]["runs"].as_array() {
-                for run in arr {
-                    if let Some(t) = run["text"].as_str() {
-                        body.push_str(t);
-                        runs.push(LiveChatRun::Text(t.to_owned()));
-                    } else if let Some(em) = run.get("emoji") {
-                        let url = em["image"]["thumbnails"]
-                            .as_array()
-                            .and_then(|a| a.last())
-                            .and_then(|t| t["url"].as_str())
-                            .map(normalize_url);
-                        let alt = em["shortcuts"]
-                            .as_array()
-                            .and_then(|a| a.first())
-                            .and_then(|s| s.as_str())
-                            .or_else(|| em["emojiId"].as_str())
-                            .unwrap_or("")
-                            .to_owned();
-                        body.push_str(&alt);
-                        runs.push(LiveChatRun::Emoji { alt, url });
+            if let Some(replay) = act.get("replayChatItemAction").filter(|x| x.is_object()) {
+                is_replay = true;
+                let offset_ms = replay["videoOffsetTimeMsec"]
+                    .as_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .or_else(|| replay["videoOffsetTimeMsec"].as_u64());
+                if let Some(inner_acts) = replay["actions"].as_array() {
+                    for inner in inner_acts {
+                        push_chat_item(
+                            &inner["addChatItemAction"]["item"],
+                            offset_ms,
+                            &mut msgs,
+                            &mut emotes,
+                        );
                     }
                 }
+            } else {
+                push_chat_item(
+                    &act["addChatItemAction"]["item"],
+                    None,
+                    &mut msgs,
+                    &mut emotes,
+                );
             }
-            if body.is_empty() {
-                body = text(&r["message"]).unwrap_or_default();
-            }
-            if body.is_empty() && runs.is_empty() {
-                continue;
-            }
-            let badges = r["authorBadges"].as_array();
-            let is_owner = badges.is_some_and(|b| {
-                b.iter().any(|x| {
-                    x["liveChatAuthorBadgeRenderer"]["icon"]["iconType"] == "OWNER"
-                })
-            });
-            let is_mod = badges.is_some_and(|b| {
-                b.iter().any(|x| {
-                    x["liveChatAuthorBadgeRenderer"]["icon"]["iconType"] == "MODERATOR"
-                })
-            });
-            msgs.push(LiveChatMessage {
-                id,
-                author,
-                avatar_url,
-                text: body,
-                runs,
-                is_owner,
-                is_mod,
-            });
         }
     }
-    Ok(LiveChatPage {
+    LiveChatPage {
         messages: msgs,
         next_token: next_tok,
         send_params,
-    })
+        emotes,
+        is_replay,
+    }
+}
+
+pub fn build_live_chat_segments(message: &str, emotes: &[LiveChatEmote]) -> Vec<Value> {
+    if emotes.is_empty() {
+        return vec![json!({ "text": message })];
+    }
+    let mut segments = Vec::new();
+    let mut rest = message;
+    let mut buf = String::new();
+    while !rest.is_empty() {
+        if let Some(em) = emotes
+            .iter()
+            .find(|e| !e.shortcut.is_empty() && rest.starts_with(&e.shortcut))
+        {
+            if !buf.is_empty() {
+                segments.push(json!({ "text": std::mem::take(&mut buf) }));
+            }
+            segments.push(json!({ "emojiId": em.emoji_id }));
+            rest = &rest[em.shortcut.len()..];
+        } else if let Some(ch) = rest.chars().next() {
+            buf.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        } else {
+            break;
+        }
+    }
+    if !buf.is_empty() {
+        segments.push(json!({ "text": buf }));
+    }
+    if segments.is_empty() {
+        segments.push(json!({ "text": message }));
+    }
+    segments
 }
 
 pub async fn send_live_chat_message(
     http: &reqwest::Client,
     params: &str,
     message: &str,
+    emotes: &[LiveChatEmote],
     cfg: &WebConfig,
     session: &Session,
 ) -> anyhow::Result<()> {
     let client_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
+    let segments = build_live_chat_segments(message, emotes);
     post_web(
         http,
         "live_chat/send_message",
         json!({
             "params": params,
             "richMessage": {
-                "textSegments": [{ "text": message }]
+                "textSegments": segments,
             },
             "clientMessageId": format!("yt-rust-{client_id}"),
         }),
@@ -2157,21 +2548,23 @@ pub async fn fetch_next_watch_fallback(
         chapters: Vec::new(),
         storyboard: None,
         comments_token,
-        live_chat_token: live_chat_token.clone(),
+        live_chat_token,
         related,
-        is_live: live_chat_token.is_some()
-            || next["contents"]["twoColumnWatchNextResults"]["results"]["results"]["contents"]
-                .as_array()
-                .is_some_and(|a| {
-                    a.iter().any(|x| {
-                        x["videoPrimaryInfoRenderer"]["viewCount"]["videoViewCountRenderer"]
-                            ["isLive"]
-                            .as_bool()
-                            .unwrap_or(false)
-                    })
-                }),
+        is_live: is_next_live(&next),
         resume_secs,
     })
+}
+
+fn is_next_live(next: &Value) -> bool {
+    next["contents"]["twoColumnWatchNextResults"]["results"]["results"]["contents"]
+        .as_array()
+        .is_some_and(|a| {
+            a.iter().any(|x| {
+                x["videoPrimaryInfoRenderer"]["viewCount"]["videoViewCountRenderer"]["isLive"]
+                    .as_bool()
+                    .unwrap_or(false)
+            })
+        })
 }
 
 pub async fn watch(
@@ -2181,7 +2574,7 @@ pub async fn watch(
     session: Option<&Session>,
 ) -> anyhow::Result<WatchData> {
     let next_fut = post_web(http, "next", json!({ "videoId": video_id }), cfg, session);
-    let player_fut = fetch_player(http, video_id, cfg.visitor_data.as_deref());
+    let player_fut = fetch_player(http, video_id, cfg, session);
     let (next_res, player_res) = tokio::join!(next_fut, player_fut);
 
     let player = player_res?;
@@ -2358,6 +2751,209 @@ pub async fn watch(
         is_live,
         resume_secs,
     })
+}
+
+pub async fn fetch_hls_variants(
+    http: &reqwest::Client,
+    hls_url: &str,
+) -> (Vec<VideoFormat>, Vec<AudioTrack>) {
+    let Ok(resp) = http
+        .get(hls_url)
+        .header("User-Agent", VISIONOS_UA)
+        .timeout(Duration::from_secs(6))
+        .send()
+        .await
+    else {
+        return (Vec::new(), Vec::new());
+    };
+    if !resp.status().is_success() {
+        return (Vec::new(), Vec::new());
+    }
+    let Ok(text) = resp.text().await else {
+        return (Vec::new(), Vec::new());
+    };
+    parse_hls_master_variants(&text, hls_url)
+}
+
+fn parse_m3u8_attrs(raw: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i] == b',' || bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        let k_start = i;
+        while i < bytes.len() && bytes[i] != b'=' && bytes[i] != b',' {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            break;
+        }
+        let key = raw[k_start..i].trim().to_ascii_uppercase();
+        i += 1;
+        let val = if i < bytes.len() && bytes[i] == b'"' {
+            i += 1;
+            let v_start = i;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += 1;
+            }
+            let s = &raw[v_start..i];
+            if i < bytes.len() {
+                i += 1;
+            }
+            s.to_owned()
+        } else {
+            let v_start = i;
+            while i < bytes.len() && bytes[i] != b',' {
+                i += 1;
+            }
+            raw[v_start..i].trim().to_owned()
+        };
+        if !key.is_empty() {
+            out.push((key, val));
+        }
+    }
+    out
+}
+
+fn hls_codec_mime(codecs: &str) -> String {
+    let lc = codecs.to_ascii_lowercase();
+    if lc.contains("av01") {
+        "video/mp4; codecs=\"av01.0.08M.08\"".to_owned()
+    } else if lc.contains("vp09") || lc.contains("vp9") {
+        "video/webm; codecs=\"vp9\"".to_owned()
+    } else if lc.contains("avc1") {
+        "video/mp4; codecs=\"avc1.640028\"".to_owned()
+    } else if lc.contains("hev1") || lc.contains("hvc1") {
+        "video/mp4; codecs=\"hev1\"".to_owned()
+    } else if codecs.is_empty() {
+        "video/mp4; codecs=\"avc1.640028\"".to_owned()
+    } else {
+        format!("video/mp4; codecs=\"{codecs}\"")
+    }
+}
+
+pub fn parse_hls_master_variants(
+    manifest: &str,
+    base_url: &str,
+) -> (Vec<VideoFormat>, Vec<AudioTrack>) {
+    let base = url::Url::parse(base_url).ok();
+    let resolve = |raw: &str| -> String {
+        let trimmed = raw.trim();
+        if let Some(ref b) = base {
+            if let Ok(u) = b.join(trimmed) {
+                return u.into();
+            }
+        }
+        trimmed.to_owned()
+    };
+
+    let mut audio_tracks: Vec<AudioTrack> = Vec::new();
+    let mut raw_formats: Vec<VideoFormat> = Vec::new();
+    let lines: Vec<&str> = manifest.lines().map(str::trim).collect();
+
+    for (idx, line) in lines.iter().enumerate() {
+        if let Some(rest) = line.strip_prefix("#EXT-X-MEDIA:") {
+            let attrs = parse_m3u8_attrs(rest);
+            let get = |k: &str| attrs.iter().find(|(ak, _)| ak == k).map(|(_, v)| v.as_str());
+            if get("TYPE") != Some("AUDIO") {
+                continue;
+            }
+            let Some(uri) = get("URI").filter(|u| !u.is_empty()) else {
+                continue;
+            };
+            let group_id = get("GROUP-ID").unwrap_or_default().to_owned();
+            let name = get("NAME")
+                .or_else(|| get("LANGUAGE"))
+                .unwrap_or("Default")
+                .to_owned();
+            let is_default = get("DEFAULT").is_some_and(|v| v.eq_ignore_ascii_case("YES"));
+            let resolved = resolve(uri);
+            if !audio_tracks.iter().any(|t| t.url == resolved) {
+                audio_tracks.push(AudioTrack {
+                    id: group_id,
+                    label: name,
+                    is_default,
+                    url: resolved,
+                    content_length: 0,
+                });
+            }
+        } else if let Some(rest) = line.strip_prefix("#EXT-X-STREAM-INF:") {
+            let Some(uri_line) = lines[idx + 1..]
+                .iter()
+                .copied()
+                .find(|l| !l.is_empty() && !l.starts_with('#'))
+            else {
+                continue;
+            };
+            let attrs = parse_m3u8_attrs(rest);
+            let get = |k: &str| attrs.iter().find(|(ak, _)| ak == k).map(|(_, v)| v.as_str());
+            let Some((width, height)) = get("RESOLUTION").and_then(|r| {
+                let (w, h) = r.split_once('x')?;
+                Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))
+            }) else {
+                continue;
+            };
+            if height == 0 {
+                continue;
+            }
+            let fps = get("FRAME-RATE")
+                .and_then(|s| s.parse::<f64>().ok())
+                .map_or(30, |f| f.round() as u32)
+                .max(1);
+            let bitrate = get("BANDWIDTH")
+                .or_else(|| get("AVERAGE-BANDWIDTH"))
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let mime = hls_codec_mime(get("CODECS").unwrap_or_default());
+            let has_audio = get("AUDIO").is_none_or(str::is_empty);
+            raw_formats.push(VideoFormat {
+                itag: 0,
+                url: resolve(uri_line),
+                mime,
+                width,
+                height,
+                fps,
+                bitrate,
+                content_length: 0,
+                has_audio,
+            });
+        }
+    }
+
+    audio_tracks.sort_by(|a, b| b.is_default.cmp(&a.is_default));
+    let mut dedup_audio: Vec<AudioTrack> = Vec::new();
+    for tr in audio_tracks {
+        if !dedup_audio.iter().any(|x| x.label == tr.label) {
+            dedup_audio.push(tr);
+        }
+    }
+
+    raw_formats.sort_by(|a, b| {
+        b.height
+            .cmp(&a.height)
+            .then_with(|| b.fps.cmp(&a.fps))
+            .then_with(|| codec_rank(&b.mime).cmp(&codec_rank(&a.mime)))
+            .then_with(|| b.bitrate.cmp(&a.bitrate))
+    });
+    let mut deduped: Vec<VideoFormat> = Vec::new();
+    for mut f in raw_formats {
+        if dedup_audio.is_empty() {
+            f.has_audio = true;
+        }
+        let same = deduped.iter().any(|d| {
+            d.height == f.height
+                && d.fps == f.fps
+                && codec_rank(&d.mime) == codec_rank(&f.mime)
+                && d.has_audio == f.has_audio
+        });
+        if !same {
+            deduped.push(f);
+        }
+    }
+
+    (deduped, dedup_audio)
 }
 
 pub fn parse_storyboard(spec: &str) -> Option<StoryboardSpec> {
@@ -2564,24 +3160,169 @@ fn codec_rank(mime: &str) -> u8 {
     }
 }
 
+fn is_login_or_age_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("LOGIN_REQUIRED")
+        || msg.contains("Sign in")
+        || msg.contains("UNPLAYABLE")
+        || msg.contains("age")
+}
+
 async fn fetch_player(
     http: &reqwest::Client,
     video_id: &str,
-    visitor_data: Option<&str>,
+    cfg: &WebConfig,
+    session: Option<&Session>,
 ) -> anyhow::Result<Value> {
+    let visitor_data = cfg.visitor_data.as_deref();
+    let mut last_err: Option<anyhow::Error> = None;
+    let mut non_playable: Option<Value> = None;
+    let mut tried_auth = false;
+
     match player_visionos(http, video_id, visitor_data).await {
         Ok(v) if has_playable_url(&v) => return Ok(v),
-        Ok(v) => {
-            if let Ok(vr) = player_android_vr(http, video_id, visitor_data).await {
-                if has_playable_url(&vr) {
-                    return Ok(vr);
+        Ok(v) => non_playable = Some(v),
+        Err(e) => {
+            if is_login_or_age_error(&e) {
+                if let Some(sess) = session {
+                    tried_auth = true;
+                    if let Some(v) = try_authenticated_players(http, video_id, cfg, sess).await {
+                        return Ok(v);
+                    }
                 }
             }
-            return Ok(v);
+            last_err = Some(e);
         }
-        Err(_) => {}
     }
-    player_android_vr(http, video_id, visitor_data).await
+
+    match player_android_vr(http, video_id, visitor_data).await {
+        Ok(vr) if has_playable_url(&vr) => return Ok(vr),
+        Ok(vr) => {
+            if non_playable.is_none() {
+                non_playable = Some(vr);
+            }
+        }
+        Err(e) => {
+            if last_err.is_none() {
+                last_err = Some(e);
+            }
+        }
+    }
+
+    if !tried_auth {
+        if let Some(sess) = session {
+            if let Some(v) = try_authenticated_players(http, video_id, cfg, sess).await {
+                return Ok(v);
+            }
+        }
+    }
+
+    if let Some(v) = non_playable {
+        return Ok(v);
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("All InnerTube player clients failed")))
+}
+
+async fn try_authenticated_players(
+    http: &reqwest::Client,
+    video_id: &str,
+    cfg: &WebConfig,
+    session: &Session,
+) -> Option<Value> {
+    if let Ok(v) = player_tv(http, video_id, cfg.visitor_data.as_deref(), session).await {
+        if has_playable_url(&v) {
+            return Some(v);
+        }
+    }
+    if let Ok(v) = player_web_safari(http, video_id, cfg, session).await {
+        if has_playable_url(&v) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+async fn player_tv(
+    http: &reqwest::Client,
+    video_id: &str,
+    visitor_data: Option<&str>,
+    session: &Session,
+) -> anyhow::Result<Value> {
+    const TV_VERSION: &str = "7.20250923.13.00";
+    const TV_UA: &str = "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version";
+    let mut client = json!({
+        "clientName": "TVHTML5",
+        "clientVersion": TV_VERSION,
+        "userAgent": TV_UA,
+        "hl": "en",
+        "gl": "US",
+    });
+    if let Some(vd) = visitor_data.filter(|v| !v.is_empty()) {
+        client["visitorData"] = json!(vd);
+    }
+    let body = json!({
+        "context": { "client": client },
+        "videoId": video_id,
+        "contentCheckOk": true,
+        "racyCheckOk": true,
+    });
+    let mut req = http
+        .post("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+        .header("User-Agent", TV_UA)
+        .header("X-YouTube-Client-Name", "7")
+        .header("X-YouTube-Client-Version", TV_VERSION)
+        .header("Origin", ORIGIN)
+        .header("Referer", format!("{ORIGIN}/tv"))
+        .timeout(Duration::from_secs(10))
+        .json(&body);
+    if let Some(vd) = visitor_data.filter(|v| !v.is_empty()) {
+        req = req.header("X-Goog-Visitor-Id", vd);
+    }
+    req = session.sign(req, ORIGIN);
+    let resp: Value = req.send().await?.error_for_status()?.json().await?;
+    check_playability(&resp)?;
+    Ok(resp)
+}
+
+async fn player_web_safari(
+    http: &reqwest::Client,
+    video_id: &str,
+    cfg: &WebConfig,
+    session: &Session,
+) -> anyhow::Result<Value> {
+    const SAFARI_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Safari/605.1.15";
+    let mut client = json!({
+        "clientName": "WEB",
+        "clientVersion": cfg.client_version,
+        "userAgent": SAFARI_UA,
+        "hl": "en",
+        "gl": "US",
+    });
+    if let Some(vd) = cfg.visitor_data.as_deref().filter(|v| !v.is_empty()) {
+        client["visitorData"] = json!(vd);
+    }
+    let body = json!({
+        "context": { "client": client },
+        "videoId": video_id,
+        "contentCheckOk": true,
+        "racyCheckOk": true,
+    });
+    let mut req = http
+        .post("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+        .header("User-Agent", SAFARI_UA)
+        .header("X-YouTube-Client-Name", "1")
+        .header("X-YouTube-Client-Version", &cfg.client_version)
+        .header("Origin", ORIGIN)
+        .header("Referer", format!("{ORIGIN}/watch?v={video_id}"))
+        .timeout(Duration::from_secs(10))
+        .json(&body);
+    if let Some(vd) = cfg.visitor_data.as_deref().filter(|v| !v.is_empty()) {
+        req = req.header("X-Goog-Visitor-Id", vd);
+    }
+    req = session.sign(req, ORIGIN);
+    let resp: Value = req.send().await?.error_for_status()?.json().await?;
+    check_playability(&resp)?;
+    Ok(resp)
 }
 
 fn has_playable_url(v: &Value) -> bool {
@@ -3104,6 +3845,7 @@ fn parse_video_renderer(vr: &Value) -> Option<VideoItem> {
         watched_percent,
         resume_secs,
         playlist_browse_id: None,
+        playlist_set_video_id: None,
     })
 }
 
@@ -3132,6 +3874,7 @@ fn parse_playlist_video_renderer(pvr: &Value) -> Option<VideoItem> {
     let resume_secs = pvr["navigationEndpoint"]["watchEndpoint"]["startTimeSeconds"]
         .as_f64()
         .filter(|&s| s > 2.0);
+    let playlist_set_video_id = pvr["setVideoId"].as_str().map(str::to_owned);
     Some(VideoItem {
         id,
         title,
@@ -3146,6 +3889,7 @@ fn parse_playlist_video_renderer(pvr: &Value) -> Option<VideoItem> {
         watched_percent,
         resume_secs,
         playlist_browse_id: None,
+        playlist_set_video_id,
     })
 }
 
@@ -3236,6 +3980,7 @@ fn parse_lockup_view_model(lm: &Value) -> Option<VideoItem> {
         watched_percent,
         resume_secs,
         playlist_browse_id: None,
+        playlist_set_video_id: None,
     })
 }
 
@@ -3544,5 +4289,232 @@ mod tests {
         assert_eq!(likes, "313");
         assert!(liked);
         assert!(!disliked);
+    }
+
+    #[test]
+    fn archived_vod_with_live_chat_token_is_not_marked_live() {
+        let archived = json!({
+            "contents": {
+                "twoColumnWatchNextResults": {
+                    "results": {
+                        "results": {
+                            "contents": [{
+                                "videoPrimaryInfoRenderer": {
+                                    "viewCount": {
+                                        "videoViewCountRenderer": { "isLive": false }
+                                    }
+                                }
+                            }]
+                        }
+                    },
+                    "conversationBar": {
+                        "liveChatRenderer": {
+                            "continuations": [{
+                                "reloadContinuationData": { "continuation": "REPLAY_TOKEN" }
+                            }]
+                        }
+                    }
+                }
+            }
+        });
+        assert!(!is_next_live(&archived));
+
+        let active = json!({
+            "contents": {
+                "twoColumnWatchNextResults": {
+                    "results": {
+                        "results": {
+                            "contents": [{
+                                "videoPrimaryInfoRenderer": {
+                                    "viewCount": {
+                                        "videoViewCountRenderer": { "isLive": true }
+                                    }
+                                }
+                            }]
+                        }
+                    }
+                }
+            }
+        });
+        assert!(is_next_live(&active));
+    }
+
+    #[test]
+    fn parses_hls_master_playlist_variants_and_audio() {
+        let m3u8 = "\
+#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"234\",NAME=\"English\",DEFAULT=YES,URI=\"audio/234.m3u8\"
+#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=854x480,FRAME-RATE=30.000,CODECS=\"avc1.4d401f\",AUDIO=\"234\"
+480p.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=4500000,RESOLUTION=1920x1080,FRAME-RATE=60.000,CODECS=\"avc1.64002a\",AUDIO=\"234\"
+1080p60.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720,FRAME-RATE=30.000,CODECS=\"avc1.4d401f\",AUDIO=\"234\"
+720p.m3u8
+";
+        let (fmts, audio) = parse_hls_master_variants(
+            m3u8,
+            "https://manifest.googlevideo.com/api/manifest/hls_variant/master.m3u8",
+        );
+        assert_eq!(audio.len(), 1);
+        assert_eq!(
+            audio[0].url,
+            "https://manifest.googlevideo.com/api/manifest/hls_variant/audio/234.m3u8"
+        );
+        assert_eq!(fmts.len(), 3);
+        assert_eq!((fmts[0].height, fmts[0].fps, fmts[0].has_audio), (1080, 60, false));
+        assert_eq!(
+            fmts[0].url,
+            "https://manifest.googlevideo.com/api/manifest/hls_variant/1080p60.m3u8"
+        );
+        assert_eq!((fmts[1].height, fmts[2].height), (720, 480));
+    }
+
+    #[test]
+    fn classifies_login_required_and_playable_urls() {
+        assert!(is_login_or_age_error(&anyhow::anyhow!(
+            "LOGIN_REQUIRED: Sign in to confirm your age"
+        )));
+        assert!(!is_login_or_age_error(&anyhow::anyhow!(
+            "VIDEO_NOT_FOUND: Video unavailable"
+        )));
+        let no_url = json!({
+            "streamingData": {
+                "adaptiveFormats": [{ "itag": 137, "signatureCipher": "s=abc" }]
+            }
+        });
+        assert!(!has_playable_url(&no_url));
+        let with_url = json!({
+            "streamingData": {
+                "hlsManifestUrl": "https://manifest.googlevideo.com/live.m3u8"
+            }
+        });
+        assert!(has_playable_url(&with_url));
+    }
+
+    #[test]
+    fn parses_playlist_video_set_video_id() {
+        let pvr = json!({
+            "videoId": "dQw4w9WgXcQ",
+            "title": { "simpleText": "Track 1" },
+            "setVideoId": "SET_VID_ABC",
+            "lengthText": { "simpleText": "3:32" }
+        });
+        let item = parse_playlist_video_renderer(&pvr).unwrap();
+        assert_eq!(item.playlist_set_video_id.as_deref(), Some("SET_VID_ABC"));
+    }
+
+    #[test]
+    fn parses_live_chat_replay_superchat_membership_and_emotes() {
+        let resp = json!({
+            "continuationContents": {
+                "liveChatContinuation": {
+                    "continuations": [{
+                        "liveChatReplayContinuationData": { "continuation": "NEXT_REPLAY_TOK" }
+                    }],
+                    "actions": [
+                        {
+                            "replayChatItemAction": {
+                                "videoOffsetTimeMsec": "42500",
+                                "actions": [{
+                                    "addChatItemAction": {
+                                        "item": {
+                                            "liveChatPaidMessageRenderer": {
+                                                "id": "sc1",
+                                                "authorName": { "simpleText": "Supporter" },
+                                                "purchaseAmountText": { "simpleText": "$5.00" },
+                                                "bodyBackgroundColor": 4280191205u64,
+                                                "message": {
+                                                    "runs": [
+                                                        { "text": "Great stream " },
+                                                        {
+                                                            "emoji": {
+                                                                "emojiId": "UC/EM1",
+                                                                "isCustomEmoji": true,
+                                                                "shortcuts": [":hype:"],
+                                                                "image": { "thumbnails": [{ "url": "https://yt.gg/em1.png" }] }
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            }
+                                        }
+                                    }
+                                }]
+                            }
+                        },
+                        {
+                            "addChatItemAction": {
+                                "item": {
+                                    "liveChatMembershipItemRenderer": {
+                                        "id": "mem1",
+                                        "authorName": { "simpleText": "NewMem" },
+                                        "headerSubtext": { "simpleText": "Member for 2 months" }
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let page = parse_live_chat_response(&resp);
+        assert!(page.is_replay);
+        assert_eq!(page.next_token.as_deref(), Some("NEXT_REPLAY_TOK"));
+        assert_eq!(page.messages.len(), 2);
+        assert_eq!(page.messages[0].offset_ms, Some(42500));
+        assert!(matches!(
+            page.messages[0].kind,
+            LiveChatKind::SuperChat { ref amount, .. } if amount == "$5.00"
+        ));
+        assert!(matches!(
+            page.messages[1].kind,
+            LiveChatKind::Membership { ref header } if header == "Member for 2 months"
+        ));
+        assert_eq!(page.emotes.len(), 1);
+        let segs = build_live_chat_segments("hi :hype: bye", &page.emotes);
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs[1]["emojiId"], "UC/EM1");
+    }
+
+    #[test]
+    fn parses_comment_pinned_heart_and_like_params() {
+        let mut entity_map = std::collections::HashMap::new();
+        entity_map.insert(
+            "K1".to_owned(),
+            json!({
+                "properties": { "commentId": "C1", "publishedTime": "1d ago", "content": { "content": "Hello!" } },
+                "author": { "displayName": "Alice" },
+                "toolbar": {
+                    "likeCountNotliked": "42",
+                    "likeState": "TOOLBAR_LIKE_STATE_INDIFFERENT",
+                    "heartState": "TOOLBAR_HEART_STATE_HEARTED"
+                }
+            }),
+        );
+        let mut surface_map = std::collections::HashMap::new();
+        surface_map.insert(
+            "S1".to_owned(),
+            json!({
+                "likeCommand": { "innertubeCommand": { "performCommentActionEndpoint": { "action": "ACT_LIKE" } } },
+                "unlikeCommand": { "innertubeCommand": { "performCommentActionEndpoint": { "action": "ACT_UNLIKE" } } }
+            }),
+        );
+        let entry = json!({
+            "commentThreadRenderer": {
+                "commentViewModel": {
+                    "commentViewModel": {
+                        "commentKey": "K1",
+                        "commentSurfaceKey": "S1",
+                        "pinnedText": "Pinned by Creator"
+                    }
+                }
+            }
+        });
+        let item = parse_comment_entry(&entry, &entity_map, &surface_map).unwrap();
+        assert!(item.is_pinned);
+        assert!(item.has_creator_heart);
+        assert!(!item.is_liked);
+        assert_eq!(item.like_action_params.as_deref(), Some("ACT_LIKE"));
+        assert_eq!(item.unlike_action_params.as_deref(), Some("ACT_UNLIKE"));
     }
 }

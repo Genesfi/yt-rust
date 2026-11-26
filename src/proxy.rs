@@ -39,6 +39,7 @@ struct StreamSession {
     active_readers: AtomicUsize,
     cancelled: AtomicBool,
     failed: AtomicBool,
+    forbidden: AtomicBool,
     notify: Notify,
 }
 
@@ -56,6 +57,7 @@ impl StreamSession {
             active_readers: AtomicUsize::new(0),
             cancelled: AtomicBool::new(false),
             failed: AtomicBool::new(false),
+            forbidden: AtomicBool::new(false),
             notify: Notify::new(),
         }
     }
@@ -173,7 +175,7 @@ impl StreamProxy {
     }
 
     pub fn register_with_ua(&self, url: &str, size: u64, user_agent: &str) -> String {
-        if size == 0 || url.contains(".m3u8") || url.contains("range=") {
+        if size == 0 || url.contains(".m3u8") || url.contains("/manifest/hls") || url.contains("range=") {
             return url.to_owned();
         }
         let ua = if user_agent.trim().is_empty() {
@@ -208,6 +210,39 @@ impl StreamProxy {
 
         format!("http://127.0.0.1:{}/s/{id}", self.port)
     }
+
+    fn session_id_from_url(&self, url: &str) -> Option<u64> {
+        let prefix = format!("http://127.0.0.1:{}/s/", self.port);
+        url.strip_prefix(&prefix)?
+            .split('?')
+            .next()?
+            .parse::<u64>()
+            .ok()
+    }
+
+    pub fn is_session_forbidden(&self, url: &str) -> bool {
+        let Some(id) = self.session_id_from_url(url) else {
+            return false;
+        };
+        self.state
+            .lock()
+            .unwrap()
+            .sessions
+            .get(&id)
+            .is_some_and(|s| s.forbidden.load(Ordering::Acquire))
+    }
+
+    pub fn is_session_failed(&self, url: &str) -> bool {
+        let Some(id) = self.session_id_from_url(url) else {
+            return false;
+        };
+        self.state
+            .lock()
+            .unwrap()
+            .sessions
+            .get(&id)
+            .is_some_and(|s| s.failed.load(Ordering::Acquire))
+    }
 }
 
 async fn worker_loop(http: reqwest::Client, sess: Arc<StreamSession>) {
@@ -228,6 +263,7 @@ async fn worker_loop(http: reqwest::Client, sess: Arc<StreamSession>) {
 
         let mut ok_data = None;
         let mut try_alt_ua = false;
+        let mut saw_403 = false;
         for attempt in 0..4 {
             if sess.cancelled.load(Ordering::Acquire) {
                 sess.release_flight(idx);
@@ -255,6 +291,7 @@ async fn worker_loop(http: reqwest::Client, sess: Arc<StreamSession>) {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(bytes) = resp.bytes().await {
                         if !bytes.is_empty() {
+                            saw_403 = false;
                             ok_data = Some(bytes.to_vec());
                             break;
                         }
@@ -262,6 +299,7 @@ async fn worker_loop(http: reqwest::Client, sess: Arc<StreamSession>) {
                 }
                 Ok(resp) if resp.status().as_u16() == 403 => {
                     log::warn!("proxy chunk {idx} HTTP 403");
+                    saw_403 = true;
                     if !try_alt_ua {
                         try_alt_ua = true;
                         continue;
@@ -276,6 +314,9 @@ async fn worker_loop(http: reqwest::Client, sess: Arc<StreamSession>) {
         if let Some(data) = ok_data {
             sess.finish_block(idx, data);
         } else {
+            if saw_403 {
+                sess.forbidden.store(true, Ordering::Release);
+            }
             sess.release_flight(idx);
             sess.failed.store(true, Ordering::Release);
             sess.notify.notify_waiters();
@@ -486,5 +527,19 @@ mod tests {
             .join()
             .unwrap();
         assert!(url.starts_with("http://127.0.0.1:"));
+        assert!(!proxy.is_session_forbidden(&url));
+        assert!(!proxy.is_session_failed(&url));
+        if let Some(id) = proxy.session_id_from_url(&url) {
+            proxy
+                .state
+                .lock()
+                .unwrap()
+                .sessions
+                .get(&id)
+                .unwrap()
+                .forbidden
+                .store(true, Ordering::Release);
+            assert!(proxy.is_session_forbidden(&url));
+        }
     }
 }

@@ -31,6 +31,9 @@ pub struct VideoItem {
     /// Set when a card represents a playlist (e.g. inside a channel's Playlists tab).
     #[serde(default)]
     pub playlist_browse_id: Option<String>,
+    /// Playlist item instance ID (`playlistVideoRenderer.setVideoId`) for remove/reorder actions.
+    #[serde(default)]
+    pub playlist_set_video_id: Option<String>,
 }
 
 /// Channel header info & available tabs returned on `Page::Channel`.
@@ -151,12 +154,31 @@ pub struct CommentItem {
     pub reply_params: Option<String>,
     pub replies: Vec<CommentItem>,
     pub replies_loading: bool,
+    pub is_liked: bool,
+    pub like_action_params: Option<String>,
+    pub unlike_action_params: Option<String>,
+    pub is_pinned: bool,
+    pub has_creator_heart: bool,
 }
 
 #[derive(Clone, Debug)]
 pub enum LiveChatRun {
     Text(String),
     Emoji { alt: String, url: Option<String> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LiveChatKind {
+    Normal,
+    SuperChat { amount: String, bg_color: u32 },
+    Membership { header: String },
+}
+
+#[derive(Clone, Debug)]
+pub struct LiveChatEmote {
+    pub shortcut: String,
+    pub emoji_id: String,
+    pub url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -168,6 +190,8 @@ pub struct LiveChatMessage {
     pub runs: Vec<LiveChatRun>,
     pub is_owner: bool,
     pub is_mod: bool,
+    pub kind: LiveChatKind,
+    pub offset_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug)]

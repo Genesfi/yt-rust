@@ -334,6 +334,84 @@ pub fn draw_next_icon(painter: &egui::Painter, c: egui::Pos2, s: f32, color: Col
     painter.rect_filled(bar, 1.0, color);
 }
 
+/// Crisp Shuffle icon centered at `c`.
+pub fn draw_shuffle_icon(painter: &egui::Painter, c: egui::Pos2, s: f32, color: Color32) {
+    let stroke = Stroke::new((s * 0.12).max(1.3), color);
+    painter.add(egui::Shape::line(
+        vec![
+            egui::pos2(c.x - s * 0.38, c.y - s * 0.24),
+            egui::pos2(c.x - s * 0.10, c.y - s * 0.24),
+            egui::pos2(c.x + s * 0.14, c.y + s * 0.24),
+            egui::pos2(c.x + s * 0.36, c.y + s * 0.24),
+        ],
+        stroke,
+    ));
+    painter.add(egui::Shape::line(
+        vec![
+            egui::pos2(c.x - s * 0.38, c.y + s * 0.24),
+            egui::pos2(c.x - s * 0.10, c.y + s * 0.24),
+            egui::pos2(c.x + s * 0.14, c.y - s * 0.24),
+            egui::pos2(c.x + s * 0.36, c.y - s * 0.24),
+        ],
+        stroke,
+    ));
+    for dy in [-s * 0.24, s * 0.24] {
+        let head = vec![
+            egui::pos2(c.x + s * 0.26, c.y + dy - s * 0.14),
+            egui::pos2(c.x + s * 0.44, c.y + dy),
+            egui::pos2(c.x + s * 0.26, c.y + dy + s * 0.14),
+        ];
+        painter.add(egui::Shape::convex_polygon(head, color, Stroke::NONE));
+    }
+}
+
+/// Crisp smiley face icon centered at `c` for the emote picker button.
+pub fn draw_smile_icon(painter: &egui::Painter, c: egui::Pos2, s: f32, color: Color32) {
+    let r = s * 0.42;
+    let stroke = Stroke::new((s * 0.10).max(1.2), color);
+    painter.circle_stroke(c, r, stroke);
+    painter.circle_filled(
+        egui::pos2(c.x - r * 0.34, c.y - r * 0.22),
+        (s * 0.07).max(1.1),
+        color,
+    );
+    painter.circle_filled(
+        egui::pos2(c.x + r * 0.34, c.y - r * 0.22),
+        (s * 0.07).max(1.1),
+        color,
+    );
+    painter.add(egui::Shape::line(
+        vec![
+            egui::pos2(c.x - r * 0.42, c.y + r * 0.16),
+            egui::pos2(c.x - r * 0.18, c.y + r * 0.38),
+            egui::pos2(c.x + r * 0.18, c.y + r * 0.38),
+            egui::pos2(c.x + r * 0.42, c.y + r * 0.16),
+        ],
+        stroke,
+    ));
+}
+
+/// Crisp pin icon centered at `c` for pinned comments.
+pub fn draw_pin_icon(painter: &egui::Painter, c: egui::Pos2, s: f32, color: Color32) {
+    let stroke = Stroke::new((s * 0.11).max(1.2), color);
+    let head = vec![
+        egui::pos2(c.x - s * 0.22, c.y - s * 0.36),
+        egui::pos2(c.x + s * 0.22, c.y - s * 0.36),
+        egui::pos2(c.x + s * 0.16, c.y - s * 0.04),
+        egui::pos2(c.x + s * 0.32, c.y + s * 0.08),
+        egui::pos2(c.x - s * 0.32, c.y + s * 0.08),
+        egui::pos2(c.x - s * 0.16, c.y - s * 0.04),
+    ];
+    painter.add(egui::Shape::closed_line(head, stroke));
+    painter.line_segment(
+        [
+            egui::pos2(c.x, c.y + s * 0.08),
+            egui::pos2(c.x, c.y + s * 0.42),
+        ],
+        stroke,
+    );
+}
+
 /// YouTube-style Theater Mode wide rectangle icon.
 pub fn draw_theater_icon(
     painter: &egui::Painter,
