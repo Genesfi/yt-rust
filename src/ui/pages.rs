@@ -4,12 +4,12 @@ use egui::{
 };
 
 use crate::backend::Request;
-use crate::model::{ChannelInfo, HwdecMode, PreferredQuality};
+use crate::model::{ChannelInfo, HwdecMode, PreferredQuality, VideoItem};
 use crate::theme::{self, icon};
 use crate::ytdlp;
 
 use super::cards::{draw_avatar, draw_thumbnail, draw_video_grid, icon_circle_button, settings_card};
-use super::{GUEST_TOPICS, Page, YtApp, format_duration};
+use super::{GUEST_TOPICS, Page, SubsFilter, YtApp, format_duration};
 
 impl YtApp {
     pub(super) fn draw_home_page(&mut self, ui: &mut egui::Ui) {
@@ -373,13 +373,92 @@ impl YtApp {
             });
             return;
         }
-        let items = self.subs_items.clone();
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Subscriptions")
+                    .font(theme::bold(20.0))
+                    .color(Color32::WHITE),
+            );
+            ui.add_space(16.0);
+            let live_count = self.subs_items.iter().filter(|it| it.is_live).count();
+            let filters = [
+                (SubsFilter::All, "All".to_owned()),
+                (SubsFilter::Unwatched, "Unwatched".to_owned()),
+                (
+                    SubsFilter::Live,
+                    if live_count > 0 {
+                        format!("Live now ({live_count})")
+                    } else {
+                        "Live now".to_owned()
+                    },
+                ),
+            ];
+            for (kind, label) in filters {
+                let selected = self.subs_filter == kind;
+                let (fill, text_col) = if selected {
+                    (Color32::from_rgb(241, 241, 241), Color32::from_rgb(15, 15, 15))
+                } else {
+                    (theme::CHIP, theme::TEXT)
+                };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(label)
+                                .font(theme::medium(13.0))
+                                .color(text_col),
+                        )
+                        .fill(fill)
+                        .corner_radius(CornerRadius::same(8)),
+                    )
+                    .clicked()
+                {
+                    self.subs_filter = kind;
+                }
+            }
+        });
+        ui.add_space(10.0);
+
+        let items: Vec<VideoItem> = self
+            .subs_items
+            .iter()
+            .filter(|it| match self.subs_filter {
+                SubsFilter::All => true,
+                SubsFilter::Unwatched => !it.watched_percent.is_some_and(|p| p >= 0.85),
+                SubsFilter::Live => it.is_live,
+            })
+            .cloned()
+            .collect();
         let loading = self.subs_loading;
         let cont = self.subs_continuation.clone();
+        if items.is_empty() && !self.subs_items.is_empty() && !loading {
+            Frame::new()
+                .fill(theme::SURFACE)
+                .stroke(Stroke::new(1.0, theme::BORDER))
+                .corner_radius(12)
+                .inner_margin(Margin::symmetric(16, 12))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let empty_msg = match self.subs_filter {
+                            SubsFilter::Live => "No live streams in loaded subscriptions.",
+                            SubsFilter::Unwatched => "All loaded subscription videos have been watched.",
+                            SubsFilter::All => "No subscription videos loaded yet.",
+                        };
+                        ui.label(
+                            RichText::new(empty_msg)
+                                .font(theme::regular(13.5))
+                                .color(theme::TEXT_DIM),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("Show all").clicked() {
+                                self.subs_filter = SubsFilter::All;
+                            }
+                        });
+                    });
+                });
+            ui.add_space(10.0);
+        }
         let ctx = ui.ctx().clone();
-        if let Some(act) =
-            draw_video_grid(ui, "Subscriptions", &items, loading, cont.is_some())
-        {
+        if let Some(act) = draw_video_grid(ui, "", &items, loading, cont.is_some()) {
             self.handle_grid_action(&ctx, act, |app| {
                 app.subs_loading = true;
                 let _ = app.backend.tx.send(Request::LoadSubscriptions {
@@ -744,6 +823,79 @@ impl YtApp {
         );
         ui.add_space(12.0);
 
+        if !self.active_downloads.is_empty() {
+            ui.label(
+                RichText::new(format!("Active Downloads ({})", self.active_downloads.len()))
+                    .font(theme::semibold(15.0))
+                    .color(Color32::WHITE),
+            );
+            ui.add_space(6.0);
+            for dl in &self.active_downloads {
+                let kind = if dl.audio_only { "M4A Audio" } else { "MP4 Video" };
+                let ico = if dl.audio_only {
+                    icon::HEADPHONES
+                } else {
+                    icon::DOWNLOAD
+                };
+                Frame::new()
+                    .fill(theme::SURFACE)
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(10)
+                    .inner_margin(Margin::symmetric(14, 10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            theme::draw_icon(ui, ico, 18.0, theme::YT_BLUE);
+                            ui.add_space(6.0);
+                            ui.vertical(|ui| {
+                                ui.set_max_width((ui.available_width() - 95.0).max(140.0));
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&dl.title)
+                                            .font(theme::medium(13.5))
+                                            .color(Color32::WHITE),
+                                    )
+                                    .truncate(),
+                                );
+                                let mut meta = vec![kind.to_owned(), dl.status.clone()];
+                                if !dl.speed.is_empty() {
+                                    meta.push(dl.speed.clone());
+                                }
+                                if !dl.total_size.is_empty() {
+                                    meta.push(dl.total_size.clone());
+                                }
+                                ui.label(
+                                    RichText::new(meta.join(" · "))
+                                        .font(theme::regular(11.5))
+                                        .color(theme::TEXT_DIM),
+                                );
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(
+                                    RichText::new(format!("{:.0}%", dl.percent * 100.0))
+                                        .font(theme::semibold(13.0))
+                                        .color(theme::YT_BLUE),
+                                );
+                            });
+                        });
+                        ui.add_space(6.0);
+                        let (bar_rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 5.0),
+                            Sense::hover(),
+                        );
+                        ui.painter().rect_filled(bar_rect, 2.5, theme::CHIP);
+                        let fill_w = (bar_rect.width() * dl.percent.clamp(0.02, 1.0)).max(6.0);
+                        let fill_rect = Rect::from_min_size(
+                            bar_rect.min,
+                            Vec2::new(fill_w, bar_rect.height()),
+                        );
+                        ui.painter().rect_filled(fill_rect, 2.5, theme::YT_BLUE);
+                    });
+                ui.add_space(6.0);
+            }
+            ui.add_space(8.0);
+        }
+
         let mut entries: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for ent in rd.flatten() {
@@ -766,7 +918,7 @@ impl YtApp {
         }
         entries.sort_by(|a, b| b.2.cmp(&a.2));
 
-        if entries.is_empty() {
+        if entries.is_empty() && self.active_downloads.is_empty() {
             Frame::new()
                 .fill(theme::SURFACE)
                 .stroke(Stroke::new(1.0, theme::BORDER))

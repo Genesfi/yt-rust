@@ -28,6 +28,8 @@ wry = "0.57.0"
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3.6.3", features = ["windows-native"] }
+raw-window-handle = "0.6"
+souvlaki = "0.9.3"
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1.31"

@@ -399,10 +399,15 @@ impl YtApp {
                                     }
                                 }
 
+                                let dl_label = if self.active_downloads.is_empty() {
+                                    "Downloads".to_owned()
+                                } else {
+                                    format!("Downloads ({})", self.active_downloads.len())
+                                };
                                 if sidebar_item_alpha(
                                     &mut acc_ui,
                                     icon::DOWNLOAD,
-                                    "Downloads",
+                                    &dl_label,
                                     "Downloads",
                                     self.page == Page::Downloads,
                                     expand_t,

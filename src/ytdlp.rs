@@ -1,6 +1,57 @@
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DownloadProgress {
+    pub percent: f32,
+    pub speed: String,
+    pub total_size: String,
+    pub status: String,
+}
+
+pub fn parse_progress_line(line: &str) -> Option<DownloadProgress> {
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix("DLPROG:") {
+        let mut parts = rest.splitn(3, '|');
+        let pct_str = parts.next().unwrap_or("").trim().trim_end_matches('%');
+        let raw_speed = parts.next().unwrap_or("").trim();
+        let raw_size = parts.next().unwrap_or("").trim();
+        let percent = pct_str
+            .parse::<f32>()
+            .map(|p| (p / 100.0).clamp(0.0, 1.0))
+            .unwrap_or(0.0);
+        let speed = if raw_speed.is_empty() || raw_speed == "N/A" || raw_speed == "Unknown" {
+            String::new()
+        } else {
+            raw_speed.to_owned()
+        };
+        let total_size = if raw_size.is_empty() || raw_size == "N/A" || raw_size == "Unknown" {
+            String::new()
+        } else {
+            raw_size.to_owned()
+        };
+        return Some(DownloadProgress {
+            percent,
+            speed,
+            total_size,
+            status: "Downloading...".to_owned(),
+        });
+    }
+    if trimmed.starts_with("[Merger]")
+        || trimmed.starts_with("[ExtractAudio]")
+        || trimmed.starts_with("[Fixup")
+    {
+        return Some(DownloadProgress {
+            percent: 1.0,
+            speed: String::new(),
+            total_size: String::new(),
+            status: "Merging & finalizing...".to_owned(),
+        });
+    }
+    None
+}
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -579,6 +630,7 @@ pub async fn download_video(
     video_id: &str,
     audio_only: bool,
     max_height: u32,
+    on_progress: impl Fn(DownloadProgress) + Send + 'static,
 ) -> anyhow::Result<PathBuf> {
     let (bin_res, runtime) = tokio::join!(
         ensure_ytdlp(http, data_dir),
@@ -607,6 +659,10 @@ pub async fn download_video(
             "--no-warnings",
             "--no-playlist",
             "--restrict-filenames",
+            "--newline",
+            "--progress",
+            "--progress-template",
+            "download:DLPROG:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._total_bytes_estimate_str,progress._total_bytes_str)s",
             "-P",
             &out_dir_str,
             "-o",
@@ -624,6 +680,7 @@ pub async fn download_video(
             cmd.args(["-f", &fmt, "--merge-output-format", "mp4"]);
         }
         cmd.arg(format!("https://www.youtube.com/watch?v={vid}"));
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         #[cfg(windows)]
         {
@@ -631,23 +688,64 @@ pub async fn download_video(
             cmd.creation_flags(0x0800_0000);
         }
 
-        let out = cmd.output()?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            let msg = err
+        let mut child = cmd.spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing yt-dlp stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing yt-dlp stderr"))?;
+        let err_handle = std::thread::spawn(move || {
+            let mut errs = String::new();
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if !errs.is_empty() {
+                    errs.push('\n');
+                }
+                errs.push_str(&line);
+            }
+            errs
+        });
+
+        let mut last_path: Option<PathBuf> = None;
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(prog) = parse_progress_line(&line) {
+                on_progress(prog);
+            } else {
+                let t = line.trim();
+                if !t.is_empty() && !t.starts_with('[') {
+                    last_path = Some(PathBuf::from(t));
+                }
+            }
+        }
+        let status = child.wait()?;
+        let err_text = err_handle.join().unwrap_or_default();
+        if !status.success() {
+            let msg = err_text
                 .lines()
                 .rfind(|l| l.contains("ERROR"))
                 .unwrap_or("yt-dlp download failed");
             anyhow::bail!("{}", msg.trim());
         }
-        let printed = String::from_utf8_lossy(&out.stdout);
-        let saved = printed
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .map(|l| PathBuf::from(l.trim()))
-            .unwrap_or(out_dir);
-        Ok(saved)
+        Ok(last_path.unwrap_or(out_dir))
     })
     .await?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_progress_line;
+
+    #[test]
+    fn parses_ytdlp_progress_template_and_postprocess() {
+        let p = parse_progress_line("DLPROG: 42.5%| 3.12MiB/s| 120.40MiB").unwrap();
+        assert!((p.percent - 0.425).abs() < 0.001);
+        assert_eq!(p.speed, "3.12MiB/s");
+        assert_eq!(p.total_size, "120.40MiB");
+
+        let m = parse_progress_line("[Merger] Merging formats into \"test.mp4\"").unwrap();
+        assert_eq!(m.percent, 1.0);
+        assert_eq!(m.status, "Merging & finalizing...");
+    }
 }

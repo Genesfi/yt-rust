@@ -316,6 +316,10 @@ impl YtApp {
             .duration
             .max(self.watch.as_ref().map_or(0.0, |w| w.duration_secs));
         let mut pos = self.seeking_pos.unwrap_or(self.playback.time_pos);
+        let is_live = self.watch.as_ref().is_some_and(|w| w.is_live);
+        let live_behind = (dur - pos).max(0.0);
+        let at_live_edge =
+            is_live && self.seeking_pos.is_none() && (dur <= 0.0 || live_behind <= 12.0);
 
         let pad_x = 14.0;
         let controls_h = 62.0;
@@ -358,8 +362,8 @@ impl YtApp {
             Color32::from_white_alpha((70.0 * alpha).round() as u8),
         );
 
-        if dur > 0.0 {
-            if self.playback.cache_duration > 0.0 {
+        if dur > 0.0 || is_live {
+            if !is_live && dur > 0.0 && self.playback.cache_duration > 0.0 {
                 let buf_frac = ((pos + self.playback.cache_duration) / dur).clamp(0.0, 1.0) as f32;
                 let buf_rect = Rect::from_min_max(
                     track.min,
@@ -372,27 +376,36 @@ impl YtApp {
                 );
             }
 
-            for seg in &self.sponsor_segments {
-                if !seg.fits(dur) {
-                    continue;
+            if !is_live && dur > 0.0 {
+                for seg in &self.sponsor_segments {
+                    if !seg.fits(dur) {
+                        continue;
+                    }
+                    let x0 =
+                        track.left() + (seg.start / dur).clamp(0.0, 1.0) as f32 * track.width();
+                    let x1 = track.left() + (seg.end / dur).clamp(0.0, 1.0) as f32 * track.width();
+                    let seg_rect = Rect::from_min_max(
+                        pos2(x0, track.top()),
+                        pos2(x1.max(x0 + 2.0), track.bottom()),
+                    );
+                    let color = match seg.category {
+                        SponsorCategory::Sponsor => Color32::from_rgb(0, 212, 0),
+                        SponsorCategory::SelfPromo => Color32::from_rgb(255, 255, 0),
+                        SponsorCategory::Interaction => Color32::from_rgb(204, 0, 255),
+                        _ => Color32::from_rgb(0, 200, 230),
+                    }
+                    .gamma_multiply(alpha);
+                    cui.painter().rect_filled(seg_rect, 1.5, color);
                 }
-                let x0 = track.left() + (seg.start / dur).clamp(0.0, 1.0) as f32 * track.width();
-                let x1 = track.left() + (seg.end / dur).clamp(0.0, 1.0) as f32 * track.width();
-                let seg_rect = Rect::from_min_max(
-                    pos2(x0, track.top()),
-                    pos2(x1.max(x0 + 2.0), track.bottom()),
-                );
-                let color = match seg.category {
-                    SponsorCategory::Sponsor => Color32::from_rgb(0, 212, 0),
-                    SponsorCategory::SelfPromo => Color32::from_rgb(255, 255, 0),
-                    SponsorCategory::Interaction => Color32::from_rgb(204, 0, 255),
-                    _ => Color32::from_rgb(0, 200, 230),
-                }
-                .gamma_multiply(alpha);
-                cui.painter().rect_filled(seg_rect, 1.5, color);
             }
 
-            let frac = (pos / dur).clamp(0.0, 1.0) as f32;
+            let frac = if at_live_edge {
+                1.0
+            } else if dur > 0.0 {
+                (pos / dur).clamp(0.0, 1.0) as f32
+            } else {
+                0.0
+            };
             let fill = Rect::from_min_max(
                 track.min,
                 pos2(track.left() + track.width() * frac, track.bottom()),
@@ -401,14 +414,16 @@ impl YtApp {
                 .rect_filled(fill, h * 0.5, theme::YT_RED.gamma_multiply(alpha));
 
             // Subtle chapter dividers along the seekbar
-            if let Some(w) = &self.watch {
-                for ch in &w.chapters {
-                    if ch.start_secs > 1.0 && ch.start_secs < dur {
-                        let cx = track.left() + (ch.start_secs / dur) as f32 * track.width();
-                        cui.painter().line_segment(
-                            [pos2(cx, track.top()), pos2(cx, track.bottom())],
-                            Stroke::new(2.0, Color32::from_black_alpha((200.0 * alpha) as u8)),
-                        );
+            if !is_live && dur > 0.0 {
+                if let Some(w) = &self.watch {
+                    for ch in &w.chapters {
+                        if ch.start_secs > 1.0 && ch.start_secs < dur {
+                            let cx = track.left() + (ch.start_secs / dur) as f32 * track.width();
+                            cui.painter().line_segment(
+                                [pos2(cx, track.top()), pos2(cx, track.bottom())],
+                                Stroke::new(2.0, Color32::from_black_alpha((200.0 * alpha) as u8)),
+                            );
+                        }
                     }
                 }
             }
@@ -421,19 +436,28 @@ impl YtApp {
                 theme::YT_RED.gamma_multiply(alpha),
             );
 
-            if bar_hot {
+            if bar_hot && dur > 0.0 {
                 if let Some(ptr) = ctx.input(|i| i.pointer.hover_pos()) {
                     let hf = ((ptr.x - track.left()) / track.width()).clamp(0.0, 1.0) as f64;
                     let h_secs = hf * dur;
-                    let ch_title = self.watch.as_ref().and_then(|w| {
-                        w.chapters
-                            .iter()
-                            .rfind(|c| c.start_secs <= h_secs)
-                            .map(|c| c.title.as_str())
-                    });
-                    let tip = match ch_title {
-                        Some(t) => format!("{} · {t}", format_duration(h_secs)),
-                        None => format_duration(h_secs),
+                    let tip = if is_live {
+                        let behind = (dur - h_secs).max(0.0);
+                        if behind <= 5.0 {
+                            "Live".to_owned()
+                        } else {
+                            format!("-{}", format_duration(behind))
+                        }
+                    } else {
+                        let ch_title = self.watch.as_ref().and_then(|w| {
+                            w.chapters
+                                .iter()
+                                .rfind(|c| c.start_secs <= h_secs)
+                                .map(|c| c.title.as_str())
+                        });
+                        match ch_title {
+                            Some(t) => format!("{} · {t}", format_duration(h_secs)),
+                            None => format_duration(h_secs),
+                        }
                     };
                     let galley = cui.painter().layout_no_wrap(
                         tip,
@@ -502,8 +526,13 @@ impl YtApp {
             }
             if bar_resp.drag_stopped() || bar_resp.clicked() {
                 if let Some(target) = self.seeking_pos.take() {
+                    let seek_to = if is_live && dur > 4.0 && target >= (dur - 4.0) {
+                        (dur - 2.0).max(0.0)
+                    } else {
+                        target
+                    };
                     if let Some(mpv) = &self.mpv {
-                        mpv.seek_abs(target);
+                        mpv.seek_abs(seek_to);
                     }
                 }
             }
@@ -659,15 +688,69 @@ impl YtApp {
             }
 
             ui.add_space(4.0);
-            ui.label(
-                RichText::new(format!(
-                    "{} / {}",
-                    format_duration(pos),
-                    format_duration(dur)
-                ))
-                .font(theme::medium(12.2))
-                .color(white),
-            );
+            if is_live {
+                let dot_col = if at_live_edge {
+                    theme::YT_RED.gamma_multiply(alpha)
+                } else {
+                    dim
+                };
+                let live_label = if at_live_edge {
+                    "Live".to_owned()
+                } else {
+                    format!("Live  ·  -{}", format_duration(live_behind))
+                };
+                let text_galley = ui.painter().layout_no_wrap(
+                    live_label.clone(),
+                    theme::semibold(12.2),
+                    white,
+                );
+                let pill_w = 24.0 + text_galley.size().x;
+                let (lrect, lresp) =
+                    ui.allocate_exact_size(Vec2::new(pill_w, 24.0), Sense::click());
+                if lresp.hovered() {
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                }
+                if lresp.hovered() || !at_live_edge {
+                    ui.painter().rect_filled(
+                        lrect,
+                        12.0,
+                        Color32::from_white_alpha((26.0 * alpha).round() as u8),
+                    );
+                }
+                ui.painter()
+                    .circle_filled(pos2(lrect.left() + 10.0, lrect.center().y), 3.6, dot_col);
+                ui.painter().text(
+                    pos2(lrect.left() + 18.0, lrect.center().y),
+                    Align2::LEFT_CENTER,
+                    live_label,
+                    theme::semibold(12.2),
+                    white,
+                );
+                if lresp
+                    .on_hover_text(if at_live_edge {
+                        "Watching live"
+                    } else {
+                        "Jump back to Live"
+                    })
+                    .clicked()
+                    && dur > 2.0
+                {
+                    any_interacted = true;
+                    if let Some(mpv) = &self.mpv {
+                        mpv.seek_abs((dur - 2.0).max(0.0));
+                    }
+                }
+            } else {
+                ui.label(
+                    RichText::new(format!(
+                        "{} / {}",
+                        format_duration(pos),
+                        format_duration(dur)
+                    ))
+                    .font(theme::medium(12.2))
+                    .color(white),
+                );
+            }
 
             if let Some(ch_title) = self.watch.as_ref().and_then(|w| {
                 w.chapters
@@ -1454,6 +1537,8 @@ impl YtApp {
 
         // Comments section
         ui.add_space(14.0);
+        let mut load_sort: Option<(usize, String)> = None;
+        let mut expand_replies: Option<(String, String)> = None;
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(if self.comments.is_empty() {
@@ -1463,12 +1548,91 @@ impl YtApp {
                 })
                 .font(theme::semibold(16.0)),
             );
+            if !self.comment_sort_options.is_empty() {
+                ui.add_space(12.0);
+                for (idx, (label, tok)) in self.comment_sort_options.iter().enumerate() {
+                    let active = idx == self.selected_comment_sort;
+                    let (fill, col) = if active {
+                        (Color32::from_rgb(241, 241, 241), Color32::from_rgb(15, 15, 15))
+                    } else {
+                        (theme::CHIP, theme::TEXT)
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(label).font(theme::medium(12.0)).color(col),
+                            )
+                            .fill(fill)
+                            .corner_radius(8),
+                        )
+                        .clicked()
+                        && !active
+                    {
+                        load_sort = Some((idx, tok.clone()));
+                    }
+                }
+            }
             if self.comments_loading {
                 ui.add_space(8.0);
                 ui.spinner();
             }
         });
+        if let Some((idx, tok)) = load_sort {
+            self.selected_comment_sort = idx;
+            self.comments.clear();
+            self.comments_next_token = None;
+            self.comments_loading = true;
+            let _ = self.backend.tx.send(Request::LoadComments {
+                video_id: w.id.clone(),
+                continuation: tok,
+                append: false,
+            });
+        }
         ui.add_space(8.0);
+
+        if self.signed_in {
+            if let Some(params) = self.comment_create_params.clone() {
+                ui.horizontal(|ui| {
+                    let input_w = (ui.available_width() - 96.0).max(160.0);
+                    let te = ui.add_sized(
+                        Vec2::new(input_w, 32.0),
+                        egui::TextEdit::singleline(&mut self.comment_draft)
+                            .hint_text("Add a comment..."),
+                    );
+                    let submit = ui
+                        .add_sized(
+                            Vec2::new(84.0, 32.0),
+                            egui::Button::new(
+                                RichText::new("Comment")
+                                    .font(theme::semibold(12.5))
+                                    .color(Color32::from_rgb(15, 15, 15)),
+                            )
+                            .fill(theme::YT_BLUE)
+                            .corner_radius(16),
+                        )
+                        .clicked()
+                        || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                    if submit {
+                        let body = self.comment_draft.trim().to_owned();
+                        if !body.is_empty() {
+                            let reload_tok = self
+                                .comment_sort_options
+                                .get(self.selected_comment_sort)
+                                .map(|(_, t)| t.clone())
+                                .or_else(|| w.comments_token.clone());
+                            let _ = self.backend.tx.send(Request::PostComment {
+                                video_id: w.id.clone(),
+                                text: body,
+                                params,
+                                reload_continuation: reload_tok,
+                            });
+                            self.comment_draft.clear();
+                        }
+                    }
+                });
+                ui.add_space(10.0);
+            }
+        }
 
         if self.comments.is_empty() && !self.comments_loading {
             if let Some(tok) = w.comments_token.clone() {
@@ -1515,9 +1679,72 @@ impl YtApp {
                                     .color(theme::TEXT_DIM),
                             );
                         }
+                        if !c.replies.is_empty() {
+                            ui.add_space(6.0);
+                            for r in &c.replies {
+                                ui.horizontal_top(|ui| {
+                                    draw_avatar(ui, r.avatar_url.as_deref(), &r.author, 24.0);
+                                    ui.add_space(8.0);
+                                    ui.vertical(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(
+                                                RichText::new(&r.author).font(theme::semibold(12.0)),
+                                            );
+                                            if !r.published.is_empty() {
+                                                ui.label(
+                                                    RichText::new(&r.published)
+                                                        .font(theme::regular(11.0))
+                                                        .color(theme::TEXT_DIM),
+                                                );
+                                            }
+                                        });
+                                        ui.label(
+                                            RichText::new(&r.text)
+                                                .font(theme::regular(12.5))
+                                                .color(theme::TEXT),
+                                        );
+                                    });
+                                });
+                                ui.add_space(4.0);
+                            }
+                        }
+                        if c.replies_loading {
+                            ui.spinner();
+                        } else if let Some(rtok) = c.replies_token.clone() {
+                            let label = if c.replies.is_empty() && !c.reply_count_text.is_empty() {
+                                c.reply_count_text.clone()
+                            } else if c.replies.is_empty() {
+                                "View replies".to_owned()
+                            } else {
+                                "Load more replies".to_owned()
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(format!("{}  {label}", icon::CHEVRON_DOWN))
+                                            .font(theme::semibold(12.0))
+                                            .color(theme::YT_BLUE),
+                                    )
+                                    .fill(Color32::TRANSPARENT),
+                                )
+                                .clicked()
+                            {
+                                expand_replies = Some((c.id.clone(), rtok));
+                            }
+                        }
                     });
                 });
                 ui.add_space(10.0);
+            }
+            if let Some((cid, rtok)) = expand_replies {
+                if let Some(c) = self.comments.iter_mut().find(|c| c.id == cid) {
+                    c.replies_loading = true;
+                }
+                let _ = self.backend.tx.send(Request::LoadCommentReplies {
+                    video_id: w.id.clone(),
+                    comment_id: cid,
+                    continuation: rtok,
+                });
             }
             if !self.comments_loading {
                 if let Some(tok) = self.comments_next_token.clone() {
@@ -1641,7 +1868,6 @@ impl YtApp {
         ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), 42.0), layout, |ui| {
             let watch_url = format!("https://www.youtube.com/watch?v={}", w.id);
             let is_saved = self.saved.iter().any(|x| x.id == w.id);
-            let output_dir = self.custom_download_dir();
 
             let draw_more_menu = |ui: &mut egui::Ui, app: &mut Self| {
                 let (mrect, mresp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
@@ -1672,14 +1898,7 @@ impl YtApp {
                         .button(format!("{}  Download Audio (M4A)", icon::HEADPHONES))
                         .clicked()
                     {
-                        app.toast(format!("Downloading audio: {}", w.title));
-                        let _ = app.backend.tx.send(Request::DownloadVideo {
-                            video_id: w.id.clone(),
-                            title: w.title.clone(),
-                            audio_only: true,
-                            max_height: app.preferred_quality.max_height(),
-                            output_dir: output_dir.clone(),
-                        });
+                        app.start_download(w.id.clone(), w.title.clone(), true);
                         ui.close();
                     }
                     if ui
@@ -1723,14 +1942,7 @@ impl YtApp {
                     .on_hover_text(format!("Download MP4 ({})", app.preferred_quality.label()))
                     .clicked()
                 {
-                    app.toast(format!("Downloading video: {}", w.title));
-                    let _ = app.backend.tx.send(Request::DownloadVideo {
-                        video_id: w.id.clone(),
-                        title: w.title.clone(),
-                        audio_only: false,
-                        max_height: app.preferred_quality.max_height(),
-                        output_dir: output_dir.clone(),
-                    });
+                    app.start_download(w.id.clone(), w.title.clone(), false);
                 }
             };
 
@@ -2004,6 +2216,49 @@ impl YtApp {
                     if cresp.clicked() {
                         clear_queue = true;
                     }
+
+                    if self.signed_in {
+                        ui.add_space(6.0);
+                        let (srect, sresp) =
+                            ui.allocate_exact_size(Vec2::new(64.0, 26.0), Sense::click());
+                        let shov = ui
+                            .ctx()
+                            .animate_bool_with_time(sresp.id, sresp.hovered(), 0.12);
+                        if sresp.hovered() {
+                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                        }
+                        let sfill = if self.save_queue_open {
+                            theme::YT_BLUE.gamma_multiply(0.22)
+                        } else {
+                            theme::lerp_color(theme::CHIP, theme::CHIP_HOVER, shov)
+                        };
+                        let scol = if self.save_queue_open {
+                            theme::YT_BLUE
+                        } else {
+                            theme::TEXT
+                        };
+                        ui.painter().rect_filled(srect, 8.0, sfill);
+                        theme::draw_icon_centered(
+                            ui.painter(),
+                            pos2(srect.left() + 15.0, srect.center().y),
+                            icon::LIST_PLUS,
+                            13.0,
+                            scol,
+                        );
+                        ui.painter().text(
+                            pos2(srect.left() + 27.0, srect.center().y),
+                            Align2::LEFT_CENTER,
+                            "Save",
+                            theme::medium(12.0),
+                            scol,
+                        );
+                        if sresp.on_hover_text("Save queue as playlist").clicked() {
+                            self.save_queue_open = !self.save_queue_open;
+                            if self.save_queue_open && self.save_queue_title.is_empty() {
+                                self.save_queue_title = "Saved Queue".to_owned();
+                            }
+                        }
+                    }
                 });
             });
             if clear_queue {
@@ -2011,9 +2266,68 @@ impl YtApp {
                 self.queue_drag_idx = None;
                 self.queue_drag_origin = None;
                 self.queue_drag_active = false;
+                self.save_queue_open = false;
                 self.persist_queue();
                 self.right_tab = RightTab::UpNext;
                 return;
+            }
+            if self.save_queue_open && self.signed_in {
+                ui.add_space(6.0);
+                Frame::new()
+                    .fill(theme::SURFACE)
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(10)
+                    .inner_margin(Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let input_w = (ui.available_width() - 92.0).max(90.0);
+                            let te = ui.add_sized(
+                                Vec2::new(input_w, 28.0),
+                                egui::TextEdit::singleline(&mut self.save_queue_title)
+                                    .hint_text("Playlist title..."),
+                            );
+                            let submit = ui
+                                .add_sized(
+                                    Vec2::new(56.0, 28.0),
+                                    egui::Button::new(
+                                        RichText::new("Save")
+                                            .font(theme::semibold(12.0))
+                                            .color(Color32::from_rgb(15, 15, 15)),
+                                    )
+                                    .fill(theme::YT_BLUE)
+                                    .corner_radius(7),
+                                )
+                                .clicked()
+                                || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if submit {
+                                let title = self.save_queue_title.trim().to_owned();
+                                if !title.is_empty() {
+                                    let mut seen = std::collections::HashSet::new();
+                                    let mut video_ids = Vec::new();
+                                    for item in &self.queue {
+                                        if !item.id.starts_with("local:")
+                                            && seen.insert(item.id.clone())
+                                        {
+                                            video_ids.push(item.id.clone());
+                                        }
+                                    }
+                                    if !video_ids.is_empty() {
+                                        let _ = self.backend.tx.send(Request::CreatePlaylist {
+                                            title,
+                                            video_ids,
+                                        });
+                                        self.save_queue_title.clear();
+                                        self.save_queue_open = false;
+                                    } else {
+                                        self.toast("No YouTube videos in queue to save");
+                                    }
+                                }
+                            }
+                            if icon_circle_button(ui, icon::X, 13.0, "Cancel") {
+                                self.save_queue_open = false;
+                            }
+                        });
+                    });
             }
             ui.add_space(6.0);
             let q_items = self.queue.clone();
@@ -2268,6 +2582,8 @@ impl YtApp {
         }
 
         if has_chat && self.right_tab == RightTab::LiveChat {
+            let can_send = self.signed_in && self.live_chat_send_params.is_some();
+            let input_reserve = if can_send { 54.0 } else { 16.0 };
             Frame::new()
                 .fill(theme::SURFACE)
                 .stroke(Stroke::new(1.0, theme::BORDER))
@@ -2277,7 +2593,7 @@ impl YtApp {
                     ScrollArea::vertical()
                         .id_salt("live_chat_scroll")
                         .stick_to_bottom(true)
-                        .max_height((ui.available_height() - 16.0).max(240.0))
+                        .max_height((ui.available_height() - input_reserve).max(200.0))
                         .show(ui, |ui| {
                             if self.live_chat.is_empty() {
                                 ui.label(
@@ -2309,6 +2625,44 @@ impl YtApp {
                                 ui.add_space(4.0);
                             }
                         });
+                    if can_send {
+                        if let Some(params) = self.live_chat_send_params.clone() {
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                let input_w = (ui.available_width() - 64.0).max(100.0);
+                                let te = ui.add_sized(
+                                    Vec2::new(input_w, 28.0),
+                                    egui::TextEdit::singleline(&mut self.live_chat_draft)
+                                        .hint_text("Say something..."),
+                                );
+                                let send = ui
+                                    .add_sized(
+                                        Vec2::new(56.0, 28.0),
+                                        egui::Button::new(
+                                            RichText::new("Send")
+                                                .font(theme::semibold(12.0))
+                                                .color(Color32::from_rgb(15, 15, 15)),
+                                        )
+                                        .fill(theme::YT_BLUE)
+                                        .corner_radius(14),
+                                    )
+                                    .clicked()
+                                    || (te.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                                if send {
+                                    let msg = self.live_chat_draft.trim().to_owned();
+                                    if !msg.is_empty() {
+                                        let _ = self.backend.tx.send(Request::SendLiveChat {
+                                            video_id: w.id.clone(),
+                                            params,
+                                            message: msg,
+                                        });
+                                        self.live_chat_draft.clear();
+                                    }
+                                }
+                            });
+                        }
+                    }
                 });
             return;
         }

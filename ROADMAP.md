@@ -39,20 +39,20 @@ All core playback, authentication, sync, and browse features are implemented and
 - [x] Modularize `src/ui.rs` into focused submodules (`src/ui/{mod.rs, topbar.rs, sidebar.rs, watch.rs, pages.rs, cards.rs}`).
 
 ### Phase 2 — OS Media Integration & Player UX
-- [ ] **Windows SMTC & Media Keys** (`Play/Pause`, `Next`, `Previous`, `Seek`) showing current video title, channel, and thumbnail in Windows media flyout.
+- [x] **Windows SMTC & Media Keys** (`Play/Pause`, `Next`, `Previous`, `Seek`) showing current video title, channel, and thumbnail in Windows media flyout.
 - [x] **Hover/Fullscreen Auto-Hide Overlay** on the video surface so fullscreen feels clean like native YouTube.
 - [x] **Stats for Nerds** modal/overlay (`Ctrl+I` or control-bar toggle): active codec, resolution, fps, bitrate, proxy cache speed/duration, `hwdec-current`, dropped frames.
 - [x] Round top corners cleanly on PiP video rendering (`draw_mini_player`) + optional snap-to-corner behavior.
 
 ### Phase 3 — Community & Discovery Parity
-- [ ] **Interactive Comments & Live Chat Input**: post comments (`comment/create_comment`), expand comment replies (`commentRepliesRenderer`), sort Top/Newest, and send live chat messages (`live_chat/send_message`).
+- [x] **Interactive Comments & Live Chat Input**: post comments (`comment/create_comment`), expand comment replies (`commentRepliesRenderer`), sort Top/Newest, and send live chat messages (`live_chat/send_message`).
 - [ ] **Channel Home & Search Within Channel**, plus vertical **Shorts Player** mode.
-- [ ] **Remove from Watch History** & **Save Queue as Playlist** + Queue drag-and-drop reordering.
-- [ ] **Subscriptions Filtering** (All / Live now / Unwatched, or per-channel notifications badge).
+- [x] **Remove from Watch History**, **Save Queue as Playlist**, & Queue drag-and-drop reordering.
+- [x] **Subscriptions Filtering** (`All` / `Unwatched` / `Live now`).
 
 ### Phase 4 — Offline Downloads Manager & CI/Release
-- [ ] **Downloads Page** in sidebar tracking live `yt-dlp` download progress (`%`, speed, size), listing downloaded MP4/M4A files, and supporting offline playback directly in `libmpv`.
-- [ ] **GitHub Actions CI** workflow running `cargo test` on push/PR and publishing Windows release builds to GitHub Releases.
+- [x] **Downloads Page** in sidebar tracking live `yt-dlp` download progress (`%`, speed, size), listing downloaded MP4/M4A files, and supporting offline playback directly in `libmpv`.
+- [x] **GitHub Actions CI** workflow running `cargo test` on push/PR and publishing Windows release builds to GitHub Releases.
 
 ---
 

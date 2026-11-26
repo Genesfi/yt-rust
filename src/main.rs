@@ -7,6 +7,7 @@ mod innertube;
 mod login;
 mod model;
 mod mpv;
+mod os_media;
 mod proxy;
 mod sponsorblock;
 mod theme;

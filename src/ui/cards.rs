@@ -18,6 +18,7 @@ pub(super) enum GridAction {
     OpenPlaylistPicker(VideoItem),
     Download { item: VideoItem, audio_only: bool },
     CopyUrl(String),
+    RemoveFromHistory(VideoItem),
     LoadMore,
 }
 
@@ -274,7 +275,7 @@ impl YtApp {
                             if !title.is_empty() {
                                 let _ = self.backend.tx.send(Request::CreatePlaylist {
                                     title,
-                                    video_id: Some(video.id.clone()),
+                                    video_ids: vec![video.id.clone()],
                                 });
                                 self.new_playlist_title.clear();
                                 close_now = true;
@@ -310,6 +311,17 @@ pub(super) fn draw_video_grid(
     items: &[VideoItem],
     loading: bool,
     has_more: bool,
+) -> Option<GridAction> {
+    draw_video_grid_opts(ui, heading, items, loading, has_more, false)
+}
+
+pub(super) fn draw_video_grid_opts(
+    ui: &mut egui::Ui,
+    heading: &str,
+    items: &[VideoItem],
+    loading: bool,
+    has_more: bool,
+    show_remove_history: bool,
 ) -> Option<GridAction> {
     let mut action = None;
     if !heading.is_empty() || loading {
@@ -484,6 +496,17 @@ pub(super) fn draw_video_grid(
                                     );
                                     egui::Popup::menu(&mresp).show(|ui| {
                                         draw_video_context_menu(ui, item, &mut action, false);
+                                        if show_remove_history
+                                            && ui
+                                                .button(format!(
+                                                    "{}  Remove from history",
+                                                    icon::TRASH_2
+                                                ))
+                                                .clicked()
+                                        {
+                                            action = Some(GridAction::RemoveFromHistory(item.clone()));
+                                            ui.close();
+                                        }
                                     });
                                     if mresp.hovered() || mresp.clicked() {
                                         child_clicked_override = true;
@@ -495,6 +518,14 @@ pub(super) fn draw_video_grid(
 
                     card_resp.context_menu(|ui| {
                         draw_video_context_menu(ui, item, &mut action, false);
+                        if show_remove_history
+                            && ui
+                                .button(format!("{}  Remove from history", icon::TRASH_2))
+                                .clicked()
+                        {
+                            action = Some(GridAction::RemoveFromHistory(item.clone()));
+                            ui.close();
+                        }
                     });
 
                     let card_hover_resp = if item.title.chars().count() > 46 {

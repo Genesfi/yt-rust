@@ -140,11 +140,16 @@ pub struct Chapter {
 
 #[derive(Clone, Debug)]
 pub struct CommentItem {
+    pub id: String,
     pub author: String,
     pub avatar_url: Option<String>,
     pub published: String,
     pub likes: String,
     pub text: String,
+    pub reply_count_text: String,
+    pub replies_token: Option<String>,
+    pub replies: Vec<CommentItem>,
+    pub replies_loading: bool,
 }
 
 #[derive(Clone, Debug)]

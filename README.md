@@ -8,37 +8,60 @@ A fast, lightweight native Windows desktop YouTube client written in Rust with [
 | :---: | :---: | :---: |
 | ![Home Feed and PiP Mini-Player](assets/screenshots/home-pip.jpg) | ![Watch Page Player](assets/screenshots/watch-player.jpg) | ![Watch Page with Expanded Sidebar](assets/screenshots/watch-sidebar.jpg) |
 
+| Livestream & Interactive Live Chat | Comments Sort, Post & Replies |
+| :---: | :---: |
+| ![Livestream and Live Chat](assets/screenshots/live-chat.jpg) | ![Comments Sort and Replies](assets/screenshots/comments-replies.png) |
+
 ## Features
 
-- **Native 1080p–4K Playback (`libmpv` + OpenGL FBO)**
+- **Native 1080p–4K Playback (`libmpv` + OpenGL FBO) & OS Media Integration**
   - Auto-downloads `libmpv-2.dll` on Windows (`shinchiro/mpv-winbuild-cmake`) on first setup via Settings.
   - Built-in localhost parallel HTTP range prefetch proxy (`src/proxy.rs`) to prevent single-stream throttling/buffering at 1080p+.
-  - Selectable resolution & codec (`H.264`, `VP9`, `AV1`), multi-audio track selector (*Original* / auto-dubbed), speed control (`0.5x–2.0x`), closed captions (`.vtt`), chapters, and storyboard seekbar thumbnail previews.
+  - Selectable resolution & codec (`H.264`, `VP9`, `AV1`), multi-audio track selector (*Original* / auto-dubbed), speed control (`0.5x–2.0x`), closed captions (`.vtt`), chapters, storyboard seekbar thumbnail previews, **Stats for Nerds** (`Ctrl+I`), and auto-hiding player controls.
+  - YouTube-style **Live** edge bar (pinned right at live edge with `-MM:SS` DVR rewind hover preview and clickable `● Live` jump-to-live badge).
+  - **Windows SMTC & Hardware Media Keys** (`src/os_media.rs`) via `souvlaki`: Windows media flyout shows title, channel, cover thumbnail, timeline progress, and responds to Play/Pause, Next, Previous, and Seek.
 - **Google Account & Sync**
   - Embedded WebView2 Google sign-in (`tao` + `wry`) with session credentials stored in the OS keychain (`keyring`).
-  - Two-way Watch History sync (`FEhistory` + YouTube `videostats` watchtime reporting) with resume progress bars (`startPercent` / `startTimeSeconds`) and automatic resume on playback.
-  - Personalized Home feed + filter chips bar (horizontal wheel, `<` / `>` buttons, and left-click drag panning), Subscriptions feed & channel list, Trending, Liked Videos (`VLLL`), and Watch Later (`VLWL`).
+  - Two-way Watch History sync (`FEhistory` + YouTube `videostats` watchtime reporting) with resume progress bars (`startPercent` / `startTimeSeconds`), automatic resume on playback, and **Remove from Watch History** support.
+  - Personalized Home feed + filter chips bar (horizontal wheel, `<` / `>` buttons, and left-click drag panning), **Subscriptions** filtering (`All` / `Unwatched` / `Live now`), Trending, Liked Videos (`VLLL`), and Watch Later (`VLWL`).
 - **Channel Pages, Playlists & Queue**
   - Full Channel pages with banner, avatar, subscriber count, subscribe toggle, and `Videos` / `Shorts` / `Live` / `Playlists` tabs.
   - Library **Playlists** view & interactive **Save to Playlist** modal with playlist search filter, playlist thumbnails, existing playlist membership checkmarks, Watch Later sync, and playlist creation.
-  - Persistent Play Queue (`Up Next` / `Queue` / `Live Chat`) with drag-to-reorder, crash-safe Last-Watched + Queue resume, auto-PiP on scroll with corner-snapping mini-player, mouse Back/Forward navigation (`XButton1` / `XButton2`), and SponsorBlock auto-skip.
-- **Search, Comments & Offline Downloads**
-  - Live YouTube search autocomplete suggestions, direct URL/video-ID paste, comments pagination, live chat polling, Like/Dislike, and optional `yt-dlp` stream fallback / MP4 & M4A downloads (configurable folder in Settings).
+  - Persistent Play Queue (`Up Next` / `Queue` / `Live Chat`) with hold-and-drag reordering, **Save Queue as Playlist**, crash-safe Last-Watched + Queue resume, rounded corner-snapping floating PiP mini-player, mouse Back/Forward navigation (`XButton1` / `XButton2`), and SponsorBlock auto-skip.
+- **Interactive Comments, Live Chat & Offline Downloads**
+  - Live YouTube search autocomplete suggestions and direct URL/video-ID paste.
+  - Interactive Comments: **Top / Newest** sort chips, expandable comment replies (`commentRepliesRenderer`), pagination, and **Add a comment** posting (`comment/create_comment`).
+  - Interactive **Live Chat** polling with signed-in message sending (`live_chat/send_message`) and Like/Dislike sync.
+  - Built-in **Downloads** manager page tracking live `yt-dlp` download progress (`%`, speed, size), configurable output folder, offline playback in `libmpv`, and optional `yt-dlp` fallback (`node` / QuickJS `qjs` runtime auto-resolved).
 
 ## Project Structure
 
 - `src/main.rs` — App entry point, `eframe` OpenGL (`Glow`) setup, image/texture loaders, Windows crash/panic logger
 - `src/ui/` — Modular application UI (`mod.rs`, `topbar.rs`, `sidebar.rs`, `cards.rs`, `pages.rs`, `watch.rs`)
+- `src/os_media.rs` — Windows SMTC media flyout & hardware media-key integration (`souvlaki`)
 - `src/images.rs` — Pooled `reqwest` HTTP image `BytesLoader`, disk thumbnail cache, and bounded GPU `TextureLoader`
-- `src/innertube.rs` — Direct InnerTube API client, feed/channel/watch/playlist/caption/storyboard parsers
+- `src/innertube.rs` — Direct InnerTube API client, feed/channel/watch/playlist/caption/comments/live-chat/storyboard parsers
 - `src/backend.rs` — Async Tokio backend worker & watchtime history sync loop
 - `src/mpv.rs` — Dynamic `libmpv-2.dll` bindings & OpenGL FBO rendering
 - `src/proxy.rs` — Localhost multi-worker HTTP range prefetch proxy
 - `src/auth.rs` & `src/login.rs` — WebView2 Google login & `SAPISIDHASH` request signing
 - `src/sponsorblock.rs` — SponsorBlock segment lookup
-- `src/ytdlp.rs` — `yt-dlp` fallback resolver & offline downloader
+- `src/ytdlp.rs` — `yt-dlp` fallback resolver & streaming progress offline downloader
 - `src/model.rs` & `src/theme.rs` — Data models, YouTube dark palette, custom vector icons, bundled fonts & app icon
 - `build.rs` — Windows resource & SegmentHeap manifest embedding via `winresource`
+- `.github/workflows/ci.yml` — GitHub Actions CI (`cargo test --locked` & Windows release packaging)
+
+## Contributing
+
+Contributions are very welcome! **yt-rust** is open for contributors — whether fixing bugs, improving InnerTube compatibility, polishing UI details, or picking up remaining items in [ROADMAP.md](ROADMAP.md).
+
+### How to Contribute
+1. Check [ROADMAP.md](ROADMAP.md) or existing issues/PRs to see what is planned or in progress.
+2. Fork the repository and create a topic branch (`feat/...`, `fix/...`, `chore/...`).
+3. Keep code modular and clean:
+   - Use custom vector / bundled `lucide.ttf` icons instead of Unicode emojis in the UI.
+   - Ensure `cargo test --locked` passes with zero compiler warnings.
+4. Open a Pull Request describing your changes clearly (screenshots welcome for UI changes).
 
 ## Build & Run
 

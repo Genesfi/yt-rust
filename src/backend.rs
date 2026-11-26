@@ -53,9 +53,29 @@ pub enum Request {
         continuation: String,
         append: bool,
     },
+    LoadCommentReplies {
+        video_id: String,
+        comment_id: String,
+        continuation: String,
+    },
+    PostComment {
+        video_id: String,
+        text: String,
+        params: String,
+        reload_continuation: Option<String>,
+    },
     LoadLiveChat {
         video_id: String,
         continuation: String,
+    },
+    SendLiveChat {
+        video_id: String,
+        params: String,
+        message: String,
+    },
+    RemoveFromHistory {
+        video_id: String,
+        feedback_token: String,
     },
     SetLike {
         video_id: String,
@@ -80,7 +100,7 @@ pub enum Request {
     },
     CreatePlaylist {
         title: String,
-        video_id: Option<String>,
+        video_ids: Vec<String>,
     },
     SetSubscribe {
         channel_id: String,
@@ -118,6 +138,7 @@ pub enum Response {
         items: Vec<VideoItem>,
         continuation: Option<String>,
         append: bool,
+        feedback_tokens: HashMap<String, String>,
     },
     GuideLoaded {
         channels: Vec<SidebarChannel>,
@@ -161,13 +182,29 @@ pub enum Response {
         video_id: String,
         comments: Vec<CommentItem>,
         next_token: Option<String>,
+        sort_options: Vec<(String, String)>,
+        create_params: Option<String>,
         append: bool,
+    },
+    CommentRepliesLoaded {
+        video_id: String,
+        comment_id: String,
+        replies: Vec<CommentItem>,
+        next_token: Option<String>,
+    },
+    CommentPosted {
+        video_id: String,
     },
     LiveChatLoaded {
         video_id: String,
         messages: Vec<LiveChatMessage>,
         next_token: Option<String>,
+        send_params: Option<String>,
     },
+    LiveChatSent {
+        video_id: String,
+    },
+    HistoryRemoved,
     LikeUpdated {
         video_id: String,
         liked: bool,
@@ -194,7 +231,14 @@ pub enum Response {
         channel_id: String,
         subscribed: bool,
     },
+    DownloadProgress {
+        video_id: String,
+        audio_only: bool,
+        progress: crate::ytdlp::DownloadProgress,
+    },
     VideoDownloaded {
+        video_id: String,
+        audio_only: bool,
         title: String,
         result: Result<PathBuf, String>,
     },
@@ -539,12 +583,15 @@ impl Backend {
                                 )
                                 .await
                                 {
-                                    Ok(FeedPage {
-                                        items,
-                                        continuation,
-                                        visitor_data,
-                                        ..
-                                    }) => {
+                                    Ok((
+                                        FeedPage {
+                                            items,
+                                            continuation,
+                                            visitor_data,
+                                            ..
+                                        },
+                                        feedback_tokens,
+                                    )) => {
                                         if visitor_data.is_some() {
                                             cfg.visitor_data = visitor_data;
                                         }
@@ -552,6 +599,7 @@ impl Backend {
                                             items,
                                             continuation,
                                             append,
+                                            feedback_tokens,
                                         });
                                     }
                                     Err(e) => {
@@ -684,17 +732,109 @@ impl Backend {
                                     )
                                     .await
                                     {
-                                        Ok((comments, next_token)) => {
+                                        Ok(page) => {
                                             let _ = resp_tx.send(Response::CommentsLoaded {
                                                 video_id,
-                                                comments,
-                                                next_token,
+                                                comments: page.comments,
+                                                next_token: page.next_token,
+                                                sort_options: page.sort_options,
+                                                create_params: page.create_params,
                                                 append,
                                             });
                                         }
                                         Err(e) => {
                                             let _ = resp_tx.send(Response::Error(format!(
                                                 "Comments failed: {e:#}"
+                                            )));
+                                        }
+                                    }
+                                    wake();
+                                });
+                            }
+                            Request::LoadCommentReplies {
+                                video_id,
+                                comment_id,
+                                continuation,
+                            } => {
+                                let cfg_clone = cfg.clone();
+                                let sess_clone = session.clone();
+                                tokio::spawn(async move {
+                                    match innertube::fetch_comment_replies(
+                                        &http,
+                                        &continuation,
+                                        &cfg_clone,
+                                        sess_clone.as_ref(),
+                                    )
+                                    .await
+                                    {
+                                        Ok((replies, next_token)) => {
+                                            let _ = resp_tx.send(Response::CommentRepliesLoaded {
+                                                video_id,
+                                                comment_id,
+                                                replies,
+                                                next_token,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = resp_tx.send(Response::Error(format!(
+                                                "Replies failed: {e:#}"
+                                            )));
+                                        }
+                                    }
+                                    wake();
+                                });
+                            }
+                            Request::PostComment {
+                                video_id,
+                                text,
+                                params,
+                                reload_continuation,
+                            } => {
+                                let Some(s) = session.clone() else {
+                                    let _ = resp_tx.send(Response::Error(
+                                        "Sign in to post comments".into(),
+                                    ));
+                                    wake();
+                                    continue;
+                                };
+                                let cfg_clone = cfg.clone();
+                                tokio::spawn(async move {
+                                    match innertube::create_comment(
+                                        &http,
+                                        &text,
+                                        &params,
+                                        &cfg_clone,
+                                        &s,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            let _ = resp_tx.send(Response::CommentPosted {
+                                                video_id: video_id.clone(),
+                                            });
+                                            if let Some(tok) = reload_continuation {
+                                                if let Ok(page) = innertube::fetch_comments(
+                                                    &http,
+                                                    &tok,
+                                                    &cfg_clone,
+                                                    Some(&s),
+                                                )
+                                                .await
+                                                {
+                                                    let _ = resp_tx.send(Response::CommentsLoaded {
+                                                        video_id,
+                                                        comments: page.comments,
+                                                        next_token: page.next_token,
+                                                        sort_options: page.sort_options,
+                                                        create_params: page.create_params,
+                                                        append: false,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let _ = resp_tx.send(Response::Error(format!(
+                                                "Comment failed: {e:#}"
                                             )));
                                         }
                                     }
@@ -708,22 +848,88 @@ impl Backend {
                                 let cfg_clone = cfg.clone();
                                 let sess_clone = session.clone();
                                 tokio::spawn(async move {
-                                    if let Ok((messages, next_token)) =
-                                        innertube::fetch_live_chat(
-                                            &http,
-                                            &continuation,
-                                            &cfg_clone,
-                                            sess_clone.as_ref(),
-                                        )
-                                        .await
+                                    if let Ok(page) = innertube::fetch_live_chat(
+                                        &http,
+                                        &continuation,
+                                        &cfg_clone,
+                                        sess_clone.as_ref(),
+                                    )
+                                    .await
                                     {
                                         let _ = resp_tx.send(Response::LiveChatLoaded {
                                             video_id,
-                                            messages,
-                                            next_token,
+                                            messages: page.messages,
+                                            next_token: page.next_token,
+                                            send_params: page.send_params,
                                         });
                                         wake();
                                     }
+                                });
+                            }
+                            Request::SendLiveChat {
+                                video_id,
+                                params,
+                                message,
+                            } => {
+                                let Some(s) = session.clone() else {
+                                    let _ = resp_tx.send(Response::Error(
+                                        "Sign in to send live chat messages".into(),
+                                    ));
+                                    wake();
+                                    continue;
+                                };
+                                let cfg_clone = cfg.clone();
+                                tokio::spawn(async move {
+                                    match innertube::send_live_chat_message(
+                                        &http,
+                                        &params,
+                                        &message,
+                                        &cfg_clone,
+                                        &s,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            let _ = resp_tx.send(Response::LiveChatSent {
+                                                video_id,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = resp_tx.send(Response::Error(format!(
+                                                "Live chat send failed: {e:#}"
+                                            )));
+                                        }
+                                    }
+                                    wake();
+                                });
+                            }
+                            Request::RemoveFromHistory {
+                                video_id,
+                                feedback_token,
+                            } => {
+                                let Some(s) = session.clone() else {
+                                    continue;
+                                };
+                                let cfg_clone = cfg.clone();
+                                tokio::spawn(async move {
+                                    match innertube::remove_from_history(
+                                        &http,
+                                        &feedback_token,
+                                        &cfg_clone,
+                                        &s,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            let _ = resp_tx.send(Response::HistoryRemoved);
+                                        }
+                                        Err(e) => {
+                                            let _ = resp_tx.send(Response::Error(format!(
+                                                "Remove from history failed: {e:#}"
+                                            )));
+                                        }
+                                    }
+                                    wake();
                                 });
                             }
                             Request::SetLike { video_id, like } => {
@@ -928,7 +1134,7 @@ impl Backend {
                                     wake();
                                 });
                             }
-                            Request::CreatePlaylist { title, video_id } => {
+                            Request::CreatePlaylist { title, video_ids } => {
                                 let Some(s) = session.clone() else {
                                     let _ = resp_tx.send(Response::Error(
                                         "Sign in to create playlists".into(),
@@ -941,7 +1147,7 @@ impl Backend {
                                     match innertube::create_playlist(
                                         &http,
                                         &title,
-                                        video_id.as_deref(),
+                                        &video_ids,
                                         &cfg_clone,
                                         &s,
                                     )
@@ -1065,6 +1271,9 @@ impl Backend {
                             } => {
                                 let cookie = session.as_ref().map(|s| s.cookie.clone());
                                 tokio::spawn(async move {
+                                    let vid_prog = video_id.clone();
+                                    let tx_prog = resp_tx.clone();
+                                    let wake_prog = wake.clone();
                                     let result = ytdlp::download_video(
                                         &http,
                                         &data_dir,
@@ -1073,10 +1282,20 @@ impl Backend {
                                         &video_id,
                                         audio_only,
                                         max_height,
+                                        move |progress| {
+                                            let _ = tx_prog.send(Response::DownloadProgress {
+                                                video_id: vid_prog.clone(),
+                                                audio_only,
+                                                progress,
+                                            });
+                                            wake_prog();
+                                        },
                                     )
                                     .await
                                     .map_err(|e| format!("{e:#}"));
                                     let _ = resp_tx.send(Response::VideoDownloaded {
+                                        video_id,
+                                        audio_only,
                                         title,
                                         result,
                                     });

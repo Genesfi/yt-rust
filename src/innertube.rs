@@ -236,7 +236,7 @@ pub async fn history_feed(
     continuation: Option<&str>,
     cfg: &WebConfig,
     session: &Session,
-) -> anyhow::Result<FeedPage> {
+) -> anyhow::Result<(FeedPage, HashMap<String, String>)> {
     let body = match continuation {
         Some(token) => json!({ "continuation": token }),
         None => json!({ "browseId": "FEhistory" }),
@@ -248,14 +248,94 @@ pub async fn history_feed(
     let mut items = Vec::new();
     let mut seen = HashSet::new();
     collect_videos(&v, &mut items, &mut seen);
+    let mut feedback_tokens = HashMap::new();
+    collect_history_feedback_tokens(&v, &mut feedback_tokens);
     let cont = find_continuation(&v);
-    Ok(FeedPage {
-        items,
-        chips: Vec::new(),
-        continuation: cont,
-        visitor_data: new_vd,
-        is_fallback_trending: false,
-    })
+    Ok((
+        FeedPage {
+            items,
+            chips: Vec::new(),
+            continuation: cont,
+            visitor_data: new_vd,
+            is_fallback_trending: false,
+        },
+        feedback_tokens,
+    ))
+}
+
+fn find_first_feedback_token(v: &Value) -> Option<String> {
+    match v {
+        Value::Object(map) => {
+            if let Some(tok) = map
+                .get("feedbackEndpoint")
+                .and_then(|fe| fe.get("feedbackToken"))
+                .and_then(|t| t.as_str())
+            {
+                return Some(tok.to_owned());
+            }
+            for val in map.values() {
+                if let Some(found) = find_first_feedback_token(val) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => arr.iter().find_map(find_first_feedback_token),
+        _ => None,
+    }
+}
+
+fn collect_history_feedback_tokens(v: &Value, out: &mut HashMap<String, String>) {
+    match v {
+        Value::Object(map) => {
+            if let Some(vr) = map.get("videoRenderer") {
+                if let Some(id) = vr["videoId"].as_str() {
+                    if let Some(tok) = find_first_feedback_token(&vr["menu"]) {
+                        out.entry(id.to_owned()).or_insert(tok);
+                    }
+                }
+            }
+            if let Some(lm) = map.get("lockupViewModel") {
+                if let Some(id) = lm["contentId"].as_str() {
+                    if id.len() == 11 {
+                        if let Some(tok) = find_first_feedback_token(
+                            &lm["metadata"]["lockupMetadataViewModel"]["menuButton"],
+                        )
+                        .or_else(|| find_first_feedback_token(lm))
+                        {
+                            out.entry(id.to_owned()).or_insert(tok);
+                        }
+                    }
+                }
+            }
+            for val in map.values() {
+                collect_history_feedback_tokens(val, out);
+            }
+        }
+        Value::Array(arr) => {
+            for val in arr {
+                collect_history_feedback_tokens(val, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub async fn remove_from_history(
+    http: &reqwest::Client,
+    feedback_token: &str,
+    cfg: &WebConfig,
+    session: &Session,
+) -> anyhow::Result<()> {
+    post_web(
+        http,
+        "feedback",
+        json!({ "feedbackTokens": [feedback_token] }),
+        cfg,
+        Some(session),
+    )
+    .await?;
+    Ok(())
 }
 
 pub async fn fetch_guide_fast(
@@ -827,7 +907,7 @@ fn parse_add_to_playlist(v: &Value) -> Vec<PlaylistOption> {
 pub async fn create_playlist(
     http: &reqwest::Client,
     title: &str,
-    video_id: Option<&str>,
+    video_ids: &[String],
     cfg: &WebConfig,
     session: &Session,
 ) -> anyhow::Result<()> {
@@ -835,8 +915,8 @@ pub async fn create_playlist(
         "title": title,
         "privacyStatus": "PRIVATE",
     });
-    if let Some(vid) = video_id {
-        body["videoIds"] = json!([vid]);
+    if !video_ids.is_empty() {
+        body["videoIds"] = json!(video_ids);
     }
     post_web(http, "playlist/create", body, cfg, Some(session)).await?;
     Ok(())
@@ -1459,12 +1539,142 @@ fn collect_videos_with_channel_items(
     walk(v, out, seen, channel_name, channel_id);
 }
 
+pub struct CommentPage {
+    pub comments: Vec<CommentItem>,
+    pub next_token: Option<String>,
+    pub sort_options: Vec<(String, String)>,
+    pub create_params: Option<String>,
+}
+
+fn find_nested_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    match v {
+        Value::Object(map) => {
+            if let Some(s) = map.get(key).and_then(|x| x.as_str()) {
+                return Some(s);
+            }
+            for val in map.values() {
+                if let Some(found) = find_nested_str(val, key) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => arr.iter().find_map(|val| find_nested_str(val, key)),
+        _ => None,
+    }
+}
+
+fn parse_comment_entry(
+    entry: &Value,
+    entity_map: &std::collections::HashMap<String, Value>,
+) -> Option<CommentItem> {
+    let thread = if entry["commentThreadRenderer"].is_object() {
+        &entry["commentThreadRenderer"]
+    } else {
+        entry
+    };
+    let (reply_count_text, replies_token) = {
+        let rr = &thread["replies"]["commentRepliesRenderer"];
+        let label = text(&rr["viewReplies"]["buttonRenderer"]["text"]).unwrap_or_default();
+        let tok = rr["contents"]
+            .as_array()
+            .and_then(|a| {
+                a.iter().find_map(|x| {
+                    x["continuationItemRenderer"]["continuationEndpoint"]
+                        ["continuationCommand"]["token"]
+                        .as_str()
+                })
+            })
+            .map(str::to_owned);
+        (label, tok)
+    };
+
+    let c_val = if thread["comment"]["commentRenderer"].is_object() {
+        Some(&thread["comment"]["commentRenderer"])
+    } else if thread["commentRenderer"].is_object() {
+        Some(&thread["commentRenderer"])
+    } else {
+        None
+    };
+
+    if let Some(cr) = c_val {
+        let id = cr["commentId"].as_str().unwrap_or_default().to_owned();
+        let author = text(&cr["authorText"]).unwrap_or_else(|| "User".to_owned());
+        let avatar_url = cr["authorThumbnail"]["thumbnails"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|t| t["url"].as_str())
+            .map(normalize_url);
+        let published = text(&cr["publishedTimeText"]).unwrap_or_default();
+        let likes = text(&cr["voteCount"]).unwrap_or_default();
+        let body_txt = text(&cr["contentText"]).unwrap_or_default();
+        if body_txt.is_empty() {
+            return None;
+        }
+        return Some(CommentItem {
+            id,
+            author,
+            avatar_url,
+            published,
+            likes,
+            text: body_txt,
+            reply_count_text,
+            replies_token,
+            replies: Vec::new(),
+            replies_loading: false,
+        });
+    }
+
+    let key = thread["commentViewModel"]["commentViewModel"]["commentKey"]
+        .as_str()
+        .or_else(|| entry["commentViewModel"]["commentKey"].as_str())?;
+    let payload = entity_map.get(key)?;
+    let author = payload["author"]["displayName"]
+        .as_str()
+        .unwrap_or("User")
+        .to_owned();
+    let avatar_url = payload["author"]["avatarThumbnailUrl"]
+        .as_str()
+        .map(normalize_url);
+    let published = payload["properties"]["publishedTime"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let likes = payload["toolbar"]["likeCountNotliked"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let body_txt = payload["properties"]["content"]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    if body_txt.is_empty() {
+        return None;
+    }
+    Some(CommentItem {
+        id: payload["properties"]["commentId"]
+            .as_str()
+            .unwrap_or(key)
+            .to_owned(),
+        author,
+        avatar_url,
+        published,
+        likes,
+        text: body_txt,
+        reply_count_text,
+        replies_token,
+        replies: Vec::new(),
+        replies_loading: false,
+    })
+}
+
 pub async fn fetch_comments(
     http: &reqwest::Client,
     continuation: &str,
     cfg: &WebConfig,
     session: Option<&Session>,
-) -> anyhow::Result<(Vec<CommentItem>, Option<String>)> {
+) -> anyhow::Result<CommentPage> {
     let v = post_web(
         http,
         "next",
@@ -1474,8 +1684,6 @@ pub async fn fetch_comments(
     )
     .await?;
 
-    let mut out = Vec::new();
-    // 1. Check modern entityBatchUpdate payloads (commentEntityPayload)
     let mut entity_map = std::collections::HashMap::<String, Value>::new();
     if let Some(muts) = v["frameworkUpdates"]["entityBatchUpdate"]["mutations"].as_array() {
         for m in muts {
@@ -1487,7 +1695,11 @@ pub async fn fetch_comments(
         }
     }
 
+    let mut out = Vec::new();
     let mut next_token = None;
+    let mut sort_options = Vec::new();
+    let mut create_params = None;
+
     if let Some(eps) = v["onResponseReceivedEndpoints"].as_array() {
         for ep in eps {
             let items = ep["reloadContinuationItemsCommand"]["continuationItems"]
@@ -1495,6 +1707,31 @@ pub async fn fetch_comments(
                 .or_else(|| ep["appendContinuationItemsAction"]["continuationItems"].as_array());
             let Some(arr) = items else { continue };
             for entry in arr {
+                if let Some(header) = entry.get("commentsHeaderRenderer") {
+                    if let Some(menu_items) = header["sortMenu"]["sortFilterSubMenuRenderer"]
+                        ["subMenuItems"]
+                        .as_array()
+                    {
+                        for mi in menu_items {
+                            let label = mi["title"].as_str().unwrap_or_default().to_owned();
+                            let tok = mi["serviceEndpoint"]["continuationCommand"]["token"]
+                                .as_str()
+                                .or_else(|| {
+                                    mi["continuationEndpoint"]["continuationCommand"]["token"]
+                                        .as_str()
+                                })
+                                .map(str::to_owned);
+                            if let (false, Some(tok)) = (label.is_empty(), tok) {
+                                sort_options.push((label, tok));
+                            }
+                        }
+                    }
+                    if create_params.is_none() {
+                        create_params = find_nested_str(header, "createCommentParams")
+                            .map(str::to_owned);
+                    }
+                    continue;
+                }
                 if let Some(tok) = entry["continuationItemRenderer"]["continuationEndpoint"]
                     ["continuationCommand"]["token"]
                     .as_str()
@@ -1502,74 +1739,50 @@ pub async fn fetch_comments(
                     next_token = Some(tok.to_owned());
                     continue;
                 }
-                let thread = &entry["commentThreadRenderer"];
-                if !thread.is_object() {
-                    continue;
-                }
-                if let Some(c) = thread["comment"]["commentRenderer"].as_object() {
-                    let author = text(&Value::Object(c.clone())["authorText"])
-                        .unwrap_or_else(|| "User".to_owned());
-                    let avatar_url = c
-                        .get("authorThumbnail")
-                        .and_then(|t| t["thumbnails"].as_array())
-                        .and_then(|a| a.first())
-                        .and_then(|t| t["url"].as_str())
-                        .map(normalize_url);
-                    let published = text(&Value::Object(c.clone())["publishedTimeText"])
-                        .unwrap_or_default();
-                    let likes = text(&Value::Object(c.clone())["voteCount"]).unwrap_or_default();
-                    let body_txt =
-                        text(&Value::Object(c.clone())["contentText"]).unwrap_or_default();
-                    if !body_txt.is_empty() {
-                        out.push(CommentItem {
-                            author,
-                            avatar_url,
-                            published,
-                            likes,
-                            text: body_txt,
-                        });
-                    }
-                } else if let Some(key) = thread["commentViewModel"]["commentViewModel"]
-                    ["commentKey"]
-                    .as_str()
-                {
-                    if let Some(payload) = entity_map.get(key) {
-                        let author = payload["author"]["displayName"]
-                            .as_str()
-                            .unwrap_or("User")
-                            .to_owned();
-                        let avatar_url = payload["author"]["avatarThumbnailUrl"]
-                            .as_str()
-                            .map(normalize_url);
-                        let published = payload["properties"]["publishedTime"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_owned();
-                        let likes = payload["toolbar"]["likeCountNotliked"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .trim()
-                            .to_owned();
-                        let body_txt = payload["properties"]["content"]["content"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_owned();
-                        if !body_txt.is_empty() {
-                            out.push(CommentItem {
-                                author,
-                                avatar_url,
-                                published,
-                                likes,
-                                text: body_txt,
-                            });
-                        }
-                    }
+                if let Some(item) = parse_comment_entry(entry, &entity_map) {
+                    out.push(item);
                 }
             }
         }
     }
 
-    Ok((out, next_token))
+    Ok(CommentPage {
+        comments: out,
+        next_token,
+        sort_options,
+        create_params,
+    })
+}
+
+pub async fn fetch_comment_replies(
+    http: &reqwest::Client,
+    continuation: &str,
+    cfg: &WebConfig,
+    session: Option<&Session>,
+) -> anyhow::Result<(Vec<CommentItem>, Option<String>)> {
+    let page = fetch_comments(http, continuation, cfg, session).await?;
+    Ok((page.comments, page.next_token))
+}
+
+pub async fn create_comment(
+    http: &reqwest::Client,
+    text_body: &str,
+    create_params: &str,
+    cfg: &WebConfig,
+    session: &Session,
+) -> anyhow::Result<()> {
+    post_web(
+        http,
+        "comment/create_comment",
+        json!({
+            "commentText": text_body,
+            "createCommentParams": create_params,
+        }),
+        cfg,
+        Some(session),
+    )
+    .await?;
+    Ok(())
 }
 
 pub async fn set_like(
@@ -1637,12 +1850,18 @@ pub async fn set_subscribe(
     Ok(())
 }
 
+pub struct LiveChatPage {
+    pub messages: Vec<LiveChatMessage>,
+    pub next_token: Option<String>,
+    pub send_params: Option<String>,
+}
+
 pub async fn fetch_live_chat(
     http: &reqwest::Client,
     continuation: &str,
     cfg: &WebConfig,
     session: Option<&Session>,
-) -> anyhow::Result<(Vec<LiveChatMessage>, Option<String>)> {
+) -> anyhow::Result<LiveChatPage> {
     let v = post_web(
         http,
         "live_chat/get_live_chat",
@@ -1663,6 +1882,14 @@ pub async fn fetch_live_chat(
             })
         })
         .map(str::to_owned);
+    let send_params = find_nested_str(&lc["actionPanel"], "sendLiveChatMessageEndpoint")
+        .map(str::to_owned)
+        .or_else(|| {
+            lc["actionPanel"]["liveChatMessageInputRenderer"]["sendButton"]["buttonRenderer"]
+                ["serviceEndpoint"]["sendLiveChatMessageEndpoint"]["params"]
+                .as_str()
+                .map(str::to_owned)
+        });
 
     let mut msgs = Vec::new();
     if let Some(actions) = lc["actions"].as_array() {
@@ -1700,7 +1927,38 @@ pub async fn fetch_live_chat(
             });
         }
     }
-    Ok((msgs, next_tok))
+    Ok(LiveChatPage {
+        messages: msgs,
+        next_token: next_tok,
+        send_params,
+    })
+}
+
+pub async fn send_live_chat_message(
+    http: &reqwest::Client,
+    params: &str,
+    message: &str,
+    cfg: &WebConfig,
+    session: &Session,
+) -> anyhow::Result<()> {
+    let client_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    post_web(
+        http,
+        "live_chat/send_message",
+        json!({
+            "params": params,
+            "richMessage": {
+                "textSegments": [{ "text": message }]
+            },
+            "clientMessageId": format!("yt-rust-{client_id}"),
+        }),
+        cfg,
+        Some(session),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Fetch signed-in user display name / avatar from account_menu.
@@ -1789,9 +2047,19 @@ pub async fn fetch_next_watch_fallback(
         chapters: Vec::new(),
         storyboard: None,
         comments_token,
-        live_chat_token,
+        live_chat_token: live_chat_token.clone(),
         related,
-        is_live: false,
+        is_live: live_chat_token.is_some()
+            || next["contents"]["twoColumnWatchNextResults"]["results"]["results"]["contents"]
+                .as_array()
+                .is_some_and(|a| {
+                    a.iter().any(|x| {
+                        x["videoPrimaryInfoRenderer"]["viewCount"]["videoViewCountRenderer"]
+                            ["isLive"]
+                            .as_bool()
+                            .unwrap_or(false)
+                    })
+                }),
         resume_secs,
     })
 }
