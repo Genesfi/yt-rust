@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::auth::Session;
 use crate::innertube::{self, FeedPage, WebConfig};
 use crate::model::{
-    AudioTrack, ChannelInfo, CommentItem, FeedChip, LiveChatEmote, LiveChatMessage,
-    PlaylistOption, PlaylistSummary, PreferredQuality, SidebarChannel, SponsorSegment, VideoFormat,
-    VideoItem, WatchData,
+    AudioTrack, ChannelInfo, ChannelNotificationParams, CommentItem, FeedChip, LiveChatEmote,
+    LiveChatMessage, NotificationLevel, NotificationMenuItem, PlaylistOption, PlaylistSummary,
+    PreferredQuality, SidebarChannel, SponsorSegment, VideoFormat, VideoItem, WatchData,
 };
 use crate::proxy::StreamProxy;
 use crate::{login, mpv, sponsorblock, ytdlp};
@@ -20,6 +20,12 @@ pub enum Request {
     LoadHome {
         params: Option<String>,
         continuation: Option<String>,
+        append: bool,
+    },
+    LoadCommunityMeta {
+        video_id: String,
+        dearrow: bool,
+        ryd: bool,
     },
     LoadSubscriptions {
         continuation: Option<String>,
@@ -148,6 +154,15 @@ pub enum Request {
     SetSubscribe {
         channel_id: String,
         subscribe: bool,
+    },
+    LoadNotifications,
+    MarkNotificationsSeen {
+        params: String,
+    },
+    SetChannelNotifications {
+        channel_id: String,
+        level: NotificationLevel,
+        params: String,
     },
     DownloadVideo {
         video_id: String,
@@ -318,6 +333,16 @@ pub enum Response {
         channel_id: String,
         subscribed: bool,
     },
+    NotificationsCountLoaded(u32),
+    NotificationsLoaded {
+        items: Vec<NotificationMenuItem>,
+        unseen_count: u32,
+        seen_params: Option<String>,
+    },
+    ChannelNotificationLevelUpdated {
+        channel_id: String,
+        level: NotificationLevel,
+    },
     DownloadProgress {
         video_id: String,
         audio_only: bool,
@@ -332,6 +357,15 @@ pub enum Response {
     SponsorSegments {
         video_id: String,
         segments: Vec<SponsorSegment>,
+    },
+    DeArrowLoaded {
+        video_id: String,
+        title: Option<String>,
+        thumbnail_url: Option<String>,
+    },
+    DislikesLoaded {
+        video_id: String,
+        dislikes_text: String,
     },
     SignedIn {
         name: Option<String>,
@@ -582,6 +616,20 @@ impl Backend {
                             resp_tx.clone(),
                             wake.clone(),
                         ));
+                        let http_n = http.clone();
+                        let cfg_n = cfg.clone();
+                        let s_n = s.clone();
+                        let tx_n = resp_tx.clone();
+                        let wake_n = wake.clone();
+                        tokio::spawn(async move {
+                            if let Ok(unseen) =
+                                innertube::fetch_unseen_notification_count(&http_n, &cfg_n, &s_n)
+                                    .await
+                            {
+                                let _ = tx_n.send(Response::NotificationsCountLoaded(unseen));
+                                wake_n();
+                            }
+                        });
                     }
 
                     while let Ok(req) = req_rx.recv() {
@@ -592,8 +640,11 @@ impl Backend {
                         let thumb_cache = thumb_cache.clone();
 
                         match req {
-                            Request::LoadHome { params, continuation } => {
-                                let append = continuation.is_some();
+                            Request::LoadHome {
+                                params,
+                                continuation,
+                                append,
+                            } => {
                                 match innertube::home_feed(
                                     &http,
                                     params.as_deref(),
@@ -628,6 +679,48 @@ impl Backend {
                                     }
                                 }
                                 wake();
+                            }
+                            Request::LoadCommunityMeta {
+                                video_id,
+                                dearrow,
+                                ryd,
+                            } => {
+                                if dearrow {
+                                    let da_http = http.clone();
+                                    let da_id = video_id.clone();
+                                    let da_tx = resp_tx.clone();
+                                    let da_wake = wake.clone();
+                                    tokio::spawn(async move {
+                                        if let Some(b) =
+                                            sponsorblock::fetch_dearrow(&da_http, &da_id).await
+                                        {
+                                            let _ = da_tx.send(Response::DeArrowLoaded {
+                                                video_id: da_id,
+                                                title: b.title,
+                                                thumbnail_url: b.thumbnail_url,
+                                            });
+                                            da_wake();
+                                        }
+                                    });
+                                }
+                                if ryd {
+                                    let ryd_http = http.clone();
+                                    let ryd_id = video_id.clone();
+                                    let ryd_tx = resp_tx.clone();
+                                    let ryd_wake = wake.clone();
+                                    tokio::spawn(async move {
+                                        if let Some(dislikes_text) =
+                                            sponsorblock::fetch_dislikes_count(&ryd_http, &ryd_id)
+                                                .await
+                                        {
+                                            let _ = ryd_tx.send(Response::DislikesLoaded {
+                                                video_id: ryd_id,
+                                                dislikes_text,
+                                            });
+                                            ryd_wake();
+                                        }
+                                    });
+                                }
                             }
                             Request::LoadSubscriptions { continuation } => {
                                 let Some(ref s) = session else {
@@ -1571,6 +1664,91 @@ impl Backend {
                                     wake();
                                 });
                             }
+                            Request::LoadNotifications => {
+                                let Some(s) = session.clone() else {
+                                    let _ = resp_tx.send(Response::Error(
+                                        "Sign in to view notifications".into(),
+                                    ));
+                                    wake();
+                                    continue;
+                                };
+                                let cfg_clone = cfg.clone();
+                                tokio::spawn(async move {
+                                    match innertube::fetch_notifications_menu(&http, &cfg_clone, &s)
+                                        .await
+                                    {
+                                        Ok((items, unseen_count, seen_params)) => {
+                                            let _ = resp_tx.send(Response::NotificationsLoaded {
+                                                items,
+                                                unseen_count,
+                                                seen_params,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = resp_tx.send(Response::Error(format!(
+                                                "Notifications load failed: {e:#}"
+                                            )));
+                                        }
+                                    }
+                                    wake();
+                                });
+                            }
+                            Request::MarkNotificationsSeen { params } => {
+                                let Some(s) = session.clone() else {
+                                    continue;
+                                };
+                                let cfg_clone = cfg.clone();
+                                tokio::spawn(async move {
+                                    let _ = innertube::mark_notifications_seen(
+                                        &http,
+                                        &params,
+                                        &cfg_clone,
+                                        &s,
+                                    )
+                                    .await;
+                                    let _ = resp_tx.send(Response::NotificationsCountLoaded(0));
+                                    wake();
+                                });
+                            }
+                            Request::SetChannelNotifications {
+                                channel_id,
+                                level,
+                                params,
+                            } => {
+                                let Some(s) = session.clone() else {
+                                    let _ = resp_tx.send(Response::Error(
+                                        "Sign in to change notification settings".into(),
+                                    ));
+                                    wake();
+                                    continue;
+                                };
+                                let cfg_clone = cfg.clone();
+                                tokio::spawn(async move {
+                                    match innertube::modify_channel_notification_preference(
+                                        &http,
+                                        &params,
+                                        &cfg_clone,
+                                        &s,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            let _ = resp_tx.send(
+                                                Response::ChannelNotificationLevelUpdated {
+                                                    channel_id,
+                                                    level,
+                                                },
+                                            );
+                                        }
+                                        Err(e) => {
+                                            let _ = resp_tx.send(Response::Error(format!(
+                                                "Notification update failed: {e:#}"
+                                            )));
+                                        }
+                                    }
+                                    wake();
+                                });
+                            }
                             Request::Search { query, continuation } => {
                                 let append = continuation.is_some();
                                 match innertube::search(
@@ -2235,9 +2413,11 @@ async fn resolve_watch(
                 views_text: String::new(),
                 published_text: String::new(),
                 likes_text: String::new(),
+                dislikes_text: None,
                 is_liked: false,
                 is_disliked: false,
                 is_subscribed: false,
+                notifications: ChannelNotificationParams::default(),
                 description: String::new(),
                 duration_secs: 0.0,
                 video_formats: Vec::new(),

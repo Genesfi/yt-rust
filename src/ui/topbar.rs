@@ -9,7 +9,7 @@ use crate::backend::Request;
 use crate::innertube;
 use crate::theme::{self, icon};
 
-use super::cards::{draw_avatar, icon_circle_button};
+use super::cards::{draw_avatar, draw_thumbnail, icon_circle_button};
 use super::{Page, YtApp};
 
 impl YtApp {
@@ -112,7 +112,7 @@ impl YtApp {
 
                     // Centered pill Search bar
                     let total_avail = ui.available_width();
-                    let right_reserve = 175.0;
+                    let right_reserve = if self.signed_in { 252.0 } else { 212.0 };
                     let search_w = (total_avail - right_reserve).clamp(180.0, 560.0);
                     let left_pad = ((total_avail - right_reserve - search_w) * 0.5).max(8.0);
                     ui.add_space(left_pad);
@@ -327,7 +327,8 @@ impl YtApp {
                         }
                     }
 
-                    // Right side: Account Sign-in / Avatar pill
+                    // Right side: Account Sign-in / Avatar pill + Notifications Bell
+                    let mut bell_anchor: Option<(Rect, bool)> = None;
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if self.signed_in {
                             let label = self
@@ -358,6 +359,78 @@ impl YtApp {
                                     },
                                 );
                             });
+
+                            ui.add_space(4.0);
+                            let (brect, bresp) =
+                                ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
+                            let b_hov = ui.ctx().animate_bool_with_time(
+                                egui::Id::unique("topbar_notif_bell_hover"),
+                                bresp.hovered() || self.notifications_open,
+                                0.14,
+                            );
+                            if b_hov > 0.01 {
+                                ui.painter().circle_filled(
+                                    brect.center(),
+                                    17.0,
+                                    theme::CHIP.gamma_multiply(b_hov),
+                                );
+                            }
+                            if bresp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            theme::draw_bell(
+                                ui.painter(),
+                                brect.center(),
+                                18.0,
+                                if self.notifications_open {
+                                    Color32::WHITE
+                                } else {
+                                    theme::TEXT
+                                },
+                            );
+                            if self.unread_notifications > 0 {
+                                let badge_txt = if self.unread_notifications > 9 {
+                                    "9+".to_owned()
+                                } else {
+                                    self.unread_notifications.to_string()
+                                };
+                                let badge_rect = Rect::from_min_size(
+                                    pos2(brect.right() - 16.0, brect.top() + 3.0),
+                                    Vec2::new(if self.unread_notifications > 9 { 18.0 } else { 15.0 }, 13.0),
+                                );
+                                ui.painter().rect_filled(badge_rect, 6.5, theme::YT_RED);
+                                ui.painter().text(
+                                    badge_rect.center(),
+                                    Align2::CENTER_CENTER,
+                                    badge_txt,
+                                    theme::bold(8.5),
+                                    Color32::WHITE,
+                                );
+                            }
+                            let mut toggled = false;
+                            if bresp.on_hover_text("Notifications").clicked() {
+                                self.notifications_open = !self.notifications_open;
+                                toggled = true;
+                                if self.notifications_open {
+                                    let stale = self
+                                        .notifications_loaded_at
+                                        .is_none_or(|t| t.elapsed() > Duration::from_secs(60));
+                                    if (self.notifications.is_empty() || stale)
+                                        && !self.notifications_loading
+                                    {
+                                        self.notifications_loading = true;
+                                        let _ = self.backend.tx.send(Request::LoadNotifications);
+                                    } else if self.unread_notifications > 0 {
+                                        if let Some(p) = self.notifications_seen_params.clone() {
+                                            let _ = self
+                                                .backend
+                                                .tx
+                                                .send(Request::MarkNotificationsSeen { params: p });
+                                        }
+                                    }
+                                }
+                            }
+                            bell_anchor = Some((brect, toggled));
                         } else {
                             let btn_text = if self.signing_in {
                                 "Signing in...".to_owned()
@@ -376,9 +449,292 @@ impl YtApp {
                                 self.start_sign_in();
                             }
                         }
+
+                        // Always-on-Top pin toggle (handy for mini-player / compact windows)
+                        ui.add_space(4.0);
+                        let (pin_rect, pin_resp) =
+                            ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
+                        let pin_hov = ui.ctx().animate_bool_with_time(
+                            egui::Id::unique("topbar_pin_hover"),
+                            pin_resp.hovered() || self.always_on_top,
+                            0.14,
+                        );
+                        if pin_hov > 0.01 {
+                            ui.painter().circle_filled(
+                                pin_rect.center(),
+                                16.0,
+                                if self.always_on_top {
+                                    theme::YT_RED.gamma_multiply(0.22 * pin_hov)
+                                } else {
+                                    theme::CHIP.gamma_multiply(pin_hov)
+                                },
+                            );
+                        }
+                        if pin_resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        theme::draw_pin_icon(
+                            ui.painter(),
+                            pin_rect.center(),
+                            15.5,
+                            if self.always_on_top {
+                                theme::YT_RED
+                            } else {
+                                theme::TEXT_DIM
+                            },
+                        );
+                        let pin_tip = if self.always_on_top {
+                            "Keep on Top: On (click to unpin)"
+                        } else {
+                            "Keep on Top"
+                        };
+                        if pin_resp.on_hover_text(pin_tip).clicked() {
+                            let next = !self.always_on_top;
+                            self.set_always_on_top(ui.ctx(), next);
+                        }
                     });
+                    if self.notifications_open {
+                        if let Some((brect, toggled)) = bell_anchor {
+                            self.draw_notifications_popup(ui.ctx(), brect, toggled);
+                        }
+                    }
                 });
             });
+    }
+
+    fn draw_notifications_popup(
+        &mut self,
+        ctx: &egui::Context,
+        bell_rect: Rect,
+        just_toggled: bool,
+    ) {
+        let screen = ctx.content_rect();
+        let popup_w = 390.0_f32.min((screen.width() - 24.0).max(260.0));
+        let anchor = pos2(
+            (bell_rect.right()).clamp(screen.left() + popup_w + 12.0, screen.right() - 12.0),
+            bell_rect.bottom() + 8.0,
+        );
+        let mut open_video: Option<String> = None;
+        let mut open_channel: Option<String> = None;
+        let mut clicked_idx: Option<usize> = None;
+
+        let area_resp = egui::Area::new(egui::Id::unique("topbar_notifications_popup"))
+            .pivot(Align2::RIGHT_TOP)
+            .fixed_pos(anchor)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                Frame::new()
+                    .fill(theme::SURFACE)
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(12)
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 10],
+                        blur: 28,
+                        spread: 2,
+                        color: Color32::from_black_alpha(190),
+                    })
+                    .inner_margin(Margin::symmetric(0, 10))
+                    .show(ui, |ui| {
+                        ui.set_width(popup_w);
+                        ui.horizontal(|ui| {
+                            ui.add_space(16.0);
+                            ui.label(
+                                RichText::new("Notifications")
+                                    .font(theme::semibold(15.0))
+                                    .color(theme::TEXT),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.add_space(10.0);
+                                if icon_circle_button(ui, icon::X, 14.0, "Close") {
+                                    self.notifications_open = false;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !self.notifications_loading,
+                                        egui::Button::new(
+                                            RichText::new(if self.notifications_loading {
+                                                "Loading..."
+                                            } else {
+                                                "Refresh"
+                                            })
+                                            .font(theme::medium(12.0))
+                                            .color(theme::YT_BLUE),
+                                        )
+                                        .fill(Color32::TRANSPARENT)
+                                        .corner_radius(14),
+                                    )
+                                    .clicked()
+                                {
+                                    self.notifications_loading = true;
+                                    let _ = self.backend.tx.send(Request::LoadNotifications);
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                        ui.painter().line_segment(
+                            [
+                                pos2(ui.min_rect().left(), ui.cursor().top()),
+                                pos2(ui.min_rect().left() + popup_w, ui.cursor().top()),
+                            ],
+                            Stroke::new(1.0, theme::BORDER),
+                        );
+                        ui.add_space(4.0);
+
+                        if self.notifications_loading && self.notifications.is_empty() {
+                            ui.add_space(28.0);
+                            ui.vertical_centered(|ui| {
+                                ui.spinner();
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new("Loading notifications...")
+                                        .font(theme::regular(13.0))
+                                        .color(theme::TEXT_DIM),
+                                );
+                            });
+                            ui.add_space(28.0);
+                        } else if self.notifications.is_empty() {
+                            ui.add_space(28.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    RichText::new("Your notifications live here")
+                                        .font(theme::medium(14.0))
+                                        .color(theme::TEXT),
+                                );
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(
+                                        "Subscribe to channels to get notified of new uploads.",
+                                    )
+                                    .font(theme::regular(12.5))
+                                    .color(theme::TEXT_DIM),
+                                );
+                            });
+                            ui.add_space(28.0);
+                        } else {
+                            let max_h = (screen.height() - 120.0).clamp(220.0, 460.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("notifications_menu_scroll")
+                                .max_height(max_h)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    for (idx, item) in self.notifications.iter().enumerate() {
+                                        let row_w = popup_w - 8.0;
+                                        let (row_rect, row_resp) = ui.allocate_exact_size(
+                                            Vec2::new(row_w, 66.0),
+                                            Sense::click(),
+                                        );
+                                        if row_resp.hovered() {
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                            ui.painter().rect_filled(
+                                                row_rect,
+                                                8.0,
+                                                theme::CHIP,
+                                            );
+                                        }
+                                        let mut r_ui = ui.new_child(
+                                            egui::UiBuilder::new()
+                                                .max_rect(row_rect.shrink2(Vec2::new(10.0, 8.0))),
+                                        );
+                                        r_ui.horizontal(|ui| {
+                                            let dot_x = ui.cursor().left() + 4.0;
+                                            let dot_y = row_rect.center().y;
+                                            if !item.read {
+                                                ui.painter().circle_filled(
+                                                    pos2(dot_x, dot_y),
+                                                    3.0,
+                                                    theme::YT_BLUE,
+                                                );
+                                            }
+                                            ui.add_space(10.0);
+                                            draw_avatar(
+                                                ui,
+                                                item.channel_avatar_url.as_deref(),
+                                                "N",
+                                                36.0,
+                                            );
+                                            ui.add_space(6.0);
+                                            let thumb_reserve =
+                                                if item.video_thumbnail_url.is_some() {
+                                                    86.0
+                                                } else {
+                                                    4.0
+                                                };
+                                            let text_w =
+                                                (ui.available_width() - thumb_reserve).max(110.0);
+                                            ui.vertical(|ui| {
+                                                ui.set_width(text_w);
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(&item.message)
+                                                            .font(theme::regular(13.0))
+                                                            .color(theme::TEXT),
+                                                    )
+                                                    .wrap(),
+                                                );
+                                                if !item.sent_time_text.is_empty() {
+                                                    ui.label(
+                                                        RichText::new(&item.sent_time_text)
+                                                            .font(theme::regular(11.5))
+                                                            .color(theme::TEXT_DIM),
+                                                    );
+                                                }
+                                            });
+                                            if let Some(thumb) =
+                                                item.video_thumbnail_url.as_deref()
+                                            {
+                                                ui.with_layout(
+                                                    Layout::right_to_left(Align::Center),
+                                                    |ui| {
+                                                        draw_thumbnail(
+                                                            ui,
+                                                            thumb,
+                                                            "",
+                                                            Vec2::new(76.0, 44.0),
+                                                            6.0,
+                                                            None,
+                                                        );
+                                                    },
+                                                );
+                                            }
+                                        });
+                                        if row_resp.clicked() {
+                                            clicked_idx = Some(idx);
+                                            if let Some(vid) = &item.video_id {
+                                                open_video = Some(vid.clone());
+                                            } else if let Some(cid) = &item.channel_id {
+                                                open_channel = Some(cid.clone());
+                                            }
+                                        }
+                                    }
+                                });
+                        }
+                    });
+            });
+
+        if let Some(idx) = clicked_idx {
+            if let Some(n) = self.notifications.get_mut(idx) {
+                n.read = true;
+            }
+            self.unread_notifications = self.unread_notifications.saturating_sub(1);
+            self.notifications_open = false;
+        }
+        if let Some(vid) = open_video {
+            self.open_video_id(&vid);
+            return;
+        }
+        if let Some(cid) = open_channel {
+            self.open_channel(cid, "Channel".to_owned());
+            return;
+        }
+
+        let clicked_outside = !just_toggled
+            && ctx.input(|i| i.pointer.any_released())
+            && ctx.input(|i| i.pointer.interact_pos()).is_none_or(|p| {
+                !area_resp.response.rect.contains(p) && !bell_rect.contains(p)
+            });
+        if clicked_outside {
+            self.notifications_open = false;
+        }
     }
 
     pub(super) fn draw_toast_snackbar(&mut self, ctx: &egui::Context) {
@@ -403,36 +759,86 @@ impl YtApp {
         }
 
         let eased = theme::ease_out_cubic(anim_t);
-        let slide_y = (1.0 - eased) * 14.0;
-        let alpha = (eased * 245.0).round() as u8;
+        let slide_y = (1.0 - eased) * 12.0;
+        let alpha = (eased * 246.0).round() as u8;
         let screen = ctx.content_rect();
-        let pos = pos2(screen.left() + 24.0, screen.bottom() - 56.0 + slide_y);
+        let left_x = if self.fullscreen {
+            24.0
+        } else if self.sidebar_expanded {
+            224.0
+        } else {
+            84.0
+        };
+        let pos = pos2(
+            (screen.left() + left_x).min(screen.right() - 200.0),
+            screen.bottom() - 22.0 + slide_y,
+        );
+        let max_text_w = (screen.right() - pos.x - 88.0).clamp(180.0, 440.0);
+
+        let lower = msg.to_ascii_lowercase();
+        let (badge_icon, accent) = if lower.contains("failed") || lower.contains("error") {
+            (icon::X, theme::YT_RED)
+        } else if lower.starts_with("queued")
+            || lower.starts_with("added")
+            || lower.starts_with("playing next")
+        {
+            (icon::LIST_MUSIC, theme::YT_BLUE)
+        } else {
+            (icon::CHECK, Color32::from_rgb(76, 195, 138))
+        };
 
         egui::Area::new(egui::Id::unique("youtube_toast_snackbar"))
+            .pivot(Align2::LEFT_BOTTOM)
             .fixed_pos(pos)
             .interactable(false)
             .order(egui::Order::Tooltip)
             .show(ctx, |ui| {
                 Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(33, 33, 36, alpha))
+                    .fill(Color32::from_rgba_unmultiplied(30, 31, 36, alpha))
                     .stroke(Stroke::new(
                         1.0,
-                        Color32::from_rgba_unmultiplied(72, 72, 78, alpha),
+                        Color32::from_rgba_unmultiplied(78, 80, 90, alpha),
                     ))
                     .corner_radius(10)
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 6],
                         blur: 18,
                         spread: 1,
-                        color: Color32::from_black_alpha((eased * 150.0) as u8),
+                        color: Color32::from_black_alpha((eased * 165.0) as u8),
                     })
-                    .inner_margin(Margin::symmetric(16, 10))
+                    .inner_margin(Margin::symmetric(14, 9))
                     .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(msg)
-                                .font(theme::medium(13.0))
-                                .color(Color32::from_rgba_unmultiplied(241, 241, 241, alpha)),
-                        );
+                        let font = theme::medium(13.0);
+                        let text_col = Color32::from_rgba_unmultiplied(244, 244, 246, alpha);
+                        let measured_w = ui
+                            .painter()
+                            .layout_no_wrap(msg.clone(), font.clone(), text_col)
+                            .size()
+                            .x
+                            .ceil()
+                            .clamp(60.0, max_text_w);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            let (dot_r, _) =
+                                ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                            ui.painter().circle_filled(
+                                dot_r.center(),
+                                10.0,
+                                accent.gamma_multiply(eased * 0.20),
+                            );
+                            theme::draw_icon_centered(
+                                ui.painter(),
+                                dot_r.center(),
+                                badge_icon,
+                                12.0,
+                                accent.gamma_multiply(eased),
+                            );
+                            ui.add_sized(
+                                Vec2::new(measured_w, 20.0),
+                                egui::Label::new(RichText::new(msg).font(font).color(text_col))
+                                    .truncate(),
+                            );
+                        });
                     });
             });
     }

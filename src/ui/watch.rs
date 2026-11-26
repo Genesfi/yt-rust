@@ -252,6 +252,21 @@ impl YtApp {
             12.0
         };
         let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+        if !is_fullscreen && self.ambient_glow && self.watch.is_some() {
+            // Soft feathered multi-ring cinema bloom behind the active video surface
+            for step in (1..=6).rev() {
+                let frac = step as f32 / 6.0;
+                let expand = step as f32 * 6.5;
+                let glow_rect = rect.expand2(vec2(expand * 1.15, expand));
+                let a = ((1.0 - frac * 0.72) * 14.0).round() as u8;
+                let tint = if step % 2 == 0 {
+                    Color32::from_rgba_unmultiplied(88, 128, 220, a)
+                } else {
+                    Color32::from_rgba_unmultiplied(185, 78, 110, a)
+                };
+                ui.painter().rect_filled(glow_rect, radius + expand * 0.45, tint);
+            }
+        }
         ui.painter().rect_filled(rect, radius, Color32::BLACK);
 
         if let Some(mpv) = &self.mpv {
@@ -1268,7 +1283,19 @@ impl YtApp {
                                 ui.add_space(4.0);
                                 if popover_option_row(
                                     ui,
-                                    "Stats for Nerds (Ctrl+I)",
+                                    "Ambient cinema glow",
+                                    self.ambient_glow,
+                                ) {
+                                    self.ambient_glow = !self.ambient_glow;
+                                    interacted = true;
+                                }
+                                let stats_label = format!(
+                                    "Stats for Nerds ({})",
+                                    self.shortcuts.stats_for_nerds.display()
+                                );
+                                if popover_option_row(
+                                    ui,
+                                    &stats_label,
                                     self.show_stats_for_nerds,
                                 ) {
                                     self.show_stats_for_nerds = !self.show_stats_for_nerds;
@@ -1331,20 +1358,62 @@ impl YtApp {
                                         interacted = true;
                                     }
                                 }
+                                ui.add_space(6.0);
+                                ui.separator();
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(format!("Caption size ({}px)", self.sub_font_size))
+                                        .font(theme::medium(11.5))
+                                        .color(theme::TEXT_DIM),
+                                );
+                                let mut style_changed = false;
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut self.sub_font_size, 24..=80)
+                                            .show_value(false),
+                                    )
+                                    .changed()
+                                {
+                                    style_changed = true;
+                                    interacted = true;
+                                }
+                                let mut pct = (self.sub_bg_opacity * 100.0).round() as u32;
+                                ui.label(
+                                    RichText::new(format!("Background opacity ({pct}%)"))
+                                        .font(theme::medium(11.5))
+                                        .color(theme::TEXT_DIM),
+                                );
+                                if ui
+                                    .add(egui::Slider::new(&mut pct, 0..=100).show_value(false))
+                                    .changed()
+                                {
+                                    self.sub_bg_opacity = pct as f32 / 100.0;
+                                    style_changed = true;
+                                    interacted = true;
+                                }
+                                if style_changed {
+                                    if let Some(mpv) = &self.mpv {
+                                        mpv.set_subtitle_style(
+                                            self.sub_font_size,
+                                            self.sub_bg_opacity,
+                                        );
+                                    }
+                                }
                             }
                             PlayerMenu::None => {}
                         }
                     });
             });
 
-        // Close popover cleanly when clicking anywhere outside it
+        // Close popover cleanly when clicking anywhere outside it (on release so trigger button toggles cleanly)
         let clicked_outside = !just_toggled
-            && ctx.input(|i| i.pointer.any_pressed())
+            && ctx.input(|i| i.pointer.any_released())
             && ctx
                 .input(|i| i.pointer.interact_pos())
                 .is_none_or(|p| !area_resp.response.rect.contains(p));
         if clicked_outside {
             self.player_menu = PlayerMenu::None;
+            interacted = true;
         }
 
         interacted || area_resp.response.hovered() || area_resp.response.clicked()
@@ -2200,59 +2269,13 @@ impl YtApp {
 
             if let Some(cid) = w.channel_id.clone() {
                 ui.add_space(8.0);
-                let (sub_w, sub_fill, sub_text_col) = if w.is_subscribed {
-                    (114.0, theme::CHIP, theme::TEXT)
-                } else {
-                    (
-                        94.0,
-                        Color32::from_rgb(241, 241, 241),
-                        Color32::from_rgb(15, 15, 15),
-                    )
-                };
-                let (srect, sresp) =
-                    ui.allocate_exact_size(Vec2::new(sub_w, 34.0), Sense::click());
-                if sresp.hovered() {
-                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                }
-                let fill = if sresp.hovered() {
-                    if w.is_subscribed {
-                        theme::CHIP_HOVER
-                    } else {
-                        Color32::from_rgb(217, 217, 217)
-                    }
-                } else {
-                    sub_fill
-                };
-                ui.painter().rect_filled(srect, 17.0, fill);
-                if w.is_subscribed {
-                    theme::draw_bell(
-                        ui.painter(),
-                        pos2(srect.left() + 18.0, srect.center().y),
-                        14.0,
-                        sub_text_col,
-                    );
-                    ui.painter().text(
-                        pos2(srect.left() + 32.0, srect.center().y),
-                        Align2::LEFT_CENTER,
-                        "Subscribed",
-                        theme::semibold(13.0),
-                        sub_text_col,
-                    );
-                } else {
-                    ui.painter().text(
-                        srect.center(),
-                        Align2::CENTER_CENTER,
-                        "Subscribe",
-                        theme::semibold(13.0),
-                        sub_text_col,
-                    );
-                }
-                if sresp.clicked() {
-                    let _ = self.backend.tx.send(Request::SetSubscribe {
-                        channel_id: cid,
-                        subscribe: !w.is_subscribed,
-                    });
-                }
+                super::cards::draw_subscribe_bell_button(
+                    ui,
+                    cid,
+                    w.is_subscribed,
+                    &w.notifications,
+                    &self.backend.tx,
+                );
             }
         });
     }
@@ -2394,7 +2417,15 @@ impl YtApp {
                     theme::TEXT,
                 );
                 let like_w = (36.0 + text_galley.size().x + 12.0).max(74.0);
-                let dislike_w = 42.0;
+                let dislike_label = w.dislikes_text.as_deref().filter(|s| !s.is_empty());
+                let dislike_galley = dislike_label.map(|t| {
+                    ui.painter()
+                        .layout_no_wrap(t.to_owned(), theme::medium(12.5), theme::TEXT)
+                });
+                let dislike_w = match &dislike_galley {
+                    Some(g) => (34.0 + g.size().x + 12.0).max(58.0),
+                    None => 42.0,
+                };
                 let total_w = like_w + dislike_w;
 
                 let (pill_rect, _) =
@@ -2486,13 +2517,30 @@ impl YtApp {
                 } else {
                     theme::TEXT
                 };
-                theme::draw_icon_centered(
-                    ui.painter(),
-                    dislike_rect.center(),
-                    icon::THUMBS_DOWN,
-                    15.0,
-                    dislike_col,
-                );
+                if let Some(d_txt) = dislike_label {
+                    theme::draw_icon_centered(
+                        ui.painter(),
+                        pos2(dislike_rect.left() + 18.0, dislike_rect.center().y),
+                        icon::THUMBS_DOWN,
+                        15.0,
+                        dislike_col,
+                    );
+                    ui.painter().text(
+                        pos2(dislike_rect.left() + 31.0, dislike_rect.center().y),
+                        Align2::LEFT_CENTER,
+                        d_txt,
+                        theme::medium(12.5),
+                        dislike_col,
+                    );
+                } else {
+                    theme::draw_icon_centered(
+                        ui.painter(),
+                        dislike_rect.center(),
+                        icon::THUMBS_DOWN,
+                        15.0,
+                        dislike_col,
+                    );
+                }
 
                 if like_resp.clicked() {
                     let _ = app.backend.tx.send(Request::SetLike {

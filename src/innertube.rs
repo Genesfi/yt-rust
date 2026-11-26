@@ -5,9 +5,10 @@ use serde_json::{Value, json};
 
 use crate::auth::Session;
 use crate::model::{
-    AudioTrack, CaptionTrack, Chapter, ChannelInfo, ChannelTab, CommentItem, FeedChip,
-    LiveChatEmote, LiveChatKind, LiveChatMessage, LiveChatRun, PlaylistOption, PlaylistSummary,
-    SidebarChannel, StoryboardSpec, VideoFormat, VideoItem, WatchData,
+    AudioTrack, CaptionTrack, ChannelInfo, ChannelNotificationParams, ChannelTab, Chapter,
+    CommentItem, FeedChip, LiveChatEmote, LiveChatKind, LiveChatMessage, LiveChatRun,
+    NotificationLevel, NotificationMenuItem, PlaylistOption, PlaylistSummary, SidebarChannel,
+    StoryboardSpec, VideoFormat, VideoItem, WatchData,
 };
 
 const ORIGIN: &str = "https://www.youtube.com";
@@ -1370,6 +1371,7 @@ pub async fn channel_videos(
     }
     let subscribers_text = sub_parts.join(" · ");
     let is_subscribed = find_is_subscribed(&v["header"]);
+    let notifications = parse_channel_notification_params(&v["header"]);
     let tabs = parse_channel_tabs(&v);
 
     let mut items = Vec::new();
@@ -1390,6 +1392,7 @@ pub async fn channel_videos(
             banner_url,
             subscribers_text,
             is_subscribed,
+            notifications,
             tabs,
         },
         FeedPage {
@@ -2083,6 +2086,311 @@ pub async fn set_subscribe(
     Ok(())
 }
 
+pub fn parse_notifications_menu(v: &Value) -> (Vec<NotificationMenuItem>, u32, Option<String>) {
+    let mut items = Vec::new();
+    let mut unseen_hint: Option<u32> = None;
+    let mut seen_params: Option<String> = None;
+
+    fn extract_seen_params(val: &Value, out: &mut Option<String>) {
+        if out.is_some() {
+            return;
+        }
+        match val {
+            Value::Object(map) => {
+                if let Some(req) = map
+                    .get("recordNotificationInteractionsEndpoint")
+                    .and_then(|e| e.get("serializedInteractionsRequest"))
+                    .and_then(|s| s.as_str())
+                {
+                    *out = Some(req.to_owned());
+                    return;
+                }
+                for child in map.values() {
+                    extract_seen_params(child, out);
+                }
+            }
+            Value::Array(arr) => {
+                for child in arr {
+                    extract_seen_params(child, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_notifications(
+        val: &Value,
+        items: &mut Vec<NotificationMenuItem>,
+        unseen_hint: &mut Option<u32>,
+    ) {
+        match val {
+            Value::Object(map) => {
+                if let Some(cnt) = map
+                    .get("updateNotificationsUnseenCountAction")
+                    .and_then(|a| a.get("unseenCount"))
+                    .and_then(|c| c.as_u64())
+                {
+                    *unseen_hint = Some(cnt as u32);
+                }
+                if let Some(nr) = map.get("notificationRenderer").and_then(|x| x.as_object()) {
+                    let message = nr
+                        .get("shortMessage")
+                        .and_then(text)
+                        .unwrap_or_default();
+                    let sent_time_text = nr
+                        .get("sentTimeText")
+                        .and_then(text)
+                        .unwrap_or_default();
+                    let channel_avatar_url = nr
+                        .get("thumbnail")
+                        .and_then(|t| t["thumbnails"].as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|t| t["url"].as_str())
+                        .map(normalize_url);
+                    let video_thumbnail_url = nr
+                        .get("videoThumbnail")
+                        .and_then(|t| t["thumbnails"].as_array())
+                        .and_then(|a| a.last().or_else(|| a.first()))
+                        .and_then(|t| t["url"].as_str())
+                        .map(normalize_url);
+                    let nav = nr.get("navigationEndpoint").unwrap_or(&Value::Null);
+                    let video_id = nav["watchEndpoint"]["videoId"]
+                        .as_str()
+                        .map(str::to_owned);
+                    let channel_id = nav["browseEndpoint"]["browseId"]
+                        .as_str()
+                        .map(str::to_owned);
+                    let read = nr.get("read").and_then(|b| b.as_bool()).unwrap_or(true);
+                    if !message.is_empty() && (video_id.is_some() || channel_id.is_some()) {
+                        items.push(NotificationMenuItem {
+                            message,
+                            sent_time_text,
+                            channel_avatar_url,
+                            video_thumbnail_url,
+                            video_id,
+                            channel_id,
+                            read,
+                        });
+                    }
+                    return;
+                }
+                for child in map.values() {
+                    walk_notifications(child, items, unseen_hint);
+                }
+            }
+            Value::Array(arr) => {
+                for child in arr {
+                    walk_notifications(child, items, unseen_hint);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    walk_notifications(v, &mut items, &mut unseen_hint);
+    extract_seen_params(v, &mut seen_params);
+    let unread_fallback = items.iter().filter(|n| !n.read).count() as u32;
+    (items, unseen_hint.unwrap_or(unread_fallback), seen_params)
+}
+
+pub async fn fetch_notifications_menu(
+    http: &reqwest::Client,
+    cfg: &WebConfig,
+    session: &Session,
+) -> anyhow::Result<(Vec<NotificationMenuItem>, u32, Option<String>)> {
+    let v = post_web(
+        http,
+        "notification/get_notification_menu",
+        json!({ "notificationsMenuRequestType": "NOTIFICATIONS_MENU_REQUEST_TYPE_INBOX" }),
+        cfg,
+        Some(session),
+    )
+    .await?;
+    Ok(parse_notifications_menu(&v))
+}
+
+pub async fn fetch_unseen_notification_count(
+    http: &reqwest::Client,
+    cfg: &WebConfig,
+    session: &Session,
+) -> anyhow::Result<u32> {
+    let v = post_web(
+        http,
+        "notification/get_unseen_count",
+        json!({}),
+        cfg,
+        Some(session),
+    )
+    .await?;
+    let (_, unseen, _) = parse_notifications_menu(&v);
+    Ok(unseen)
+}
+
+pub async fn mark_notifications_seen(
+    http: &reqwest::Client,
+    serialized_interactions_request: &str,
+    cfg: &WebConfig,
+    session: &Session,
+) -> anyhow::Result<()> {
+    post_web(
+        http,
+        "notification/record_interactions",
+        json!({ "serializedRecordNotificationInteractionsRequest": serialized_interactions_request }),
+        cfg,
+        Some(session),
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn modify_channel_notification_preference(
+    http: &reqwest::Client,
+    params: &str,
+    cfg: &WebConfig,
+    session: &Session,
+) -> anyhow::Result<()> {
+    post_web(
+        http,
+        "notification/modify_channel_notification_preference",
+        json!({ "params": params }),
+        cfg,
+        Some(session),
+    )
+    .await?;
+    Ok(())
+}
+
+pub fn parse_channel_notification_params(v: &Value) -> ChannelNotificationParams {
+    let mut out = ChannelNotificationParams::default();
+    let mut found_level: Option<NotificationLevel> = None;
+
+    fn classify_level(label: &str) -> Option<NotificationLevel> {
+        let low = label.trim().to_ascii_lowercase();
+        if low == "all" || low.starts_with("all ") || low.contains("all notifications") {
+            Some(NotificationLevel::All)
+        } else if low.starts_with("personal") {
+            Some(NotificationLevel::Personalized)
+        } else if low == "none" || low.contains("no notifications") || low.contains("turned off") {
+            Some(NotificationLevel::None)
+        } else {
+            None
+        }
+    }
+
+    fn find_modify_params(val: &Value) -> Option<String> {
+        match val {
+            Value::Object(map) => {
+                if let Some(p) = map
+                    .get("modifyChannelNotificationPreferenceEndpoint")
+                    .and_then(|e| e.get("params"))
+                    .and_then(|s| s.as_str())
+                {
+                    return Some(p.to_owned());
+                }
+                for child in map.values() {
+                    if let Some(p) = find_modify_params(child) {
+                        return Some(p);
+                    }
+                }
+                None
+            }
+            Value::Array(arr) => arr.iter().find_map(find_modify_params),
+            _ => None,
+        }
+    }
+
+    fn walk(
+        val: &Value,
+        out: &mut ChannelNotificationParams,
+        found_level: &mut Option<NotificationLevel>,
+    ) {
+        match val {
+            Value::Object(map) => {
+                if let Some(tbr) = map
+                    .get("subscriptionNotificationToggleButtonRenderer")
+                    .and_then(|x| x.as_object())
+                {
+                    if let Some(cur_id) = tbr.get("currentStateId").and_then(|n| n.as_i64()) {
+                        let mut mapped = None;
+                        if let Some(states) = tbr.get("states").and_then(|s| s.as_array()) {
+                            for st in states {
+                                if st.get("stateId").and_then(|n| n.as_i64()) == Some(cur_id) {
+                                    let icon = st["state"]["buttonRenderer"]["icon"]["iconType"]
+                                        .as_str()
+                                        .unwrap_or_default();
+                                    let tip = st["state"]["buttonRenderer"]["tooltip"]
+                                        .as_str()
+                                        .or_else(|| {
+                                            st["state"]["buttonRenderer"]["accessibility"]["label"]
+                                                .as_str()
+                                        })
+                                        .unwrap_or_default();
+                                    mapped = if icon.contains("ACTIVE") {
+                                        Some(NotificationLevel::All)
+                                    } else if icon.contains("OFF") {
+                                        Some(NotificationLevel::None)
+                                    } else if !icon.is_empty() {
+                                        Some(NotificationLevel::Personalized)
+                                    } else {
+                                        classify_level(tip)
+                                    };
+                                }
+                            }
+                        }
+                        *found_level = mapped.or(match cur_id {
+                            2 => Some(NotificationLevel::All),
+                            3 => Some(NotificationLevel::Personalized),
+                            0 | 4 => Some(NotificationLevel::None),
+                            _ => None,
+                        });
+                    }
+                }
+                if let Some(item_text) = map.get("text").and_then(text).or_else(|| {
+                    map.get("title")
+                        .and_then(|t| t.as_str().map(str::to_owned).or_else(|| text(t)))
+                }) {
+                    if let Some(lvl) = classify_level(&item_text) {
+                        if let Some(p) = find_modify_params(val) {
+                            match lvl {
+                                NotificationLevel::All => {
+                                    if out.all_params.is_none() {
+                                        out.all_params = Some(p);
+                                    }
+                                }
+                                NotificationLevel::Personalized => {
+                                    if out.personalized_params.is_none() {
+                                        out.personalized_params = Some(p);
+                                    }
+                                }
+                                NotificationLevel::None => {
+                                    if out.none_params.is_none() {
+                                        out.none_params = Some(p);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for child in map.values() {
+                    walk(child, out, found_level);
+                }
+            }
+            Value::Array(arr) => {
+                for child in arr {
+                    walk(child, out, found_level);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    walk(v, &mut out, &mut found_level);
+    if let Some(lvl) = found_level {
+        out.level = lvl;
+    }
+    out
+}
+
 pub struct LiveChatPage {
     pub messages: Vec<LiveChatMessage>,
     pub next_token: Option<String>,
@@ -2516,6 +2824,7 @@ pub async fn fetch_next_watch_fallback(
         is_liked,
         is_disliked,
         is_subscribed,
+        notifications,
         subscribers_text,
         channel_avatar_url,
         comments_token,
@@ -2534,9 +2843,11 @@ pub async fn fetch_next_watch_fallback(
         views_text,
         published_text,
         likes_text,
+        dislikes_text: None,
         is_liked,
         is_disliked,
         is_subscribed,
+        notifications,
         description: String::new(),
         duration_secs: 0.0,
         video_formats: Vec::new(),
@@ -2609,6 +2920,7 @@ pub async fn watch(
         is_liked,
         is_disliked,
         is_subscribed,
+        notifications,
         subscribers_text,
         channel_avatar_url,
         comments_token,
@@ -2627,6 +2939,7 @@ pub async fn watch(
             false,
             false,
             false,
+            ChannelNotificationParams::default(),
             String::new(),
             None,
             None,
@@ -2735,9 +3048,11 @@ pub async fn watch(
         views_text,
         published_text,
         likes_text,
+        dislikes_text: None,
         is_liked,
         is_disliked,
         is_subscribed,
+        notifications,
         description,
         duration_secs,
         video_formats: deduped,
@@ -3495,6 +3810,7 @@ fn parse_next_metadata(
     bool,
     bool,
     bool,
+    ChannelNotificationParams,
     String,
     Option<String>,
     Option<String>,
@@ -3508,6 +3824,7 @@ fn parse_next_metadata(
     let mut is_liked = false;
     let mut is_disliked = false;
     let mut is_subscribed = false;
+    let mut notifications = ChannelNotificationParams::default();
     let mut subscribers_text = String::new();
     let mut avatar_url = None;
     let mut comments_token = None;
@@ -3652,6 +3969,7 @@ fn parse_next_metadata(
                 if let Some(subbed) = s["subscribeButton"]["subscribeButtonRenderer"]["subscribed"].as_bool() {
                     is_subscribed = subbed;
                 }
+                notifications = parse_channel_notification_params(&s["subscribeButton"]);
             }
             let sec = &item["itemSectionRenderer"];
             if sec.is_object()
@@ -3699,6 +4017,7 @@ fn parse_next_metadata(
         is_liked,
         is_disliked,
         is_subscribed,
+        notifications,
         subscribers_text,
         avatar_url,
         comments_token,
@@ -3755,6 +4074,43 @@ fn pick_thumb(v: &Value, video_id: &str) -> String {
     format!("https://i.ytimg.com/vi/{video_id}/mqdefault.jpg")
 }
 
+fn extract_chip_continuation(cr: &Value) -> Option<String> {
+    fn walk_tok(v: &Value) -> Option<String> {
+        match v {
+            Value::Object(map) => {
+                if let Some(tok) = map
+                    .get("continuationCommand")
+                    .and_then(|c| c.get("token"))
+                    .and_then(|s| s.as_str())
+                {
+                    if !tok.is_empty() {
+                        return Some(tok.to_owned());
+                    }
+                }
+                if let Some(tok) = map
+                    .get("reloadContinuationData")
+                    .and_then(|c| c.get("continuation"))
+                    .and_then(|s| s.as_str())
+                {
+                    if !tok.is_empty() {
+                        return Some(tok.to_owned());
+                    }
+                }
+                for child in map.values() {
+                    if let Some(tok) = walk_tok(child) {
+                        return Some(tok);
+                    }
+                }
+                None
+            }
+            Value::Array(arr) => arr.iter().find_map(walk_tok),
+            _ => None,
+        }
+    }
+
+    walk_tok(&cr["navigationEndpoint"]).or_else(|| walk_tok(&cr["onSelectCommand"]))
+}
+
 fn collect_chips(v: &Value) -> Vec<FeedChip> {
     let mut out = Vec::new();
     fn walk(v: &Value, out: &mut Vec<FeedChip>) {
@@ -3774,9 +4130,11 @@ fn collect_chips(v: &Value) -> Vec<FeedChip> {
                             let params = cr["navigationEndpoint"]["browseEndpoint"]["params"]
                                 .as_str()
                                 .map(str::to_owned);
+                            let continuation = extract_chip_continuation(cr);
                             out.push(FeedChip {
                                 title,
                                 params,
+                                continuation,
                                 selected,
                             });
                         }
@@ -4340,7 +4698,7 @@ mod tests {
                 }
             }
         });
-        let (_, _, likes, liked, disliked, _, _, _, _, _, _) =
+        let (_, _, likes, liked, disliked, _, _, _, _, _, _, _) =
             parse_next_metadata(&next, "abc12345678");
         assert_eq!(likes, "313");
         assert!(liked);
@@ -4595,5 +4953,132 @@ mod tests {
         assert!(!item.is_liked);
         assert_eq!(item.like_action_params.as_deref(), Some("ACT_LIKE"));
         assert_eq!(item.unlike_action_params.as_deref(), Some("ACT_UNLIKE"));
+    }
+
+    #[test]
+    fn parses_notifications_menu_and_channel_bell_levels() {
+        let menu = json!({
+            "actions": [
+                { "updateNotificationsUnseenCountAction": { "unseenCount": 3 } },
+                {
+                    "openPopupAction": {
+                        "popup": {
+                            "multiPageMenuRenderer": {
+                                "sections": [{
+                                    "multiPageMenuNotificationSectionRenderer": {
+                                        "items": [{
+                                            "notificationRenderer": {
+                                                "notificationId": "N1",
+                                                "shortMessage": { "simpleText": "Rust Channel uploaded: Async Deep Dive" },
+                                                "sentTimeText": { "simpleText": "1 hour ago" },
+                                                "read": false,
+                                                "thumbnail": { "thumbnails": [{ "url": "//yt3.ggpht.com/av.jpg" }] },
+                                                "videoThumbnail": { "thumbnails": [{ "url": "https://i.ytimg.com/vi/abc/hqdefault.jpg" }] },
+                                                "navigationEndpoint": { "watchEndpoint": { "videoId": "abc123" } },
+                                                "recordNotificationInteractionsEndpoint": {
+                                                    "serializedInteractionsRequest": "SEEN_TOK"
+                                                }
+                                            }
+                                        }]
+                                    }
+                                }]
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+        let (items, unseen, seen_tok) = parse_notifications_menu(&menu);
+        assert_eq!(unseen, 3);
+        assert_eq!(seen_tok.as_deref(), Some("SEEN_TOK"));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].video_id.as_deref(), Some("abc123"));
+        assert!(!items[0].read);
+        assert_eq!(
+            items[0].channel_avatar_url.as_deref(),
+            Some("https://yt3.ggpht.com/av.jpg")
+        );
+
+        let sub_btn = json!({
+            "subscribeButtonRenderer": {
+                "subscribed": true,
+                "notificationPreferenceButton": {
+                    "subscriptionNotificationToggleButtonRenderer": {
+                        "currentStateId": 2,
+                        "states": [
+                            { "stateId": 2, "state": { "buttonRenderer": { "icon": { "iconType": "NOTIFICATIONS_ACTIVE" } } } },
+                            { "stateId": 3, "state": { "buttonRenderer": { "icon": { "iconType": "NOTIFICATIONS" } } } }
+                        ],
+                        "command": {
+                            "openPopupAction": {
+                                "popup": {
+                                    "menuPopupRenderer": {
+                                        "items": [
+                                            { "menuServiceItemRenderer": { "text": { "simpleText": "All" }, "serviceEndpoint": { "modifyChannelNotificationPreferenceEndpoint": { "params": "P_ALL" } } } },
+                                            { "menuServiceItemRenderer": { "text": { "simpleText": "Personalized" }, "serviceEndpoint": { "modifyChannelNotificationPreferenceEndpoint": { "params": "P_PERS" } } } },
+                                            { "menuServiceItemRenderer": { "text": { "simpleText": "None" }, "serviceEndpoint": { "modifyChannelNotificationPreferenceEndpoint": { "params": "P_NONE" } } } }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let prefs = parse_channel_notification_params(&sub_btn);
+        assert_eq!(prefs.level, NotificationLevel::All);
+        assert_eq!(prefs.params_for(NotificationLevel::All), Some("P_ALL"));
+        assert_eq!(
+            prefs.params_for(NotificationLevel::Personalized),
+            Some("P_PERS")
+        );
+        assert_eq!(prefs.params_for(NotificationLevel::None), Some("P_NONE"));
+    }
+
+    #[test]
+    fn parses_home_filter_chip_continuation_tokens() {
+        let home = json!({
+            "header": {
+                "feedFilterChipBarRenderer": {
+                    "contents": [
+                        {
+                            "chipCloudChipRenderer": {
+                                "text": { "simpleText": "All" },
+                                "isSelected": true,
+                                "navigationEndpoint": {
+                                    "continuationCommand": { "token": "CONT_ALL" }
+                                }
+                            }
+                        },
+                        {
+                            "chipCloudChipRenderer": {
+                                "text": { "simpleText": "Gaming" },
+                                "isSelected": false,
+                                "navigationEndpoint": {
+                                    "continuationCommand": { "token": "CONT_GAMING" }
+                                }
+                            }
+                        },
+                        {
+                            "chipCloudChipRenderer": {
+                                "text": { "simpleText": "Podcasts" },
+                                "isSelected": false,
+                                "navigationEndpoint": {
+                                    "browseEndpoint": { "params": "PAR_POD" }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let chips = collect_chips(&home);
+        assert_eq!(chips.len(), 3);
+        assert!(chips[0].selected);
+        assert_eq!(chips[0].continuation.as_deref(), Some("CONT_ALL"));
+        assert_eq!(chips[1].title, "Gaming");
+        assert_eq!(chips[1].continuation.as_deref(), Some("CONT_GAMING"));
+        assert_eq!(chips[2].params.as_deref(), Some("PAR_POD"));
     }
 }

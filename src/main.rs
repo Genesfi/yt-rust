@@ -12,6 +12,7 @@ mod proxy;
 mod sponsorblock;
 mod theme;
 mod ui;
+mod win_shell;
 mod ytdlp;
 
 use std::path::PathBuf;

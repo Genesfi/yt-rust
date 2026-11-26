@@ -486,6 +486,16 @@ impl MpvPlayer {
         }
     }
 
+    pub fn set_subtitle_style(&self, font_size: u32, bg_opacity: f32) {
+        let size = font_size.clamp(18, 96);
+        self.set_property_str("sub-font-size", &size.to_string());
+        self.set_property_str("sub-back-color", &format_mpv_sub_back_color(bg_opacity));
+        self.set_property_str(
+            "sub-border-size",
+            if bg_opacity > 0.05 { "1.5" } else { "2.8" },
+        );
+    }
+
     pub fn stop(&self) {
         self.command(&["stop"]);
     }
@@ -884,5 +894,23 @@ pub async fn download_libmpv_windows(
         anyhow::ensure!(found, "libmpv-2.dll was not found inside the downloaded archive");
         std::fs::rename(&tmp_dll, &out_dll)?;
         Ok(out_dll)
+    }
+}
+
+pub fn format_mpv_sub_back_color(opacity: f32) -> String {
+    let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("#{alpha:02X}000000")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_mpv_sub_back_color;
+
+    #[test]
+    fn formats_mpv_sub_back_color_hex() {
+        assert_eq!(format_mpv_sub_back_color(0.0), "#00000000");
+        assert_eq!(format_mpv_sub_back_color(1.0), "#FF000000");
+        assert_eq!(format_mpv_sub_back_color(0.5), "#80000000");
+        assert_eq!(format_mpv_sub_back_color(1.5), "#FF000000");
     }
 }

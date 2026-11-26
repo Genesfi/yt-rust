@@ -56,6 +56,7 @@ impl YtApp {
                                 let _ = self.backend.tx.send(Request::LoadHome {
                                     params: None,
                                     continuation: None,
+                                    append: false,
                                 });
                             }
                         }

@@ -67,10 +67,10 @@ Phases 1–4 are complete (`11/11` unit tests passing, Windows release binary + 
 - [x] **Comment Actions & Badges**: thumb-up (`comment/perform_comment_action`) on comments/replies, plus pinned comment & creator heart badges.
 
 ### Phase 6 — Desktop Experience, Notifications & Settings
-- [ ] **YouTube Notifications Menu**: topbar bell popup (`notification/get_notification_menu`) with unread count badge and per-channel notification level toggle (`All` / `Personalized` / `None`).
-- [ ] **System Tray & Window Modes**: optional minimize/close to system tray, "Keep on Top" for mini-player/compact windows, and Windows taskbar thumbnail preview buttons (`Prev` / `Play-Pause` / `Next`).
-- [ ] **Subtitle & Player Customization**: caption font size/background opacity controls, ambient cinema glow behind the video surface, and custom keyboard shortcuts in Settings.
-- [ ] **Community Integrations (Optional)**: opt-in SponsorBlock category toggles, DeArrow title/thumbnail cleanup, and Return YouTube Dislike count display.
+- [x] **YouTube Notifications Menu**: topbar bell popup (`notification/get_notification_menu`) with unread count badge and per-channel notification level toggle (`All` / `Personalized` / `None`).
+- [x] **System Tray & Window Modes**: optional minimize/close to system tray, "Keep on Top" for mini-player/compact windows, and Windows taskbar thumbnail preview buttons (`Prev` / `Play-Pause` / `Next`).
+- [x] **Subtitle & Player Customization**: caption font size/background opacity controls, ambient cinema glow behind the video surface, and custom keyboard shortcuts in Settings.
+- [x] **Community Integrations (Optional)**: opt-in SponsorBlock category toggles, DeArrow title/thumbnail cleanup, and Return YouTube Dislike count display.
 
 ### Phase 7 — Packaging, Search Filters & Cross-Platform
 - [ ] **Search Filters & History Controls**: Search type/upload-date/duration filter chips (`browse` / `search` params), "Clear Watch History" / pause watch history toggle, and Playlist visibility selector (`Private` / `Unlisted` / `Public`).

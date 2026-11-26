@@ -15,13 +15,15 @@ use egui::{Align, Color32, Frame, Key, Layout, Margin, ViewportCommand};
 use crate::backend::{Backend, Request, Response};
 use crate::innertube;
 use crate::model::{
-    ChannelInfo, CommentItem, FeedChip, HwdecMode, LastWatched, LiveChatEmote, LiveChatMessage,
-    PlaylistOption, PlaylistSummary, PreferredQuality, SidebarChannel, SponsorCategory,
-    SponsorSegment, VideoItem, WatchData,
+    ChannelInfo, ChannelNotificationParams, CommentItem, FeedChip, HwdecMode, KeyBinding,
+    LastWatched, LiveChatEmote, LiveChatMessage, NotificationMenuItem, PlaylistOption,
+    PlaylistSummary, PreferredQuality, ShortcutConfig, ShortcutSlot, SidebarChannel,
+    SponsorCategory, SponsorSegment, VideoItem, WatchData,
 };
 use crate::mpv::{GlProcAddrFn, MpvPlayer, PlaybackState};
 use crate::os_media::OsMedia;
 use crate::theme;
+use crate::win_shell::{ShellEvent, WinShell};
 use crate::ytdlp;
 
 use cards::{GridAction, draw_video_grid};
@@ -104,6 +106,7 @@ pub struct YtApp {
     pub(super) backend: Backend,
     pub(super) mpv: Option<MpvPlayer>,
     pub(super) os_media: Option<OsMedia>,
+    pub(super) win_shell: Option<WinShell>,
     pub(super) mpv_error: Option<String>,
     pub(super) get_proc_address: Option<GlProcAddrFn>,
     pub(super) downloading_mpv: bool,
@@ -121,6 +124,13 @@ pub struct YtApp {
     pub(super) signing_in: bool,
     pub(super) account_name: Option<String>,
     pub(super) account_avatar: Option<String>,
+
+    pub(super) notifications: Vec<NotificationMenuItem>,
+    pub(super) notifications_loading: bool,
+    pub(super) notifications_open: bool,
+    pub(super) unread_notifications: u32,
+    pub(super) notifications_seen_params: Option<String>,
+    pub(super) notifications_loaded_at: Option<Instant>,
 
     pub(super) search_input: String,
     pub(super) active_query: String,
@@ -248,11 +258,25 @@ pub struct YtApp {
     pub(super) hwdec_mode: HwdecMode,
     pub(super) download_dir: String,
     pub(super) sponsorblock_enabled: bool,
+    pub(super) sponsorblock_categories: HashSet<SponsorCategory>,
+    pub(super) dearrow_enabled: bool,
+    pub(super) ryd_enabled: bool,
     pub(super) sync_history: bool,
     pub(super) autoplay_next: bool,
     pub(super) auto_resume_on_start: bool,
     pub(super) theater_mode: bool,
     pub(super) fullscreen: bool,
+    pub(super) always_on_top: bool,
+    pub(super) close_to_tray: bool,
+    pub(super) minimize_to_tray: bool,
+    pub(super) hidden_to_tray: bool,
+    pub(super) was_minimized: bool,
+    pub(super) quitting_from_tray: bool,
+    pub(super) ambient_glow: bool,
+    pub(super) sub_font_size: u32,
+    pub(super) sub_bg_opacity: f32,
+    pub(super) shortcuts: ShortcutConfig,
+    pub(super) rebinding_shortcut: Option<ShortcutSlot>,
     pub(super) watch_scrolled_into_pip: bool,
     pub(super) scroll_watch_to_top: bool,
     pub(super) show_description: bool,
@@ -296,6 +320,8 @@ impl YtApp {
 
         let wake_ctx = cc.egui_ctx.clone();
         let os_media = OsMedia::new(cc, Arc::new(move || wake_ctx.request_repaint()));
+        let tray_wake_ctx = cc.egui_ctx.clone();
+        let win_shell = WinShell::new(cc, Arc::new(move || tray_wake_ctx.request_repaint()));
 
         let get_proc_address = cc.get_proc_address.clone();
         let (mpv, mpv_error) = match get_proc_address.clone() {
@@ -308,9 +334,27 @@ impl YtApp {
 
         let mut volume = 85.0f64;
         let mut sponsorblock_enabled = true;
+        let mut sponsorblock_categories: HashSet<SponsorCategory> = [
+            SponsorCategory::Sponsor,
+            SponsorCategory::SelfPromo,
+            SponsorCategory::Interaction,
+            SponsorCategory::Intro,
+            SponsorCategory::Outro,
+        ]
+        .into_iter()
+        .collect();
+        let mut dearrow_enabled = false;
+        let mut ryd_enabled = false;
         let mut sync_history = true;
         let mut autoplay_next = true;
         let mut auto_resume_on_start = false;
+        let mut always_on_top = false;
+        let mut close_to_tray = false;
+        let mut minimize_to_tray = false;
+        let mut ambient_glow = true;
+        let mut sub_font_size = 46u32;
+        let mut sub_bg_opacity = 0.70f32;
+        let mut shortcuts = ShortcutConfig::default();
         let mut preferred_quality = PreferredQuality::P1080;
         let mut hwdec_mode = HwdecMode::AutoCopy;
         let mut download_dir = String::new();
@@ -328,6 +372,17 @@ impl YtApp {
             if let Some(sb) = storage.get_string("sponsorblock") {
                 sponsorblock_enabled = sb != "0";
             }
+            if let Some(sbc) = storage.get_string("sb_categories") {
+                if let Ok(parsed) = serde_json::from_str::<HashSet<SponsorCategory>>(&sbc) {
+                    sponsorblock_categories = parsed;
+                }
+            }
+            if let Some(da) = storage.get_string("dearrow") {
+                dearrow_enabled = da == "1";
+            }
+            if let Some(ryd) = storage.get_string("ryd") {
+                ryd_enabled = ryd == "1";
+            }
             if let Some(sh) = storage.get_string("sync_history") {
                 sync_history = sh != "0";
             }
@@ -336,6 +391,29 @@ impl YtApp {
             }
             if let Some(ar) = storage.get_string("auto_resume_on_start") {
                 auto_resume_on_start = ar == "1";
+            }
+            if let Some(aot) = storage.get_string("always_on_top") {
+                always_on_top = aot == "1";
+            }
+            if let Some(ct) = storage.get_string("close_to_tray") {
+                close_to_tray = ct == "1";
+            }
+            if let Some(mt) = storage.get_string("minimize_to_tray") {
+                minimize_to_tray = mt == "1";
+            }
+            if let Some(ag) = storage.get_string("ambient_glow") {
+                ambient_glow = ag != "0";
+            }
+            if let Some(sf) = storage.get_string("sub_font_size").and_then(|s| s.parse().ok()) {
+                sub_font_size = sf;
+            }
+            if let Some(sb) = storage.get_string("sub_bg_opacity").and_then(|s| s.parse().ok()) {
+                sub_bg_opacity = sb;
+            }
+            if let Some(sc) = storage.get_string("shortcuts") {
+                if let Ok(parsed) = serde_json::from_str::<ShortcutConfig>(&sc) {
+                    shortcuts = parsed;
+                }
             }
             if let Some(se) = storage.get_string("sidebar") {
                 sidebar_expanded = se != "0";
@@ -398,12 +476,14 @@ impl YtApp {
         let _ = backend.tx.send(Request::LoadHome {
             params: None,
             continuation: None,
+            append: false,
         });
 
         let mut app = Self {
             backend,
             mpv,
             os_media,
+            win_shell,
             mpv_error,
             get_proc_address,
             downloading_mpv: false,
@@ -419,6 +499,12 @@ impl YtApp {
             signing_in: false,
             account_name: None,
             account_avatar: None,
+            notifications: Vec::new(),
+            notifications_loading: false,
+            notifications_open: false,
+            unread_notifications: 0,
+            notifications_seen_params: None,
+            notifications_loaded_at: None,
             search_input: String::new(),
             active_query: String::new(),
             search_suggestions: Vec::new(),
@@ -535,11 +621,25 @@ impl YtApp {
             hwdec_mode,
             download_dir,
             sponsorblock_enabled,
+            sponsorblock_categories,
+            dearrow_enabled,
+            ryd_enabled,
             sync_history,
             autoplay_next,
             auto_resume_on_start,
             theater_mode: false,
             fullscreen: false,
+            always_on_top,
+            close_to_tray,
+            minimize_to_tray,
+            hidden_to_tray: false,
+            was_minimized: false,
+            quitting_from_tray: false,
+            ambient_glow,
+            sub_font_size,
+            sub_bg_opacity,
+            shortcuts,
+            rebinding_shortcut: None,
             watch_scrolled_into_pip: false,
             scroll_watch_to_top: false,
             show_description: false,
@@ -567,6 +667,13 @@ impl YtApp {
         }
         if app.auto_resume_on_start && app.last_watched.is_some() {
             app.resume_last_watched();
+        }
+        if app.always_on_top {
+            cc.egui_ctx
+                .send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+        }
+        if let Some(mpv) = &app.mpv {
+            mpv.set_subtitle_style(app.sub_font_size, app.sub_bg_opacity);
         }
         app.last_nav = app.current_nav_entry();
         app
@@ -871,9 +978,11 @@ impl YtApp {
             views_text: "Local file".to_owned(),
             published_text: path_str.clone(),
             likes_text: String::new(),
+            dislikes_text: None,
             is_liked: false,
             is_disliked: false,
             is_subscribed: false,
+            notifications: ChannelNotificationParams::default(),
             description: path_str.clone(),
             duration_secs: 0.0,
             video_formats: Vec::new(),
@@ -949,6 +1058,13 @@ impl YtApp {
             quality: self.preferred_quality,
             sync_history: self.sync_history,
         });
+        if self.dearrow_enabled || self.ryd_enabled {
+            let _ = self.backend.tx.send(Request::LoadCommunityMeta {
+                video_id: video_id.to_owned(),
+                dearrow: self.dearrow_enabled,
+                ryd: self.ryd_enabled,
+            });
+        }
     }
 
     fn record_history(&mut self, item: VideoItem) {
@@ -1344,6 +1460,7 @@ impl YtApp {
                     let _ = self.backend.tx.send(Request::LoadHome {
                         params: None,
                         continuation: None,
+                        append: false,
                     });
                 }
             }
@@ -2128,6 +2245,41 @@ impl YtApp {
                         "Unsubscribed"
                     });
                 }
+                Response::NotificationsCountLoaded(count) => {
+                    self.unread_notifications = count;
+                }
+                Response::NotificationsLoaded {
+                    items,
+                    unseen_count,
+                    seen_params,
+                } => {
+                    self.notifications_loading = false;
+                    self.unread_notifications = unseen_count;
+                    self.notifications_seen_params = seen_params.clone();
+                    self.notifications_loaded_at = Some(Instant::now());
+                    self.notifications = items;
+                    if self.notifications_open && unseen_count > 0 {
+                        if let Some(p) = seen_params {
+                            let _ = self
+                                .backend
+                                .tx
+                                .send(Request::MarkNotificationsSeen { params: p });
+                        }
+                    }
+                }
+                Response::ChannelNotificationLevelUpdated { channel_id, level } => {
+                    if let Some(w) = &mut self.watch {
+                        if w.channel_id.as_deref() == Some(channel_id.as_str()) {
+                            w.notifications.level = level;
+                        }
+                    }
+                    if let Some(ci) = &mut self.channel_info {
+                        if ci.id == channel_id {
+                            ci.notifications.level = level;
+                        }
+                    }
+                    self.toast(format!("Notifications: {}", level.label()));
+                }
                 Response::DownloadProgress {
                     video_id,
                     audio_only,
@@ -2176,12 +2328,60 @@ impl YtApp {
                         self.sponsor_segments = segments;
                     }
                 }
+                Response::DeArrowLoaded {
+                    video_id,
+                    title,
+                    thumbnail_url,
+                } => {
+                    if let Some(t) = &title {
+                        if let Some(w) = &mut self.watch {
+                            if w.id == video_id {
+                                w.title = t.clone();
+                            }
+                        }
+                        for list in [
+                            &mut self.history,
+                            &mut self.saved,
+                            &mut self.queue,
+                            &mut self.home_items,
+                            &mut self.subs_items,
+                        ] {
+                            for it in list.iter_mut().filter(|x| x.id == video_id) {
+                                it.title = t.clone();
+                            }
+                        }
+                    }
+                    if let Some(thumb) = &thumbnail_url {
+                        for list in [
+                            &mut self.history,
+                            &mut self.saved,
+                            &mut self.queue,
+                            &mut self.home_items,
+                            &mut self.subs_items,
+                        ] {
+                            for it in list.iter_mut().filter(|x| x.id == video_id) {
+                                it.thumbnail_url = thumb.clone();
+                            }
+                        }
+                    }
+                }
+                Response::DislikesLoaded {
+                    video_id,
+                    dislikes_text,
+                } => {
+                    if let Some(w) = &mut self.watch {
+                        if w.id == video_id {
+                            w.dislikes_text = Some(dislikes_text);
+                        }
+                    }
+                }
                 Response::SignedIn { name, avatar } => {
                     self.signed_in = true;
                     self.signing_in = false;
                     self.account_name = name;
                     self.account_avatar = avatar;
                     self.home_is_fallback = false;
+                    let _ = self.backend.tx.send(Request::LoadNotifications);
                     self.toast("Signed in to YouTube");
                 }
                 Response::SignedOut => {
@@ -2189,6 +2389,11 @@ impl YtApp {
                     self.signing_in = false;
                     self.account_name = None;
                     self.account_avatar = None;
+                    self.notifications.clear();
+                    self.notifications_open = false;
+                    self.unread_notifications = 0;
+                    self.notifications_seen_params = None;
+                    self.notifications_loaded_at = None;
                     self.subs_items.clear();
                     self.guide_channels.clear();
                     self.guide_playlists.clear();
@@ -2201,6 +2406,7 @@ impl YtApp {
                     let _ = self.backend.tx.send(Request::LoadHome {
                         params: None,
                         continuation: None,
+                        append: false,
                     });
                     self.toast("Signed out");
                 }
@@ -2214,6 +2420,10 @@ impl YtApp {
                                     Ok(player) => {
                                         player.set_volume(self.volume);
                                         player.set_hwdec(self.hwdec_mode);
+                                        player.set_subtitle_style(
+                                            self.sub_font_size,
+                                            self.sub_bg_opacity,
+                                        );
                                         self.mpv = Some(player);
                                         self.toast(format!("libmpv ready ({})", path.display()));
                                     }
@@ -2234,6 +2444,7 @@ impl YtApp {
                     self.search_loading = false;
                     self.watch_loading = false;
                     self.comments_loading = false;
+                    self.notifications_loading = false;
                     self.signing_in = false;
                     self.last_error = Some(msg);
                 }
@@ -2269,11 +2480,46 @@ impl YtApp {
             self.nav_go_forward();
             return;
         }
+        if let Some(slot) = self.rebinding_shortcut {
+            let captured = ctx.input(|i| {
+                if i.key_pressed(Key::Escape) {
+                    return Some(None);
+                }
+                for ev in &i.events {
+                    if let egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } = ev
+                    {
+                        return Some(Some(KeyBinding {
+                            key: KeyBinding::key_name(*key).to_owned(),
+                            ctrl: modifiers.ctrl,
+                            alt: modifiers.alt,
+                            shift: modifiers.shift,
+                        }));
+                    }
+                }
+                None
+            });
+            if let Some(opt_bind) = captured {
+                self.rebinding_shortcut = None;
+                if let Some(bind) = opt_bind {
+                    let label = bind.display();
+                    self.shortcuts.set(slot, bind);
+                    self.toast(format!("{}: {label}", slot.label()));
+                }
+            }
+            return;
+        }
         let mut hud_msg: Option<(HudIcon, &'static str)> = None;
         let mut wake_controls = false;
         ctx.input(|i| {
             if i.key_pressed(Key::Escape) {
-                if self.player_menu != PlayerMenu::None {
+                if self.notifications_open {
+                    self.notifications_open = false;
+                } else if self.player_menu != PlayerMenu::None {
                     self.player_menu = PlayerMenu::None;
                 } else if self.fullscreen {
                     self.fullscreen = false;
@@ -2283,10 +2529,10 @@ impl YtApp {
             if self.page != Page::Watch {
                 return;
             }
-            if i.modifiers.ctrl && i.key_pressed(Key::I) {
+            if self.shortcuts.stats_for_nerds.matches(i) {
                 self.show_stats_for_nerds = !self.show_stats_for_nerds;
             }
-            if i.key_pressed(Key::Space) || i.key_pressed(Key::K) {
+            if self.shortcuts.play_pause.matches(i) || self.shortcuts.play_pause_alt.matches(i) {
                 if let Some(m) = &self.mpv {
                     m.toggle_pause();
                     hud_msg = Some(if self.playback.paused {
@@ -2297,35 +2543,35 @@ impl YtApp {
                     wake_controls = true;
                 }
             }
-            if i.key_pressed(Key::ArrowLeft) {
+            if self.shortcuts.seek_back.matches(i) {
                 if let Some(m) = &self.mpv {
                     m.seek_rel(-5.0);
                     hud_msg = Some((HudIcon::SeekBack, "-5s"));
                     wake_controls = true;
                 }
             }
-            if i.key_pressed(Key::ArrowRight) {
+            if self.shortcuts.seek_forward.matches(i) {
                 if let Some(m) = &self.mpv {
                     m.seek_rel(5.0);
                     hud_msg = Some((HudIcon::SeekForward, "+5s"));
                     wake_controls = true;
                 }
             }
-            if i.key_pressed(Key::J) {
+            if self.shortcuts.seek_back_big.matches(i) {
                 if let Some(m) = &self.mpv {
                     m.seek_rel(-10.0);
                     hud_msg = Some((HudIcon::SeekBack, "-10s"));
                     wake_controls = true;
                 }
             }
-            if i.key_pressed(Key::L) {
+            if self.shortcuts.seek_forward_big.matches(i) {
                 if let Some(m) = &self.mpv {
                     m.seek_rel(10.0);
                     hud_msg = Some((HudIcon::SeekForward, "+10s"));
                     wake_controls = true;
                 }
             }
-            if i.key_pressed(Key::M) {
+            if self.shortcuts.mute.matches(i) {
                 self.muted = !self.muted;
                 if let Some(m) = &self.mpv {
                     m.set_mute(self.muted);
@@ -2337,22 +2583,39 @@ impl YtApp {
                 });
                 wake_controls = true;
             }
-            if i.key_pressed(Key::T) && !self.fullscreen {
+            if self.shortcuts.theater.matches(i) && !self.fullscreen {
                 self.theater_mode = !self.theater_mode;
             }
-            if i.key_pressed(Key::F) {
+            if self.shortcuts.fullscreen.matches(i) {
                 self.fullscreen = !self.fullscreen;
                 ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
                 wake_controls = true;
             }
-            if i.key_pressed(Key::ArrowUp) {
+            if self.shortcuts.toggle_captions.matches(i) {
+                if let Some(w) = &self.watch {
+                    if !w.captions.is_empty() {
+                        let next = if self.selected_caption_idx.is_some() {
+                            None
+                        } else {
+                            Some(0)
+                        };
+                        self.selected_caption_idx = next;
+                        let url = next.and_then(|idx| w.captions.get(idx)).map(|c| c.vtt_url.as_str());
+                        if let Some(m) = &self.mpv {
+                            m.set_subtitle(url);
+                        }
+                        wake_controls = true;
+                    }
+                }
+            }
+            if self.shortcuts.volume_up.matches(i) {
                 self.volume = (self.volume + 5.0).min(100.0);
                 if let Some(m) = &self.mpv {
                     m.set_volume(self.volume);
                 }
                 wake_controls = true;
             }
-            if i.key_pressed(Key::ArrowDown) {
+            if self.shortcuts.volume_down.matches(i) {
                 self.volume = (self.volume - 5.0).max(0.0);
                 if let Some(m) = &self.mpv {
                     m.set_volume(self.volume);
@@ -2365,6 +2628,133 @@ impl YtApp {
         }
         if wake_controls {
             self.last_pointer_move = Instant::now();
+        }
+    }
+
+    pub(super) fn set_always_on_top(&mut self, ctx: &egui::Context, on: bool) {
+        self.always_on_top = on;
+        ctx.send_viewport_cmd(ViewportCommand::WindowLevel(if on {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        }));
+        self.toast(if on {
+            "Keep on Top: On"
+        } else {
+            "Keep on Top: Off"
+        });
+    }
+
+    pub(super) fn hide_to_tray(&mut self, ctx: &egui::Context) {
+        self.hidden_to_tray = true;
+        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+    }
+
+    pub(super) fn restore_from_tray(&mut self, ctx: &egui::Context) {
+        self.hidden_to_tray = false;
+        self.was_minimized = false;
+        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(ViewportCommand::Focus);
+        if let Some(ws) = &self.win_shell {
+            ws.restore_main_window();
+        }
+    }
+
+    pub(super) fn play_next_video(&mut self) {
+        if !self.queue.is_empty() {
+            let next = self.queue.remove(0);
+            self.persist_queue();
+            self.open_video(next);
+        } else if let Some(next) = self.watch.as_ref().and_then(|w| w.related.first()).cloned() {
+            self.open_video(next);
+        }
+    }
+
+    pub(super) fn play_previous_video(&mut self) {
+        if self.playback.time_pos > 5.0 || self.history.len() < 2 {
+            if let Some(m) = &self.mpv {
+                m.seek_abs(0.0);
+                self.trigger_hud(HudIcon::SeekBack, "Restart");
+            }
+        } else {
+            let prev = self.history[1].clone();
+            self.open_video(prev);
+        }
+    }
+
+    pub(super) fn toggle_play_pause(&mut self) {
+        if let Some(m) = &self.mpv {
+            m.toggle_pause();
+            self.trigger_hud(
+                if self.playback.paused {
+                    HudIcon::Play
+                } else {
+                    HudIcon::Pause
+                },
+                if self.playback.paused {
+                    "Playing"
+                } else {
+                    "Paused"
+                },
+            );
+        }
+    }
+
+    fn handle_win_shell(&mut self, ctx: &egui::Context) {
+        let mut events = Vec::new();
+        if let Some(ws) = &self.win_shell {
+            while let Some(ev) = ws.try_recv() {
+                events.push(ev);
+            }
+        }
+        for ev in events {
+            match ev {
+                ShellEvent::ShowWindow => {
+                    if self.hidden_to_tray {
+                        self.restore_from_tray(ctx);
+                    } else if self.close_to_tray || self.minimize_to_tray {
+                        self.hide_to_tray(ctx);
+                    } else {
+                        self.restore_from_tray(ctx);
+                    }
+                }
+                ShellEvent::TogglePlayPause => self.toggle_play_pause(),
+                ShellEvent::Prev => self.play_previous_video(),
+                ShellEvent::Next => self.play_next_video(),
+                ShellEvent::ToggleAlwaysOnTop => self.set_always_on_top(ctx, !self.always_on_top),
+                ShellEvent::Quit => {
+                    self.quitting_from_tray = true;
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+            }
+        }
+
+        // Intercept window Close / Minimize when tray options are enabled
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested && self.close_to_tray && !self.quitting_from_tray {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            self.hide_to_tray(ctx);
+        }
+        let minimized = ctx.input(|i| i.viewport().minimized) == Some(true);
+        if minimized && !self.was_minimized && self.minimize_to_tray && !self.hidden_to_tray {
+            self.hide_to_tray(ctx);
+        }
+        self.was_minimized = minimized;
+
+        if let Some(ws) = &mut self.win_shell {
+            let title = if self.page == Page::Watch {
+                self.watch.as_ref().map(|w| w.title.as_str())
+            } else {
+                None
+            };
+            ws.sync_state(
+                self.playback.paused,
+                !self.hidden_to_tray,
+                self.always_on_top,
+                title,
+            );
         }
     }
 
@@ -2392,45 +2782,9 @@ impl YtApp {
                             self.trigger_hud(HudIcon::Pause, "Paused");
                         }
                     }
-                    MediaControlEvent::Toggle => {
-                        if let Some(m) = &self.mpv {
-                            m.toggle_pause();
-                            self.trigger_hud(
-                                if self.playback.paused {
-                                    HudIcon::Play
-                                } else {
-                                    HudIcon::Pause
-                                },
-                                if self.playback.paused {
-                                    "Playing"
-                                } else {
-                                    "Paused"
-                                },
-                            );
-                        }
-                    }
-                    MediaControlEvent::Next => {
-                        if !self.queue.is_empty() {
-                            let next = self.queue.remove(0);
-                            self.persist_queue();
-                            self.open_video(next);
-                        } else if let Some(next) =
-                            self.watch.as_ref().and_then(|w| w.related.first()).cloned()
-                        {
-                            self.open_video(next);
-                        }
-                    }
-                    MediaControlEvent::Previous => {
-                        if self.playback.time_pos > 5.0 || self.history.len() < 2 {
-                            if let Some(m) = &self.mpv {
-                                m.seek_abs(0.0);
-                                self.trigger_hud(HudIcon::SeekBack, "Restart");
-                            }
-                        } else {
-                            let prev = self.history[1].clone();
-                            self.open_video(prev);
-                        }
-                    }
+                    MediaControlEvent::Toggle => self.toggle_play_pause(),
+                    MediaControlEvent::Next => self.play_next_video(),
+                    MediaControlEvent::Previous => self.play_previous_video(),
                     _ => {
                         if let Some(target) = crate::os_media::seek_target(
                             &ev,
@@ -2649,11 +3003,12 @@ impl YtApp {
         if self.sponsorblock_enabled && !self.playback.paused {
             let pos = self.playback.time_pos;
             let dur = self.playback.duration;
-            if let Some(seg) = self
-                .sponsor_segments
-                .iter()
-                .find(|s| s.fits(dur) && pos >= s.start && pos < s.end - 0.5)
-            {
+            if let Some(seg) = self.sponsor_segments.iter().find(|s| {
+                self.sponsorblock_categories.contains(&s.category)
+                    && s.fits(dur)
+                    && pos >= s.start
+                    && pos < s.end - 0.5
+            }) {
                 if (seg.end - self.last_skipped_end).abs() > 0.5 {
                     self.last_skipped_end = seg.end;
                     if let Some(mpv) = &self.mpv {
@@ -2719,6 +3074,17 @@ impl eframe::App for YtApp {
             "sponsorblock",
             if self.sponsorblock_enabled { "1" } else { "0" }.into(),
         );
+        if let Ok(sbc) = serde_json::to_string(&self.sponsorblock_categories) {
+            storage.set_string("sb_categories", sbc);
+        }
+        storage.set_string(
+            "dearrow",
+            if self.dearrow_enabled { "1" } else { "0" }.into(),
+        );
+        storage.set_string(
+            "ryd",
+            if self.ryd_enabled { "1" } else { "0" }.into(),
+        );
         storage.set_string(
             "sync_history",
             if self.sync_history { "1" } else { "0" }.into(),
@@ -2731,6 +3097,27 @@ impl eframe::App for YtApp {
             "auto_resume_on_start",
             if self.auto_resume_on_start { "1" } else { "0" }.into(),
         );
+        storage.set_string(
+            "always_on_top",
+            if self.always_on_top { "1" } else { "0" }.into(),
+        );
+        storage.set_string(
+            "close_to_tray",
+            if self.close_to_tray { "1" } else { "0" }.into(),
+        );
+        storage.set_string(
+            "minimize_to_tray",
+            if self.minimize_to_tray { "1" } else { "0" }.into(),
+        );
+        storage.set_string(
+            "ambient_glow",
+            if self.ambient_glow { "1" } else { "0" }.into(),
+        );
+        storage.set_string("sub_font_size", self.sub_font_size.to_string());
+        storage.set_string("sub_bg_opacity", format!("{:.2}", self.sub_bg_opacity));
+        if let Ok(sc) = serde_json::to_string(&self.shortcuts) {
+            storage.set_string("shortcuts", sc);
+        }
         storage.set_string(
             "sidebar",
             if self.sidebar_expanded { "1" } else { "0" }.into(),
@@ -2778,6 +3165,7 @@ impl eframe::App for YtApp {
         self.drain_backend(&ctx);
         self.handle_shortcuts(&ctx);
         self.handle_os_media();
+        self.handle_win_shell(&ctx);
         self.poll_playback_and_sponsorblock(&ctx);
 
         if !self.fullscreen {

@@ -4,7 +4,7 @@ use egui::{
 };
 
 use crate::backend::Request;
-use crate::model::{PlaylistOption, VideoItem};
+use crate::model::{ChannelNotificationParams, NotificationLevel, PlaylistOption, VideoItem};
 use crate::theme::{self, icon};
 
 use super::YtApp;
@@ -835,4 +835,146 @@ pub(super) fn join_meta(views: &str, published: &str) -> String {
         (true, false) => published.to_owned(),
         (true, true) => String::new(),
     }
+}
+
+pub(super) fn draw_subscribe_bell_button(
+    ui: &mut egui::Ui,
+    channel_id: String,
+    is_subscribed: bool,
+    notifications: &ChannelNotificationParams,
+    tx: &crossbeam_channel::Sender<Request>,
+) {
+    if !is_subscribed {
+        let (srect, sresp) = ui.allocate_exact_size(Vec2::new(96.0, 34.0), Sense::click());
+        if sresp.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        let fill = if sresp.hovered() {
+            Color32::from_rgb(217, 217, 217)
+        } else {
+            Color32::from_rgb(241, 241, 241)
+        };
+        ui.painter().rect_filled(srect, 17.0, fill);
+        ui.painter().text(
+            srect.center(),
+            Align2::CENTER_CENTER,
+            "Subscribe",
+            theme::semibold(13.0),
+            Color32::from_rgb(15, 15, 15),
+        );
+        if sresp.clicked() {
+            let _ = tx.send(Request::SetSubscribe {
+                channel_id,
+                subscribe: true,
+            });
+        }
+        return;
+    }
+
+    let label = match notifications.level {
+        NotificationLevel::All => "All",
+        NotificationLevel::Personalized => "Subscribed",
+        NotificationLevel::None => "Off",
+    };
+    let pill_w = match notifications.level {
+        NotificationLevel::All => 88.0,
+        NotificationLevel::Personalized => 126.0,
+        NotificationLevel::None => 88.0,
+    };
+    let (srect, sresp) = ui.allocate_exact_size(Vec2::new(pill_w, 34.0), Sense::click());
+    if sresp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    let fill = if sresp.hovered() {
+        theme::CHIP_HOVER
+    } else {
+        theme::CHIP
+    };
+    ui.painter().rect_filled(srect, 17.0, fill);
+    let bell_col = match notifications.level {
+        NotificationLevel::All => Color32::WHITE,
+        NotificationLevel::Personalized => theme::TEXT,
+        NotificationLevel::None => theme::TEXT_DIM,
+    };
+    theme::draw_bell(
+        ui.painter(),
+        pos2(srect.left() + 18.0, srect.center().y),
+        14.0,
+        bell_col,
+    );
+    if notifications.level == NotificationLevel::None {
+        ui.painter().line_segment(
+            [
+                pos2(srect.left() + 12.0, srect.center().y + 6.0),
+                pos2(srect.left() + 24.0, srect.center().y - 6.0),
+            ],
+            Stroke::new(1.5, bell_col),
+        );
+    }
+    ui.painter().text(
+        pos2(srect.left() + 32.0, srect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        theme::semibold(13.0),
+        theme::TEXT,
+    );
+    theme::draw_icon_centered(
+        ui.painter(),
+        pos2(srect.right() - 14.0, srect.center().y),
+        icon::CHEVRON_DOWN,
+        12.0,
+        theme::TEXT_DIM,
+    );
+
+    egui::Popup::menu(&sresp).show(|ui| {
+        ui.set_min_width(170.0);
+        if notifications.has_controls() {
+            for lvl in [
+                NotificationLevel::All,
+                NotificationLevel::Personalized,
+                NotificationLevel::None,
+            ] {
+                let mark = if notifications.level == lvl {
+                    icon::CHECK
+                } else {
+                    ' '
+                };
+                let p_opt = notifications.params_for(lvl);
+                if ui
+                    .add_enabled(
+                        p_opt.is_some(),
+                        egui::Button::new(
+                            RichText::new(format!("{mark}  {}", lvl.label()))
+                                .font(theme::regular(13.0)),
+                        ),
+                    )
+                    .clicked()
+                {
+                    if let Some(params) = p_opt {
+                        let _ = tx.send(Request::SetChannelNotifications {
+                            channel_id: channel_id.clone(),
+                            level: lvl,
+                            params: params.to_owned(),
+                        });
+                    }
+                    ui.close();
+                }
+            }
+            ui.separator();
+        }
+        if ui
+            .button(
+                RichText::new(format!("{}  Unsubscribe", icon::X))
+                    .font(theme::regular(13.0))
+                    .color(theme::TEXT),
+            )
+            .clicked()
+        {
+            let _ = tx.send(Request::SetSubscribe {
+                channel_id: channel_id.clone(),
+                subscribe: false,
+            });
+            ui.close();
+        }
+    });
 }

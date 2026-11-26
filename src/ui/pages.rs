@@ -18,7 +18,7 @@ impl YtApp {
     pub(super) fn draw_home_page(&mut self, ui: &mut egui::Ui) {
         // Filter chips bar with smooth animated < / > scrolling, wheel scroll, and drag panning
         let drag_blocked_click = self.chips_drag_dist >= 6.0;
-        let mut clicked_remote: Option<Option<String>> = None;
+        let mut clicked_remote: Option<usize> = None;
         let mut clicked_guest: Option<(usize, Option<&'static str>)> = None;
 
         // Smoothly ease chips_scroll_x toward chips_scroll_target
@@ -47,7 +47,7 @@ impl YtApp {
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .show(ui, |ui| {
                             if !self.home_chips.is_empty() {
-                                for chip in &self.home_chips {
+                                for (idx, chip) in self.home_chips.iter().enumerate() {
                                     let fill = if chip.selected {
                                         Color32::from_rgb(241, 241, 241)
                                     } else {
@@ -66,7 +66,7 @@ impl YtApp {
                                     .fill(fill)
                                     .corner_radius(CornerRadius::same(8));
                                     if ui.add(btn).clicked() && !drag_blocked_click {
-                                        clicked_remote = Some(chip.params.clone());
+                                        clicked_remote = Some(idx);
                                     }
                                 }
                             } else {
@@ -153,11 +153,22 @@ impl YtApp {
             self.chips_scroll_target = next_target.clamp(0.0, max_scroll);
         });
 
-        if let Some(params) = clicked_remote {
+        if let Some(idx) = clicked_remote {
+            let (params, continuation) = if let Some(chip) = self.home_chips.get(idx) {
+                (chip.params.clone(), chip.continuation.clone())
+            } else {
+                (None, None)
+            };
+            for (i, c) in self.home_chips.iter_mut().enumerate() {
+                c.selected = i == idx;
+            }
+            self.home_items.clear();
+            self.home_continuation = None;
             self.home_loading = true;
             let _ = self.backend.tx.send(Request::LoadHome {
                 params,
-                continuation: None,
+                continuation,
+                append: false,
             });
         } else if let Some((idx, query)) = clicked_guest {
             self.selected_topic_chip = idx;
@@ -167,6 +178,7 @@ impl YtApp {
                     let _ = self.backend.tx.send(Request::LoadHome {
                         params: None,
                         continuation: None,
+                        append: false,
                     });
                 }
                 Some(q) => {
@@ -334,6 +346,7 @@ impl YtApp {
                 let _ = app.backend.tx.send(Request::LoadHome {
                     params: None,
                     continuation: cont,
+                    append: true,
                 });
             });
         }
@@ -510,33 +523,14 @@ impl YtApp {
                 }
                 ui.add_space(4.0);
                 if let Some(cid) = self.channel_id.clone() {
-                    let (sub_label, sub_fill, sub_text_col) = if info.is_subscribed {
-                        ("Subscribed", theme::CHIP, theme::TEXT)
-                    } else {
-                        (
-                            "Subscribe",
-                            Color32::from_rgb(241, 241, 241),
-                            Color32::from_rgb(15, 15, 15),
-                        )
-                    };
                     ui.horizontal(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(sub_label)
-                                        .font(theme::semibold(13.0))
-                                        .color(sub_text_col),
-                                )
-                                .fill(sub_fill)
-                                .corner_radius(18),
-                            )
-                            .clicked()
-                        {
-                            let _ = self.backend.tx.send(Request::SetSubscribe {
-                                channel_id: cid,
-                                subscribe: !info.is_subscribed,
-                            });
-                        }
+                        super::cards::draw_subscribe_bell_button(
+                            ui,
+                            cid,
+                            info.is_subscribed,
+                            &info.notifications,
+                            &self.backend.tx,
+                        );
                         if self
                             .channel_items
                             .iter()
@@ -922,6 +916,191 @@ impl YtApp {
                     } else if ui.button("Download libmpv-2.dll automatically").clicked() {
                         self.downloading_mpv = true;
                         let _ = self.backend.tx.send(Request::DownloadLibmpv);
+                    }
+                }
+            });
+
+            ui.add_space(12.0);
+            settings_card(ui, "Window & System Tray", |ui| {
+                let mut aot = self.always_on_top;
+                if ui
+                    .checkbox(&mut aot, "Keep window Always on Top")
+                    .changed()
+                {
+                    self.set_always_on_top(ui.ctx(), aot);
+                }
+                ui.checkbox(
+                    &mut self.close_to_tray,
+                    "Close button hides window to system tray (use tray menu -> Quit to exit)",
+                );
+                ui.checkbox(
+                    &mut self.minimize_to_tray,
+                    "Minimize button hides window to system tray",
+                );
+            });
+
+            ui.add_space(12.0);
+            settings_card(ui, "Subtitles & Player Appearance", |ui| {
+                ui.checkbox(
+                    &mut self.ambient_glow,
+                    "Ambient cinema glow behind video player",
+                );
+                ui.add_space(8.0);
+                let mut sub_changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Caption font size");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!("{} px", self.sub_font_size))
+                                .font(theme::medium(13.0))
+                                .color(theme::TEXT_DIM),
+                        );
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.sub_font_size, 24..=80)
+                                    .show_value(false),
+                            )
+                            .changed()
+                        {
+                            sub_changed = true;
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Caption background opacity");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let mut pct = (self.sub_bg_opacity * 100.0).round() as u32;
+                        ui.label(
+                            RichText::new(format!("{pct}%"))
+                                .font(theme::medium(13.0))
+                                .color(theme::TEXT_DIM),
+                        );
+                        if ui
+                            .add(egui::Slider::new(&mut pct, 0..=100).show_value(false))
+                            .changed()
+                        {
+                            self.sub_bg_opacity = pct as f32 / 100.0;
+                            sub_changed = true;
+                        }
+                    });
+                });
+                if sub_changed {
+                    if let Some(mpv) = &self.mpv {
+                        mpv.set_subtitle_style(self.sub_font_size, self.sub_bg_opacity);
+                    }
+                }
+            });
+
+            ui.add_space(12.0);
+            settings_card(ui, "Keyboard Shortcuts", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Click any binding and press a new key combination (Esc cancels)")
+                            .font(theme::regular(12.5))
+                            .color(theme::TEXT_DIM),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Reset defaults").clicked() {
+                            self.shortcuts = crate::model::ShortcutConfig::default();
+                            self.rebinding_shortcut = None;
+                            self.toast("Keyboard shortcuts reset to defaults");
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                for slot in crate::model::ShortcutSlot::ALL {
+                    let listening = self.rebinding_shortcut == Some(*slot);
+                    ui.horizontal(|ui| {
+                        ui.label(slot.label());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let label = if listening {
+                                "Press key...".to_owned()
+                            } else {
+                                self.shortcuts.get(*slot).display()
+                            };
+                            let btn = egui::Button::new(
+                                RichText::new(label)
+                                    .font(theme::medium(12.5))
+                                    .color(if listening {
+                                        Color32::WHITE
+                                    } else {
+                                        theme::TEXT
+                                    }),
+                            )
+                            .min_size(Vec2::new(112.0, 26.0))
+                            .fill(if listening {
+                                theme::YT_BLUE
+                            } else {
+                                theme::CHIP
+                            })
+                            .corner_radius(6);
+                            if ui.add(btn).clicked() {
+                                self.rebinding_shortcut = if listening { None } else { Some(*slot) };
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
+            });
+
+            ui.add_space(12.0);
+            settings_card(ui, "Community Integrations (Optional)", |ui| {
+                ui.checkbox(&mut self.sponsorblock_enabled, "Auto-skip SponsorBlock segments");
+                if self.sponsorblock_enabled {
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for &cat in crate::model::SponsorCategory::ALL {
+                            let mut on = self.sponsorblock_categories.contains(&cat);
+                            if ui.checkbox(&mut on, cat.label()).changed() {
+                                if on {
+                                    self.sponsorblock_categories.insert(cat);
+                                } else {
+                                    self.sponsorblock_categories.remove(&cat);
+                                }
+                            }
+                        }
+                    });
+                }
+                ui.add_space(8.0);
+                if ui
+                    .checkbox(
+                        &mut self.dearrow_enabled,
+                        "DeArrow: Replace clickbait titles & thumbnails via crowd-sourced branding",
+                    )
+                    .changed()
+                {
+                    if self.dearrow_enabled {
+                        if let Some(w) = &self.watch {
+                            if !w.id.starts_with("local:") {
+                                let _ = self.backend.tx.send(Request::LoadCommunityMeta {
+                                    video_id: w.id.clone(),
+                                    dearrow: true,
+                                    ryd: false,
+                                });
+                            }
+                        }
+                    }
+                }
+                if ui
+                    .checkbox(
+                        &mut self.ryd_enabled,
+                        "Return YouTube Dislike: Show estimated dislike counts beside Dislike button",
+                    )
+                    .changed()
+                {
+                    if self.ryd_enabled {
+                        if let Some(w) = &self.watch {
+                            if !w.id.starts_with("local:") {
+                                let _ = self.backend.tx.send(Request::LoadCommunityMeta {
+                                    video_id: w.id.clone(),
+                                    dearrow: false,
+                                    ryd: true,
+                                });
+                            }
+                        }
+                    } else if let Some(w) = &mut self.watch {
+                        w.dislikes_text = None;
                     }
                 }
             });
