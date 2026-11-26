@@ -1,0 +1,11 @@
+/target/
+**/*.rs.bk
+*.exe
+*.dll
+*.pdb
+*.log
+app.ron
+session.json
+player_sts.txt
+.DS_Store
+Thumbs.db
