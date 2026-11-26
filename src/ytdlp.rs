@@ -214,16 +214,20 @@ pub fn default_downloads_dir(data_dir: &Path) -> PathBuf {
     }
 }
 
-/// Downloads a video (MP4) or audio (M4A/Opus) into the user's Downloads/yt-rust folder via yt-dlp.
+/// Downloads a video (MP4) or audio (M4A/Opus) into the configured download folder (or Downloads/yt-rust) via yt-dlp.
 pub async fn download_video(
     http: &reqwest::Client,
     data_dir: &Path,
+    custom_dir: Option<&Path>,
     video_id: &str,
     audio_only: bool,
     max_height: u32,
 ) -> anyhow::Result<PathBuf> {
     let bin = ensure_ytdlp(http, data_dir).await?;
-    let out_dir = default_downloads_dir(data_dir);
+    let out_dir = custom_dir
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_downloads_dir(data_dir));
     let vid = video_id.to_owned();
     tokio::task::spawn_blocking(move || -> anyhow::Result<PathBuf> {
         std::fs::create_dir_all(&out_dir)?;

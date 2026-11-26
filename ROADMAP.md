@@ -33,16 +33,16 @@ All core playback, authentication, sync, and browse features are implemented and
 ## Next Roadmap (Ready for New Chat)
 
 ### Phase 1 — Code Cleanup & Windows Polish
-- [ ] Clean up remaining `dead_code` compiler warnings in `src/backend.rs`, `src/model.rs`, and `src/theme.rs`.
-- [ ] Embed a proper Windows application icon (`app.ico` + viewport `IconData`) for `.exe`, taskbar, and titlebar.
-- [ ] Add Settings options for: custom download directory + "Open Downloads folder" button (`FOLDER_OPEN` icon), and optional `hwdec` mode toggle (`Auto-copy` vs `Software CPU`).
-- [ ] Modularize `src/ui.rs` into focused submodules (`src/ui/{mod.rs, topbar.rs, sidebar.rs, watch.rs, channel.rs, cards.rs}`) as the file is now ~4.5k lines.
+- [x] Clean up remaining `dead_code` compiler warnings in `src/backend.rs`, `src/model.rs`, and `src/theme.rs`.
+- [x] Embed an application window/taskbar icon (`theme::generate_app_icon()` via viewport `IconData`; `.exe` PE resource `.ico` optional).
+- [x] Add Settings options for: custom download directory + "Open Downloads folder" button (`FOLDER_OPEN` icon), and optional `hwdec` mode toggle (`Auto-copy` vs `Software CPU`).
+- [x] Modularize `src/ui.rs` into focused submodules (`src/ui/{mod.rs, topbar.rs, sidebar.rs, watch.rs, pages.rs, cards.rs}`).
 
 ### Phase 2 — OS Media Integration & Player UX
 - [ ] **Windows SMTC & Media Keys** (`Play/Pause`, `Next`, `Previous`, `Seek`) showing current video title, channel, and thumbnail in Windows media flyout.
-- [ ] **Hover/Fullscreen Auto-Hide Overlay** on the video surface so fullscreen feels clean like native YouTube.
-- [ ] **Stats for Nerds** modal/overlay (`Ctrl+I` or control-bar toggle): active codec, resolution, fps, bitrate, proxy cache speed/duration, `hwdec-current`, dropped frames.
-- [ ] Round top corners cleanly on PiP video rendering (`draw_mini_player`) + optional snap-to-corner behavior.
+- [x] **Hover/Fullscreen Auto-Hide Overlay** on the video surface so fullscreen feels clean like native YouTube.
+- [x] **Stats for Nerds** modal/overlay (`Ctrl+I` or control-bar toggle): active codec, resolution, fps, bitrate, proxy cache speed/duration, `hwdec-current`, dropped frames.
+- [x] Round top corners cleanly on PiP video rendering (`draw_mini_player`) + optional snap-to-corner behavior.
 
 ### Phase 3 — Community & Discovery Parity
 - [ ] **Interactive Comments & Live Chat Input**: post comments (`comment/create_comment`), expand comment replies (`commentRepliesRenderer`), sort Top/Newest, and send live chat messages (`live_chat/send_message`).

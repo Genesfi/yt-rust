@@ -184,7 +184,11 @@ pub struct PlaybackState {
     pub eof: bool,
     pub video_w: i64,
     pub video_h: i64,
+    pub fps: f64,
+    pub dropped_frames: i64,
     pub hwdec: String,
+    pub video_codec: String,
+    pub audio_codec: String,
     pub cache_duration: f64,
 }
 
@@ -305,9 +309,9 @@ impl MpvPlayer {
             set_opt("ytdl", "no");
             set_opt("keep-open", "yes");
             set_opt("cache", "yes");
-            set_opt("demuxer-max-bytes", "128MiB");
-            set_opt("demuxer-max-back-bytes", "48MiB");
-            set_opt("demuxer-readahead-secs", "35");
+            set_opt("demuxer-max-bytes", "72MiB");
+            set_opt("demuxer-max-back-bytes", "24MiB");
+            set_opt("demuxer-readahead-secs", "25");
             set_opt("cache-pause-wait", "1.5");
             set_opt("network-timeout", "15");
             set_opt(
@@ -467,6 +471,10 @@ impl MpvPlayer {
         );
     }
 
+    pub fn set_hwdec(&self, mode: crate::model::HwdecMode) {
+        self.set_property_str("hwdec", mode.mpv_value());
+    }
+
     pub fn poll_state(&self) -> PlaybackState {
         // Drain libmpv's event queue so internal buffers never stall
         unsafe {
@@ -485,7 +493,14 @@ impl MpvPlayer {
         st.eof = self.get_flag("eof-reached").unwrap_or(false);
         st.video_w = self.get_double("video-params/w").unwrap_or(0.0) as i64;
         st.video_h = self.get_double("video-params/h").unwrap_or(0.0) as i64;
+        st.fps = self
+            .get_double("estimated-vf-fps")
+            .or_else(|| self.get_double("container-fps"))
+            .unwrap_or(0.0);
+        st.dropped_frames = self.get_double("frame-drop-count").unwrap_or(0.0) as i64;
         st.hwdec = self.get_string("hwdec-current").unwrap_or_default();
+        st.video_codec = self.get_string("video-codec").unwrap_or_default();
+        st.audio_codec = self.get_string("audio-codec-name").unwrap_or_default();
         st.cache_duration = self.get_double("demuxer-cache-duration").unwrap_or(0.0);
         st
     }

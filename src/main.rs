@@ -133,7 +133,8 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1320.0, 840.0])
             .with_min_inner_size([840.0, 540.0])
-            .with_title("YouTube — yt-rust"),
+            .with_title("YouTube — yt-rust")
+            .with_icon(Arc::new(theme::generate_app_icon())),
         renderer: eframe::Renderer::Glow,
         persistence_path: Some(dir.join("app.ron")),
         multisampling: 0,

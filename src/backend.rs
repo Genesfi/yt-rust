@@ -24,7 +24,6 @@ pub enum Request {
     LoadHistory {
         continuation: Option<String>,
     },
-    LoadGuide,
     LoadPlaylist {
         browse_id: String,
         continuation: Option<String>,
@@ -90,6 +89,7 @@ pub enum Request {
         title: String,
         audio_only: bool,
         max_height: u32,
+        output_dir: Option<PathBuf>,
     },
     SignIn,
     SignOut,
@@ -171,10 +171,7 @@ pub enum Response {
         video_id: String,
         disliked: bool,
     },
-    WatchLaterUpdated {
-        video_id: String,
-        added: bool,
-    },
+    WatchLaterUpdated,
     PlaylistEdited {
         playlist_title: String,
         added: bool,
@@ -191,7 +188,6 @@ pub enum Response {
         subscribed: bool,
     },
     VideoDownloaded {
-        video_id: String,
         title: String,
         result: Result<PathBuf, String>,
     },
@@ -427,22 +423,6 @@ impl Backend {
                                     }
                                 }
                                 wake();
-                            }
-                            Request::LoadGuide => {
-                                if let Some(s) = session.clone() {
-                                    let cfg_clone = cfg.clone();
-                                    tokio::spawn(async move {
-                                        if let Ok((channels, playlists)) =
-                                            innertube::fetch_guide(&http, &cfg_clone, &s).await
-                                        {
-                                            let _ = resp_tx.send(Response::GuideLoaded {
-                                                channels,
-                                                playlists,
-                                            });
-                                            wake();
-                                        }
-                                    });
-                                }
                             }
                             Request::LoadPlaylist {
                                 browse_id,
@@ -686,10 +666,7 @@ impl Backend {
                                     .await
                                     {
                                         Ok(()) => {
-                                            let _ = resp_tx.send(Response::WatchLaterUpdated {
-                                                video_id,
-                                                added: add,
-                                            });
+                                            let _ = resp_tx.send(Response::WatchLaterUpdated);
                                         }
                                         Err(e) => {
                                             let _ = resp_tx.send(Response::Error(format!(
@@ -905,11 +882,13 @@ impl Backend {
                                 title,
                                 audio_only,
                                 max_height,
+                                output_dir,
                             } => {
                                 tokio::spawn(async move {
                                     let result = ytdlp::download_video(
                                         &http,
                                         &data_dir,
+                                        output_dir.as_deref(),
                                         &video_id,
                                         audio_only,
                                         max_height,
@@ -917,7 +896,6 @@ impl Backend {
                                     .await
                                     .map_err(|e| format!("{e:#}"));
                                     let _ = resp_tx.send(Response::VideoDownloaded {
-                                        video_id,
                                         title,
                                         result,
                                     });

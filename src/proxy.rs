@@ -10,8 +10,8 @@ use tokio::sync::Notify;
 const FIRST_BLOCK: u64 = 256 * 1024;
 const BLOCK_SIZE: u64 = 1024 * 1024;
 const WORKERS: usize = 4;
-const PREFETCH_AHEAD: usize = 20;
-const KEEP_BEHIND: usize = 4;
+const PREFETCH_AHEAD: usize = 14;
+const KEEP_BEHIND: usize = 2;
 const VISIONOS_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
 
 #[derive(Clone)]

@@ -271,18 +271,175 @@ pub async fn fetch_guide(
         cfg,
         Some(session),
     );
-    let (guide_res, pl_res) = tokio::join!(guide_fut, pl_fut);
+    let lib_fut = post_web(
+        http,
+        "browse",
+        json!({ "browseId": "FElibrary" }),
+        cfg,
+        Some(session),
+    );
+    let (guide_res, pl_res, lib_res) = tokio::join!(guide_fut, pl_fut, lib_fut);
     let guide_val = guide_res?;
     let (channels, mut playlists) = parse_guide_response(&guide_val);
-    if let Ok(pl_val) = pl_res {
+    if let Ok(mut pl_val) = pl_res {
         merge_playlists_from_browse(&pl_val, &mut playlists);
+        for _ in 0..4 {
+            let Some(cont) = find_continuation(&pl_val) else {
+                break;
+            };
+            let Ok(next_pl) = post_web(
+                http,
+                "browse",
+                json!({ "continuation": cont }),
+                cfg,
+                Some(session),
+            )
+            .await
+            else {
+                break;
+            };
+            merge_playlists_from_browse(&next_pl, &mut playlists);
+            pl_val = next_pl;
+        }
     }
+    if let Ok(lib_val) = lib_res {
+        merge_playlists_from_browse(&lib_val, &mut playlists);
+    }
+
+    // Backfill remaining playlist thumbnails concurrently from their first video
+    let missing: Vec<(usize, String)> = playlists
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.thumbnail_url.is_none() && !p.browse_id.is_empty())
+        .take(24)
+        .map(|(i, p)| (i, p.browse_id.clone()))
+        .collect();
+    if !missing.is_empty() {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(6));
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, bid) in missing {
+            let http = http.clone();
+            let cfg = cfg.clone();
+            let session = session.clone();
+            let sem = sem.clone();
+            set.spawn(async move {
+                let _permit = sem.acquire_owned().await.ok()?;
+                let v = post_web(&http, "browse", json!({ "browseId": bid }), &cfg, Some(&session))
+                    .await
+                    .ok()?;
+                let thumb = extract_first_playlist_video_thumb(&v);
+                Some((idx, thumb))
+            });
+        }
+        while let Some(res) = set.join_next().await {
+            if let Ok(Some((idx, Some(thumb)))) = res {
+                if let Some(p) = playlists.get_mut(idx) {
+                    if p.thumbnail_url.is_none() {
+                        p.thumbnail_url = Some(thumb);
+                    }
+                }
+            }
+        }
+    }
+
     Ok((channels, playlists))
 }
 
+fn extract_first_playlist_video_thumb(v: &Value) -> Option<String> {
+    match v {
+        Value::Object(map) => {
+            for key in [
+                "playlistVideoRenderer",
+                "playlistPanelVideoRenderer",
+                "gridVideoRenderer",
+                "videoRenderer",
+            ] {
+                if let Some(item) = map.get(key) {
+                    if let Some(u) = find_first_thumb_url(&item["thumbnail"]) {
+                        return Some(u);
+                    }
+                    if let Some(vid) = item["videoId"].as_str() {
+                        return Some(format!("https://i.ytimg.com/vi/{vid}/mqdefault.jpg"));
+                    }
+                }
+            }
+            if let Some(lm) = map.get("lockupViewModel") {
+                if let Some(u) = find_first_thumb_url(&lm["contentImage"]) {
+                    return Some(u);
+                }
+                if let Some(vid) = lm["contentId"].as_str() {
+                    if vid.len() == 11 {
+                        return Some(format!("https://i.ytimg.com/vi/{vid}/mqdefault.jpg"));
+                    }
+                }
+            }
+            for val in map.values() {
+                if let Some(u) = extract_first_playlist_video_thumb(val) {
+                    return Some(u);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => arr.iter().find_map(extract_first_playlist_video_thumb),
+        _ => None,
+    }
+}
+
+fn find_first_thumb_url(v: &Value) -> Option<String> {
+    match v {
+        Value::Object(map) => {
+            for key in ["sources", "thumbnails"] {
+                if let Some(arr) = map.get(key).and_then(Value::as_array) {
+                    if let Some(u) = arr.last().and_then(|t| t["url"].as_str()) {
+                        return Some(normalize_url(u));
+                    }
+                }
+            }
+            for val in map.values() {
+                if let Some(u) = find_first_thumb_url(val) {
+                    return Some(u);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => {
+            for val in arr {
+                if let Some(u) = find_first_thumb_url(val) {
+                    return Some(u);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn upsert_playlist(
+    out: &mut Vec<PlaylistSummary>,
+    bid: String,
+    title: String,
+    subtitle: String,
+    thumbnail_url: Option<String>,
+) {
+    if let Some(existing) = out.iter_mut().find(|p| p.browse_id == bid) {
+        if existing.thumbnail_url.is_none() {
+            existing.thumbnail_url = thumbnail_url;
+        }
+        if existing.subtitle.is_empty() && !subtitle.is_empty() {
+            existing.subtitle = subtitle;
+        }
+    } else {
+        out.push(PlaylistSummary {
+            title,
+            browse_id: bid,
+            subtitle,
+            thumbnail_url,
+        });
+    }
+}
+
 fn merge_playlists_from_browse(v: &Value, out: &mut Vec<PlaylistSummary>) {
-    let mut seen: HashSet<String> = out.iter().map(|p| p.browse_id.clone()).collect();
-    fn walk(v: &Value, out: &mut Vec<PlaylistSummary>, seen: &mut HashSet<String>) {
+    fn walk(v: &Value, out: &mut Vec<PlaylistSummary>) {
         match v {
             Value::Object(map) => {
                 if let Some(gp) = map.get("gridPlaylistRenderer") {
@@ -291,22 +448,24 @@ fn merge_playlists_from_browse(v: &Value, out: &mut Vec<PlaylistSummary>) {
                     {
                         if pid != "WL" && pid != "LL" {
                             let bid = format!("VL{pid}");
-                            if seen.insert(bid.clone()) {
-                                let subtitle = text(&gp["videoCountShortText"])
-                                    .or_else(|| text(&gp["videoCountText"]))
-                                    .unwrap_or_default();
-                                let thumbnail_url = gp["thumbnail"]["thumbnails"]
-                                    .as_array()
-                                    .and_then(|a| a.last())
-                                    .and_then(|t| t["url"].as_str())
-                                    .map(normalize_url);
-                                out.push(PlaylistSummary {
-                                    title,
-                                    browse_id: bid,
-                                    subtitle,
-                                    thumbnail_url,
-                                });
-                            }
+                            let subtitle = text(&gp["videoCountShortText"])
+                                .or_else(|| text(&gp["videoCountText"]))
+                                .unwrap_or_default();
+                            let thumbnail_url = find_first_thumb_url(&gp["thumbnail"])
+                                .or_else(|| find_first_thumb_url(gp));
+                            upsert_playlist(out, bid, title, subtitle, thumbnail_url);
+                        }
+                    }
+                } else if let Some(pl) = map.get("playlistRenderer") {
+                    if let (Some(pid), Some(title)) =
+                        (pl["playlistId"].as_str(), text(&pl["title"]))
+                    {
+                        if pid != "WL" && pid != "LL" {
+                            let bid = format!("VL{pid}");
+                            let subtitle = text(&pl["videoCountText"]).unwrap_or_default();
+                            let thumbnail_url = find_first_thumb_url(&pl["thumbnails"])
+                                .or_else(|| find_first_thumb_url(pl));
+                            upsert_playlist(out, bid, title, subtitle, thumbnail_url);
                         }
                     }
                 } else if let Some(lm) = map.get("lockupViewModel") {
@@ -322,38 +481,40 @@ fn merge_playlists_from_browse(v: &Value, out: &mut Vec<PlaylistSummary>) {
                                 } else {
                                     format!("VL{pid}")
                                 };
-                                if seen.insert(bid.clone()) {
-                                    let thumbnail_url = lm["contentImage"]["collectionThumbnailViewModel"]
-                                        ["primaryThumbnail"]["thumbnailViewModel"]["image"]["sources"]
-                                        .as_array()
-                                        .or_else(|| lm["contentImage"]["thumbnailViewModel"]["image"]["sources"].as_array())
-                                        .and_then(|a| a.last())
-                                        .and_then(|s| s["url"].as_str())
-                                        .map(normalize_url);
-                                    out.push(PlaylistSummary {
-                                        title: title.to_owned(),
-                                        browse_id: bid,
-                                        subtitle: String::new(),
-                                        thumbnail_url,
-                                    });
-                                }
+                                let subtitle = lm["metadata"]["lockupMetadataViewModel"]["metadata"]
+                                    ["contentMetadataViewModel"]["metadataRows"]
+                                    .as_array()
+                                    .and_then(|rows| rows.last())
+                                    .and_then(|r| r["metadataParts"].as_array())
+                                    .and_then(|parts| parts.first())
+                                    .and_then(|p| p["text"]["content"].as_str())
+                                    .unwrap_or("")
+                                    .to_owned();
+                                let thumbnail_url = find_first_thumb_url(&lm["contentImage"]);
+                                upsert_playlist(
+                                    out,
+                                    bid,
+                                    title.to_owned(),
+                                    subtitle,
+                                    thumbnail_url,
+                                );
                             }
                         }
                     }
                 }
                 for val in map.values() {
-                    walk(val, out, seen);
+                    walk(val, out);
                 }
             }
             Value::Array(arr) => {
                 for val in arr {
-                    walk(val, out, seen);
+                    walk(val, out);
                 }
             }
             _ => {}
         }
     }
-    walk(v, out, &mut seen);
+    walk(v, out);
 }
 
 fn parse_guide_response(v: &Value) -> (Vec<SidebarChannel>, Vec<PlaylistSummary>) {
@@ -555,11 +716,8 @@ fn parse_add_to_playlist(v: &Value) -> Vec<PlaylistOption> {
                         if seen.insert(pid.to_owned()) {
                             let status = opt["containsSelectedVideos"].as_str().unwrap_or("");
                             let is_added = matches!(status, "ALL" | "SOME");
-                            let thumbnail_url = opt["thumbnail"]["thumbnails"]
-                                .as_array()
-                                .and_then(|a| a.last())
-                                .and_then(|t| t["url"].as_str())
-                                .map(normalize_url);
+                            let thumbnail_url = find_first_thumb_url(&opt["thumbnail"])
+                                .or_else(|| find_first_thumb_url(opt));
                             out.push(PlaylistOption {
                                 id: pid.to_owned(),
                                 title,
@@ -829,25 +987,28 @@ pub async fn trending_feed(
     cfg: &WebConfig,
     session: Option<&Session>,
 ) -> anyhow::Result<FeedPage> {
-    let v = post_web(http, "browse", json!({ "browseId": "FEtrending" }), cfg, session).await?;
-    let new_vd = v["responseContext"]["visitorData"]
-        .as_str()
-        .map(str::to_owned);
-    let mut items = Vec::new();
-    let mut seen = HashSet::new();
-    collect_videos(&v, &mut items, &mut seen);
-    // If FEtrending returned empty on some regions, fallback to a broad music/tech/gaming explore query
-    if items.is_empty() {
-        return search(http, "trending videos 2026", None, cfg, session).await;
+    for browse_id in ["FEexplore", "FEtrending"] {
+        if let Ok(v) = post_web(http, "browse", json!({ "browseId": browse_id }), cfg, session).await
+        {
+            let new_vd = v["responseContext"]["visitorData"]
+                .as_str()
+                .map(str::to_owned);
+            let mut items = Vec::new();
+            let mut seen = HashSet::new();
+            collect_videos(&v, &mut items, &mut seen);
+            if !items.is_empty() {
+                let cont = find_continuation(&v);
+                return Ok(FeedPage {
+                    items,
+                    chips: Vec::new(),
+                    continuation: cont,
+                    visitor_data: new_vd,
+                    is_fallback_trending: false,
+                });
+            }
+        }
     }
-    let cont = find_continuation(&v);
-    Ok(FeedPage {
-        items,
-        chips: Vec::new(),
-        continuation: cont,
-        visitor_data: new_vd,
-        is_fallback_trending: false,
-    })
+    search(http, "trending videos 2026", None, cfg, session).await
 }
 
 pub async fn search(
@@ -2035,23 +2196,114 @@ fn parse_next_metadata(
                 if let Some(d) = text(&p["dateText"]) {
                     published_text = d;
                 }
+                let mut like_status_entity_key: Option<String> = None;
                 if let Some(btns) = p["videoActions"]["menuRenderer"]["topLevelButtons"].as_array() {
                     for b in btns {
                         let seg = &b["segmentedLikeDislikeButtonViewModel"];
-                        let like_toggle = &seg["likeButtonViewModel"]["likeButtonViewModel"]
-                            ["toggleButtonViewModel"]["toggleButtonViewModel"];
-                        if let Some(t) = like_toggle["defaultButtonViewModel"]["buttonViewModel"]["title"].as_str() {
-                            likes_text = t.to_owned();
+                        if seg.is_object() {
+                            let like_vm = &seg["likeButtonViewModel"]["likeButtonViewModel"];
+                            if let Some(k) = like_vm["likeStatusEntityKey"]
+                                .as_str()
+                                .or_else(|| seg["likeStatusEntityKey"].as_str())
+                            {
+                                like_status_entity_key = Some(k.to_owned());
+                            }
+                            let like_toggle =
+                                &like_vm["toggleButtonViewModel"]["toggleButtonViewModel"];
+                            if let Some(t) =
+                                like_toggle["defaultButtonViewModel"]["buttonViewModel"]["title"]
+                                    .as_str()
+                            {
+                                likes_text = t.to_owned();
+                            }
+                            if let Some(toggled) = like_toggle["isToggled"].as_bool() {
+                                is_liked = toggled;
+                            }
+                            let dislike_vm = &seg["dislikeButtonViewModel"]["dislikeButtonViewModel"];
+                            if like_status_entity_key.is_none() {
+                                if let Some(k) = dislike_vm["likeStatusEntityKey"].as_str() {
+                                    like_status_entity_key = Some(k.to_owned());
+                                }
+                            }
+                            let dislike_toggle =
+                                &dislike_vm["toggleButtonViewModel"]["toggleButtonViewModel"];
+                            if let Some(toggled) = dislike_toggle["isToggled"].as_bool() {
+                                is_disliked = toggled;
+                            }
+                            // Also check inline likeStatusEntity if present directly on the view model
+                            if let Some(status) = like_vm["likeStatusEntity"]["likeStatus"]
+                                .as_str()
+                                .or_else(|| seg["likeStatusEntity"]["likeStatus"].as_str())
+                            {
+                                match status {
+                                    "LIKE" => {
+                                        is_liked = true;
+                                        is_disliked = false;
+                                    }
+                                    "DISLIKE" => {
+                                        is_liked = false;
+                                        is_disliked = true;
+                                    }
+                                    "INDIFFERENT" => {
+                                        is_liked = false;
+                                        is_disliked = false;
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
-                        if let Some(toggled) = like_toggle["isTogglingDisabled"].as_bool().and_then(|_| None::<bool>).or_else(|| {
-                            like_toggle["isToggled"].as_bool()
-                        }) {
-                            is_liked = toggled;
+                        let legacy_seg = &b["segmentedLikeDislikeButtonRenderer"];
+                        if legacy_seg.is_object() {
+                            let lt = &legacy_seg["likeButton"]["toggleButtonRenderer"];
+                            if likes_text.is_empty() {
+                                if let Some(t) = text(&lt["defaultText"]) {
+                                    likes_text = t;
+                                }
+                            }
+                            if let Some(toggled) = lt["isToggled"].as_bool() {
+                                is_liked = toggled;
+                            }
+                            let dt = &legacy_seg["dislikeButton"]["toggleButtonRenderer"];
+                            if let Some(toggled) = dt["isToggled"].as_bool() {
+                                is_disliked = toggled;
+                            }
                         }
-                        let dislike_toggle = &seg["dislikeButtonViewModel"]["dislikeButtonViewModel"]
-                            ["toggleButtonViewModel"]["toggleButtonViewModel"];
-                        if let Some(toggled) = dislike_toggle["isToggled"].as_bool() {
-                            is_disliked = toggled;
+                    }
+                }
+                // InnerTube /next stores authoritative user like state in frameworkUpdates mutations
+                if let Some(mutations) =
+                    next["frameworkUpdates"]["entityBatchUpdate"]["mutations"].as_array()
+                {
+                    let matched = like_status_entity_key
+                        .as_deref()
+                        .and_then(|key| {
+                            mutations.iter().find(|m| {
+                                m["entityKey"].as_str() == Some(key)
+                                    && m["payload"]["likeStatusEntity"]["likeStatus"].is_string()
+                            })
+                        })
+                        .or_else(|| {
+                            mutations.iter().find(|m| {
+                                m["payload"]["likeStatusEntity"]["likeStatus"].is_string()
+                            })
+                        });
+                    if let Some(status) =
+                        matched.and_then(|m| m["payload"]["likeStatusEntity"]["likeStatus"].as_str())
+                    {
+                        match status {
+                            "LIKE" => {
+                                is_liked = true;
+                                is_disliked = false;
+                            }
+                            "DISLIKE" => {
+                                is_liked = false;
+                                is_disliked = true;
+                            }
+                            "INDIFFERENT" => {
+                                is_liked = false;
+                                is_disliked = false;
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -2675,5 +2927,68 @@ mod tests {
         assert_eq!(lm_item.duration_text, "3:32");
         assert_eq!(lm_item.watched_percent, Some(0.52));
         assert!(lm_item.resume_secs.is_some());
+    }
+
+    #[test]
+    fn parses_like_status_from_framework_updates() {
+        let next = json!({
+            "contents": {
+                "twoColumnWatchNextResults": {
+                    "results": {
+                        "results": {
+                            "contents": [{
+                                "videoPrimaryInfoRenderer": {
+                                    "videoActions": {
+                                        "menuRenderer": {
+                                            "topLevelButtons": [{
+                                                "segmentedLikeDislikeButtonViewModel": {
+                                                    "likeButtonViewModel": {
+                                                        "likeButtonViewModel": {
+                                                            "likeStatusEntityKey": "LIKE_KEY_1",
+                                                            "toggleButtonViewModel": {
+                                                                "toggleButtonViewModel": {
+                                                                    "isToggled": false,
+                                                                    "defaultButtonViewModel": {
+                                                                        "buttonViewModel": { "title": "313" }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    },
+                                                    "dislikeButtonViewModel": {
+                                                        "dislikeButtonViewModel": {
+                                                            "toggleButtonViewModel": {
+                                                                "toggleButtonViewModel": { "isToggled": false }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }]
+                                        }
+                                    }
+                                }
+                            }]
+                        }
+                    }
+                }
+            },
+            "frameworkUpdates": {
+                "entityBatchUpdate": {
+                    "mutations": [{
+                        "entityKey": "LIKE_KEY_1",
+                        "payload": {
+                            "likeStatusEntity": {
+                                "likeStatus": "LIKE"
+                            }
+                        }
+                    }]
+                }
+            }
+        });
+        let (_, _, likes, liked, disliked, _, _, _, _, _, _) =
+            parse_next_metadata(&next, "abc12345678");
+        assert_eq!(likes, "313");
+        assert!(liked);
+        assert!(!disliked);
     }
 }

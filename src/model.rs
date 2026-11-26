@@ -248,6 +248,28 @@ pub struct WatchData {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HwdecMode {
+    AutoCopy,
+    Software,
+}
+
+impl HwdecMode {
+    pub fn mpv_value(self) -> &'static str {
+        match self {
+            Self::AutoCopy => "auto-copy",
+            Self::Software => "no",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AutoCopy => "Auto-copy (GPU H.264/HEVC + CPU VP9/AV1)",
+            Self::Software => "Software CPU (Maximum stability)",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PreferredQuality {
     Best4K,
     P1440,
@@ -308,4 +330,15 @@ impl SponsorSegment {
     pub fn fits(&self, duration: f64) -> bool {
         self.video_duration <= 0.0 || duration <= 0.0 || (self.video_duration - duration).abs() < 4.0
     }
+}
+
+/// Persisted snapshot of the most recent active video for crash-safe / restart resume.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LastWatched {
+    pub id: String,
+    pub title: String,
+    pub channel: String,
+    pub thumbnail_url: String,
+    pub position_secs: f64,
+    pub duration_secs: f64,
 }
