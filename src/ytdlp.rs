@@ -30,6 +30,48 @@ pub struct YtdlpStreams {
     pub duration_secs: f64,
 }
 
+pub fn remove_leftover_cookies(data_dir: &Path) {
+    let Ok(files) = std::fs::read_dir(data_dir) else {
+        return;
+    };
+    for f in files.flatten() {
+        let name = f.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("cookies-") && name.ends_with(".txt") {
+            let _ = std::fs::remove_file(f.path());
+        }
+    }
+}
+
+struct TempCookieJar {
+    path: PathBuf,
+}
+
+impl TempCookieJar {
+    fn create(data_dir: &Path, cookie: &str) -> anyhow::Result<Self> {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let path = data_dir.join(format!("cookies-{nonce}.txt"));
+        let mut txt = String::from("# Netscape HTTP Cookie File\n");
+        for kv in cookie.split(';') {
+            if let Some((k, v)) = kv.trim().split_once('=') {
+                txt.push_str(&format!(
+                    ".youtube.com\tTRUE\t/\tTRUE\t2147483647\t{k}\t{v}\n"
+                ));
+            }
+        }
+        std::fs::write(&path, txt)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for TempCookieJar {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 fn find_existing(data_dir: &Path) -> Option<PathBuf> {
     let local = data_dir.join(BIN);
     if local.is_file() {
@@ -122,15 +164,30 @@ async fn fetch_latest(http: &reqwest::Client, dest: &Path) -> anyhow::Result<()>
 pub async fn resolve_video(
     http: &reqwest::Client,
     data_dir: &Path,
+    cookie: Option<&str>,
     video_id: &str,
     max_height: u32,
 ) -> anyhow::Result<YtdlpStreams> {
     let bin = ensure_ytdlp(http, data_dir).await?;
+    let data_dir = data_dir.to_owned();
+    let cookie = cookie.filter(|c| !c.trim().is_empty()).map(str::to_owned);
     let vid = video_id.to_owned();
-    tokio::task::spawn_blocking(move || run_ytdlp(&bin, &vid, max_height)).await?
+    tokio::task::spawn_blocking(move || {
+        run_ytdlp(&bin, &data_dir, cookie.as_deref(), &vid, max_height)
+    })
+    .await?
 }
 
-fn run_ytdlp(bin: &Path, video_id: &str, max_height: u32) -> anyhow::Result<YtdlpStreams> {
+fn run_ytdlp(
+    bin: &Path,
+    data_dir: &Path,
+    cookie: Option<&str>,
+    video_id: &str,
+    max_height: u32,
+) -> anyhow::Result<YtdlpStreams> {
+    let _jar = cookie
+        .map(|c| TempCookieJar::create(data_dir, c))
+        .transpose()?;
     let selector = format!(
         "bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best"
     );
@@ -142,8 +199,11 @@ fn run_ytdlp(bin: &Path, video_id: &str, max_height: u32) -> anyhow::Result<Ytdl
         "-f",
         &selector,
         "-j",
-    ])
-    .arg(format!("https://www.youtube.com/watch?v={video_id}"));
+    ]);
+    if let Some(ref jar) = _jar {
+        cmd.arg("--cookies").arg(&jar.path);
+    }
+    cmd.arg(format!("https://www.youtube.com/watch?v={video_id}"));
 
     #[cfg(windows)]
     {
@@ -158,6 +218,9 @@ fn run_ytdlp(bin: &Path, video_id: &str, max_height: u32) -> anyhow::Result<Ytdl
             .lines()
             .rfind(|l| l.contains("ERROR"))
             .unwrap_or("yt-dlp failed");
+        if msg.contains("Sign in to confirm") && cookie.is_none() {
+            anyhow::bail!("YouTube requested sign-in verification for this video — please Sign in first.");
+        }
         anyhow::bail!("{}", msg.trim());
     }
 
@@ -219,11 +282,14 @@ pub async fn download_video(
     http: &reqwest::Client,
     data_dir: &Path,
     custom_dir: Option<&Path>,
+    cookie: Option<&str>,
     video_id: &str,
     audio_only: bool,
     max_height: u32,
 ) -> anyhow::Result<PathBuf> {
     let bin = ensure_ytdlp(http, data_dir).await?;
+    let data_dir_owned = data_dir.to_path_buf();
+    let cookie = cookie.filter(|c| !c.trim().is_empty()).map(str::to_owned);
     let out_dir = custom_dir
         .filter(|p| !p.as_os_str().is_empty())
         .map(Path::to_path_buf)
@@ -231,6 +297,10 @@ pub async fn download_video(
     let vid = video_id.to_owned();
     tokio::task::spawn_blocking(move || -> anyhow::Result<PathBuf> {
         std::fs::create_dir_all(&out_dir)?;
+        let _jar = cookie
+            .as_deref()
+            .map(|c| TempCookieJar::create(&data_dir_owned, c))
+            .transpose()?;
         let out_dir_str = out_dir.to_string_lossy().into_owned();
         let mut cmd = Command::new(&bin);
         let fmt = format!(
@@ -247,6 +317,9 @@ pub async fn download_video(
             "--print",
             "after_move:filepath",
         ]);
+        if let Some(ref jar) = _jar {
+            cmd.arg("--cookies").arg(&jar.path);
+        }
         if audio_only {
             cmd.args(["-x", "--audio-format", "m4a", "-f", "bestaudio/best"]);
         } else {

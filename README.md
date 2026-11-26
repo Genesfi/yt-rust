@@ -2,6 +2,12 @@
 
 A fast, lightweight native Windows desktop YouTube client written in Rust with [`eframe`](https://crates.io/crates/eframe) / [`egui`](https://crates.io/crates/egui) and OpenGL [`libmpv`](https://mpv.io/).
 
+## Screenshots
+
+| Home Feed + Floating PiP | Watch Player & Up Next | Expanded Sidebar & Subscriptions |
+| :---: | :---: | :---: |
+| ![Home Feed and PiP Mini-Player](assets/screenshots/home-pip.jpg) | ![Watch Page Player](assets/screenshots/watch-player.jpg) | ![Watch Page with Expanded Sidebar](assets/screenshots/watch-sidebar.jpg) |
+
 ## Features
 
 - **Native 1080p–4K Playback (`libmpv` + OpenGL FBO)**
@@ -14,15 +20,16 @@ A fast, lightweight native Windows desktop YouTube client written in Rust with [
   - Personalized Home feed + filter chips bar (horizontal wheel, `<` / `>` buttons, and left-click drag panning), Subscriptions feed & channel list, Trending, Liked Videos (`VLLL`), and Watch Later (`VLWL`).
 - **Channel Pages, Playlists & Queue**
   - Full Channel pages with banner, avatar, subscriber count, subscribe toggle, and `Videos` / `Shorts` / `Live` / `Playlists` tabs.
-  - Interactive **Save to Playlist** modal with playlist search filter, playlist thumbnails, existing playlist membership checkmarks, Watch Later sync, and playlist creation.
-  - Play Queue management (`Up Next` / `Queue` / `Live Chat`), Floating draggable PiP mini-player with interactive seekbar, and SponsorBlock segment auto-skip.
+  - Library **Playlists** view & interactive **Save to Playlist** modal with playlist search filter, playlist thumbnails, existing playlist membership checkmarks, Watch Later sync, and playlist creation.
+  - Persistent Play Queue (`Up Next` / `Queue` / `Live Chat`) with right-click drag reordering, crash-safe Last-Watched + Queue resume, auto-PiP on scroll with corner-snapping mini-player, mouse Back/Forward navigation (`XButton1` / `XButton2`), and SponsorBlock auto-skip.
 - **Search, Comments & Offline Downloads**
-  - Live YouTube search autocomplete suggestions, direct URL/video-ID paste, comments pagination, live chat polling, Like/Dislike, and optional `yt-dlp` stream fallback / MP4 & M4A downloads to `Downloads/yt-rust`.
+  - Live YouTube search autocomplete suggestions, direct URL/video-ID paste, comments pagination, live chat polling, Like/Dislike, and optional `yt-dlp` stream fallback / MP4 & M4A downloads (configurable folder in Settings).
 
 ## Project Structure
 
-- `src/main.rs` — App entry point, `eframe` OpenGL (`Glow`) setup, Windows crash/panic logger
-- `src/ui.rs` — Main application layout, Home/Channel/Search/History/Playlist/Watch/Settings views, PiP mini-player
+- `src/main.rs` — App entry point, `eframe` OpenGL (`Glow`) setup, image/texture loaders, Windows crash/panic logger
+- `src/ui/` — Modular application UI (`mod.rs`, `topbar.rs`, `sidebar.rs`, `cards.rs`, `pages.rs`, `watch.rs`)
+- `src/images.rs` — Pooled `reqwest` HTTP image `BytesLoader`, disk thumbnail cache, and bounded GPU `TextureLoader`
 - `src/innertube.rs` — Direct InnerTube API client, feed/channel/watch/playlist/caption/storyboard parsers
 - `src/backend.rs` — Async Tokio backend worker & watchtime history sync loop
 - `src/mpv.rs` — Dynamic `libmpv-2.dll` bindings & OpenGL FBO rendering
@@ -30,7 +37,8 @@ A fast, lightweight native Windows desktop YouTube client written in Rust with [
 - `src/auth.rs` & `src/login.rs` — WebView2 Google login & `SAPISIDHASH` request signing
 - `src/sponsorblock.rs` — SponsorBlock segment lookup
 - `src/ytdlp.rs` — `yt-dlp` fallback resolver & offline downloader
-- `src/model.rs` & `src/theme.rs` — Data models, YouTube dark palette, bundled fonts & icons
+- `src/model.rs` & `src/theme.rs` — Data models, YouTube dark palette, custom vector icons, bundled fonts & app icon
+- `build.rs` — Windows resource & SegmentHeap manifest embedding via `winresource`
 
 ## Build & Run
 

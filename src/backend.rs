@@ -1,8 +1,10 @@
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use serde::{Deserialize, Serialize};
 
 use crate::auth::Session;
 use crate::innertube::{self, FeedPage, WebConfig};
@@ -94,6 +96,9 @@ pub enum Request {
     SignIn,
     SignOut,
     DownloadLibmpv,
+    ResolveChannelAvatars {
+        channel_ids: Vec<String>,
+    },
 }
 
 pub enum Response {
@@ -180,6 +185,8 @@ pub enum Response {
         video_id: String,
         options: Vec<PlaylistOption>,
     },
+    PlaylistThumbsResolved(HashMap<String, String>),
+    ChannelAvatarsResolved(HashMap<String, String>),
     PlaylistCreated {
         title: String,
     },
@@ -234,15 +241,137 @@ impl PlaybackCursor {
     }
 }
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct ThumbDiskCache {
+    playlist_thumbs: HashMap<String, String>,
+    channel_avatars: HashMap<String, String>,
+}
+
+impl ThumbDiskCache {
+    fn load(dir: &Path) -> Self {
+        let Ok(raw) = std::fs::read_to_string(dir.join("thumb_caches.json")) else {
+            return Self::default();
+        };
+        serde_json::from_str(&raw).unwrap_or_default()
+    }
+
+    fn save(&self, dir: &Path) {
+        if self.playlist_thumbs.is_empty() && self.channel_avatars.is_empty() {
+            return;
+        }
+        if let Ok(json) = serde_json::to_string(self) {
+            let _ = std::fs::write(dir.join("thumb_caches.json"), json);
+        }
+    }
+}
+
+async fn load_guide_and_backfill_thumbs(
+    http: reqwest::Client,
+    cfg: WebConfig,
+    session: Session,
+    thumb_cache: Arc<Mutex<ThumbDiskCache>>,
+    data_dir: PathBuf,
+    resp_tx: Sender<Response>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+) {
+    let Ok((channels, mut playlists)) = innertube::fetch_guide_fast(&http, &cfg, &session).await
+    else {
+        return;
+    };
+
+    let mut missing = Vec::new();
+    {
+        let mut tc = thumb_cache.lock().unwrap();
+        let mut cache_dirty = false;
+        for ch in &channels {
+            if let Some(av) = &ch.avatar_url {
+                if tc
+                    .channel_avatars
+                    .insert(ch.browse_id.clone(), av.clone())
+                    .as_deref()
+                    != Some(av.as_str())
+                {
+                    cache_dirty = true;
+                }
+            }
+        }
+        for pl in &mut playlists {
+            let key = pl.browse_id.strip_prefix("VL").unwrap_or(&pl.browse_id);
+            if let Some(thumb) = &pl.thumbnail_url {
+                if tc
+                    .playlist_thumbs
+                    .insert(key.to_owned(), thumb.clone())
+                    .as_deref()
+                    != Some(thumb.as_str())
+                {
+                    cache_dirty = true;
+                }
+            } else if let Some(cached) = tc.playlist_thumbs.get(key) {
+                pl.thumbnail_url = Some(cached.clone());
+            } else if !pl.browse_id.is_empty() {
+                missing.push(pl.browse_id.clone());
+            }
+        }
+        if cache_dirty {
+            tc.save(&data_dir);
+        }
+    }
+
+    let _ = resp_tx.send(Response::GuideLoaded {
+        channels,
+        playlists,
+    });
+    wake();
+
+    if !missing.is_empty() {
+        let resolved =
+            innertube::fetch_missing_playlist_thumbs(&http, missing, &cfg, &session).await;
+        if !resolved.is_empty() {
+            {
+                let mut tc = thumb_cache.lock().unwrap();
+                for (pid, url) in &resolved {
+                    tc.playlist_thumbs.insert(pid.clone(), url.clone());
+                }
+                tc.save(&data_dir);
+            }
+            let _ = resp_tx.send(Response::PlaylistThumbsResolved(resolved));
+            wake();
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Backend {
     pub tx: Sender<Request>,
     pub rx: Receiver<Response>,
     pub data_dir: PathBuf,
     proxy: Option<StreamProxy>,
     pub cursor: Arc<PlaybackCursor>,
+    http: reqwest::Client,
+    rt: tokio::runtime::Handle,
+    wake: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl Backend {
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    pub fn http(&self) -> reqwest::Client {
+        self.http.clone()
+    }
+
+    pub fn spawn_task<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.rt.spawn(fut);
+    }
+
+    pub fn wake(&self) {
+        (self.wake)();
+    }
+
     pub fn proxy_url(&self, raw_url: &str, content_length: u64) -> String {
         match &self.proxy {
             Some(p) => p.register(raw_url, content_length),
@@ -258,22 +387,27 @@ impl Backend {
         let cursor_bg = cursor.clone();
         let dir_clone = data_dir.clone();
 
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let rt_handle = rt.handle().clone();
+        let http = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .build()
+            .expect("reqwest client");
+        let http_for_struct = http.clone();
+        let wake_for_struct = wake.clone();
+
         std::thread::Builder::new()
             .name("yt-rust-backend".into())
             .spawn(move || {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .expect("tokio runtime");
                 rt.block_on(async move {
-                    let http = reqwest::Client::builder()
-                        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                        .build()
-                        .expect("reqwest client");
-
                     let proxy = StreamProxy::start(http.clone()).await.ok();
                     let _ = proxy_tx.send(proxy.clone());
 
+                    let thumb_cache = Arc::new(Mutex::new(ThumbDiskCache::load(&dir_clone)));
+                    ytdlp::remove_leftover_cookies(&dir_clone);
                     let mut session = Session::load(&dir_clone);
                     let mut cfg = innertube::fetch_web_config(&http, session.as_ref()).await;
 
@@ -296,12 +430,15 @@ impl Backend {
                             });
                             wake();
                         }
-                        if let Ok((channels, playlists)) =
-                            innertube::fetch_guide(&http, &cfg, s).await
-                        {
-                            let _ = resp_tx.send(Response::GuideLoaded { channels, playlists });
-                            wake();
-                        }
+                        tokio::spawn(load_guide_and_backfill_thumbs(
+                            http.clone(),
+                            cfg.clone(),
+                            s.clone(),
+                            thumb_cache.clone(),
+                            dir_clone.clone(),
+                            resp_tx.clone(),
+                            wake.clone(),
+                        ));
                     }
 
                     while let Ok(req) = req_rx.recv() {
@@ -309,6 +446,7 @@ impl Backend {
                         let resp_tx = resp_tx.clone();
                         let wake = wake.clone();
                         let data_dir = dir_clone.clone();
+                        let thumb_cache = thumb_cache.clone();
 
                         match req {
                             Request::LoadHome { params, continuation } => {
@@ -736,11 +874,50 @@ impl Backend {
                                     )
                                     .await
                                     {
-                                        Ok(options) => {
+                                        Ok(mut options) => {
+                                            let mut missing = Vec::new();
+                                            {
+                                                let tc = thumb_cache.lock().unwrap();
+                                                for opt in &mut options {
+                                                    if opt.thumbnail_url.is_none() {
+                                                        if let Some(cached) =
+                                                            tc.playlist_thumbs.get(&opt.id)
+                                                        {
+                                                            opt.thumbnail_url = Some(cached.clone());
+                                                        } else if opt.id != "WL" {
+                                                            missing.push(opt.id.clone());
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             let _ = resp_tx.send(Response::PlaylistOptionsLoaded {
                                                 video_id,
                                                 options,
                                             });
+                                            wake();
+                                            if !missing.is_empty() {
+                                                let resolved =
+                                                    innertube::fetch_missing_playlist_thumbs(
+                                                        &http,
+                                                        missing,
+                                                        &cfg_clone,
+                                                        &s,
+                                                    )
+                                                    .await;
+                                                if !resolved.is_empty() {
+                                                    {
+                                                        let mut tc = thumb_cache.lock().unwrap();
+                                                        for (pid, url) in &resolved {
+                                                            tc.playlist_thumbs
+                                                                .insert(pid.clone(), url.clone());
+                                                        }
+                                                        tc.save(&data_dir);
+                                                    }
+                                                    let _ = resp_tx.send(
+                                                        Response::PlaylistThumbsResolved(resolved),
+                                                    );
+                                                }
+                                            }
                                         }
                                         Err(e) => {
                                             let _ = resp_tx.send(Response::Error(format!(
@@ -774,14 +951,16 @@ impl Backend {
                                             let _ = resp_tx.send(Response::PlaylistCreated {
                                                 title,
                                             });
-                                            if let Ok((channels, playlists)) =
-                                                innertube::fetch_guide(&http, &cfg_clone, &s).await
-                                            {
-                                                let _ = resp_tx.send(Response::GuideLoaded {
-                                                    channels,
-                                                    playlists,
-                                                });
-                                            }
+                                            load_guide_and_backfill_thumbs(
+                                                http,
+                                                cfg_clone,
+                                                s,
+                                                thumb_cache,
+                                                data_dir,
+                                                resp_tx.clone(),
+                                                wake.clone(),
+                                            )
+                                            .await;
                                         }
                                         Err(e) => {
                                             let _ = resp_tx.send(Response::Error(format!(
@@ -884,11 +1063,13 @@ impl Backend {
                                 max_height,
                                 output_dir,
                             } => {
+                                let cookie = session.as_ref().map(|s| s.cookie.clone());
                                 tokio::spawn(async move {
                                     let result = ytdlp::download_video(
                                         &http,
                                         &data_dir,
                                         output_dir.as_deref(),
+                                        cookie.as_deref(),
                                         &video_id,
                                         audio_only,
                                         max_height,
@@ -1024,14 +1205,15 @@ impl Backend {
                                                 });
                                             }
                                             if let Some(ref s) = session {
-                                                if let Ok((channels, playlists)) =
-                                                    innertube::fetch_guide(&http, &cfg, s).await
-                                                {
-                                                    let _ = resp_tx.send(Response::GuideLoaded {
-                                                        channels,
-                                                        playlists,
-                                                    });
-                                                }
+                                                tokio::spawn(load_guide_and_backfill_thumbs(
+                                                    http.clone(),
+                                                    cfg.clone(),
+                                                    s.clone(),
+                                                    thumb_cache.clone(),
+                                                    data_dir.clone(),
+                                                    resp_tx.clone(),
+                                                    wake.clone(),
+                                                ));
                                             }
                                         }
                                         login::Outcome::Cancelled => {}
@@ -1059,6 +1241,49 @@ impl Backend {
                                     wake();
                                 });
                             }
+                            Request::ResolveChannelAvatars { channel_ids } => {
+                                let cfg_clone = cfg.clone();
+                                let sess_clone = session.clone();
+                                tokio::spawn(async move {
+                                    let mut resolved = HashMap::new();
+                                    let mut missing = Vec::new();
+                                    {
+                                        let tc = thumb_cache.lock().unwrap();
+                                        for cid in channel_ids {
+                                            if let Some(av) = tc.channel_avatars.get(&cid) {
+                                                resolved.insert(cid, av.clone());
+                                            } else {
+                                                missing.push(cid);
+                                            }
+                                        }
+                                    }
+                                    if !missing.is_empty() {
+                                        let fetched = innertube::fetch_channel_avatars(
+                                            &http,
+                                            missing,
+                                            &cfg_clone,
+                                            sess_clone.as_ref(),
+                                        )
+                                        .await;
+                                        if !fetched.is_empty() {
+                                            {
+                                                let mut tc = thumb_cache.lock().unwrap();
+                                                for (cid, av) in &fetched {
+                                                    tc.channel_avatars
+                                                        .insert(cid.clone(), av.clone());
+                                                }
+                                                tc.save(&data_dir);
+                                            }
+                                            resolved.extend(fetched);
+                                        }
+                                    }
+                                    if !resolved.is_empty() {
+                                        let _ = resp_tx
+                                            .send(Response::ChannelAvatarsResolved(resolved));
+                                        wake();
+                                    }
+                                });
+                            }
                         }
                     }
                 });
@@ -1072,6 +1297,9 @@ impl Backend {
             data_dir,
             proxy,
             cursor,
+            http: http_for_struct,
+            rt: rt_handle,
+            wake: wake_for_struct,
         }
     }
 }
@@ -1190,7 +1418,14 @@ async fn resolve_watch(
                     used_ytdlp: false,
                 });
             }
-            let yt = ytdlp::resolve_video(http, data_dir, video_id, quality.max_height()).await?;
+            let yt = ytdlp::resolve_video(
+                http,
+                data_dir,
+                session.map(|s| s.cookie.as_str()),
+                video_id,
+                quality.max_height(),
+            )
+            .await?;
             Ok(Response::WatchReady {
                 selected_video_url: yt.video_url,
                 selected_audio_url: yt.audio_url,
@@ -1201,7 +1436,14 @@ async fn resolve_watch(
         }
         Err(inner_err) => {
             log::warn!("InnerTube watch failed ({inner_err:#}), falling back to yt-dlp");
-            let yt = ytdlp::resolve_video(http, data_dir, video_id, quality.max_height()).await?;
+            let yt = ytdlp::resolve_video(
+                http,
+                data_dir,
+                session.map(|s| s.cookie.as_str()),
+                video_id,
+                quality.max_height(),
+            )
+            .await?;
             let data = WatchData {
                 id: video_id.to_owned(),
                 title: yt.title.unwrap_or_else(|| format!("Video {video_id}")),

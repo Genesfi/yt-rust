@@ -2,6 +2,7 @@
 
 mod auth;
 mod backend;
+mod images;
 mod innertube;
 mod login;
 mod model;
@@ -147,8 +148,6 @@ fn main() -> eframe::Result {
         "yt-rust",
         options,
         Box::new(move |cc| {
-            egui_extras::install_image_loaders(&cc.egui_ctx);
-
             static CTX: OnceLock<egui::Context> = OnceLock::new();
             let _ = CTX.set(cc.egui_ctx.clone());
             let wake = Arc::new(|| {
@@ -158,6 +157,12 @@ fn main() -> eframe::Result {
             });
 
             let backend = backend::Backend::spawn(dir, wake);
+            egui_extras::install_image_loaders(&cc.egui_ctx);
+            cc.egui_ctx
+                .add_bytes_loader(Arc::new(images::HttpImages::new(backend.clone())));
+            cc.egui_ctx
+                .add_texture_loader(Arc::new(images::Textures::default()));
+
             Ok(Box::new(ui::YtApp::new(cc, backend)))
         }),
     )

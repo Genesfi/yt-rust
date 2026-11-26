@@ -4,7 +4,7 @@ mod sidebar;
 mod topbar;
 mod watch;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -47,6 +47,22 @@ pub(super) enum RightTab {
     LiveChat,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum NavEntry {
+    Home,
+    Subscriptions,
+    Trending,
+    Playlists,
+    Playlist { browse_id: String, title: String },
+    Channel { channel_id: String, name: String },
+    Search { query: String },
+    Watch { video_id: String },
+    History,
+    Saved,
+    Downloads,
+    Settings,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum PlayerMenu {
     None,
@@ -73,6 +89,11 @@ pub struct YtApp {
 
     pub(super) page: Page,
     pub(super) prev_page: Page,
+    pub(super) active_watch_id: Option<String>,
+    pub(super) nav_back: Vec<NavEntry>,
+    pub(super) nav_forward: Vec<NavEntry>,
+    pub(super) last_nav: NavEntry,
+    pub(super) nav_applying: bool,
     pub(super) sidebar_expanded: bool,
 
     pub(super) signed_in: bool,
@@ -137,6 +158,7 @@ pub struct YtApp {
     pub(super) remote_history_loading: bool,
     pub(super) saved: Vec<VideoItem>,
     pub(super) queue: Vec<VideoItem>,
+    pub(super) queue_drag_idx: Option<usize>,
     pub(super) resume_positions: HashMap<String, f64>,
     pub(super) pending_resume: Option<(String, f64, Option<f32>)>,
 
@@ -196,6 +218,8 @@ pub struct YtApp {
     pub(super) playlist_options_loading: bool,
     pub(super) playlist_filter: String,
     pub(super) new_playlist_title: String,
+    pub(super) channel_avatars: HashMap<String, String>,
+    pub(super) avatar_requested: HashSet<String>,
 }
 
 pub(super) const GUEST_TOPICS: &[(&str, Option<&str>)] = &[
@@ -302,6 +326,7 @@ impl YtApp {
             p.set_hwdec(hwdec_mode);
         }
 
+        let mut queue = load_queue_file(&backend.data_dir);
         let last_watched = load_last_watched_file(&backend.data_dir);
         if let Some(ref lw) = last_watched {
             if lw.position_secs > 2.0 {
@@ -322,6 +347,11 @@ impl YtApp {
             downloading_mpv: false,
             page: Page::Home,
             prev_page: Page::Home,
+            active_watch_id: None,
+            nav_back: Vec::new(),
+            nav_forward: Vec::new(),
+            last_nav: NavEntry::Home,
+            nav_applying: false,
             sidebar_expanded,
             signed_in: false,
             signing_in: false,
@@ -376,6 +406,7 @@ impl YtApp {
             remote_history_loading: false,
             saved,
             queue: Vec::new(),
+            queue_drag_idx: None,
             resume_positions,
             pending_resume: None,
             watch_loading: false,
@@ -393,6 +424,8 @@ impl YtApp {
             live_chat: Vec::new(),
             live_chat_token: None,
             live_chat_next_poll: None,
+            channel_avatars: HashMap::new(),
+            avatar_requested: HashSet::new(),
             right_tab: RightTab::UpNext,
             playback: PlaybackState::default(),
             seeking_pos: None,
@@ -429,9 +462,14 @@ impl YtApp {
             playlist_filter: String::new(),
             new_playlist_title: String::new(),
         };
+        if !queue.is_empty() {
+            app.ingest_and_request_avatars(&mut queue);
+            app.queue = queue;
+        }
         if app.auto_resume_on_start && app.last_watched.is_some() {
             app.resume_last_watched();
         }
+        app.last_nav = app.current_nav_entry();
         app
     }
 
@@ -465,6 +503,13 @@ impl YtApp {
             self.resume_positions.insert(lw.id.clone(), lw.position_secs);
         }
         self.open_video_id(&lw.id);
+        if !self.queue.is_empty() {
+            self.right_tab = RightTab::Queue;
+        }
+    }
+
+    pub(super) fn persist_queue(&self) {
+        save_queue_file(&self.backend.data_dir, &self.queue);
     }
 
     pub(super) fn clear_last_watched(&mut self) {
@@ -582,6 +627,7 @@ impl YtApp {
             .to_owned();
         let path_str = path.to_string_lossy().into_owned();
         self.page = Page::Watch;
+        self.active_watch_id = Some(format!("local:{}", title));
         self.watch_scrolled_into_pip = false;
         self.scroll_watch_to_top = true;
         self.watch_loading = false;
@@ -602,7 +648,9 @@ impl YtApp {
         self.live_chat.clear();
         self.live_chat_token = None;
         self.live_chat_next_poll = None;
-        self.right_tab = RightTab::UpNext;
+        if !(self.right_tab == RightTab::Queue && !self.queue.is_empty()) {
+            self.right_tab = RightTab::UpNext;
+        }
         self.watch = Some(WatchData {
             id: format!("local:{}", title),
             title,
@@ -643,6 +691,7 @@ impl YtApp {
             self.prev_page = self.page;
         }
         self.page = Page::Watch;
+        self.active_watch_id = Some(video_id.to_owned());
         self.watch_scrolled_into_pip = false;
         self.scroll_watch_to_top = true;
         self.watch_loading = true;
@@ -661,7 +710,9 @@ impl YtApp {
         self.live_chat.clear();
         self.live_chat_token = None;
         self.live_chat_next_poll = None;
-        self.right_tab = RightTab::UpNext;
+        if !(self.right_tab == RightTab::Queue && !self.queue.is_empty()) {
+            self.right_tab = RightTab::UpNext;
+        }
         let _ = self.backend.tx.send(Request::Watch {
             video_id: video_id.to_owned(),
             quality: self.preferred_quality,
@@ -757,6 +808,56 @@ impl YtApp {
         }
     }
 
+    fn ingest_and_request_avatars(&mut self, items: &mut [VideoItem]) {
+        let mut missing = Vec::new();
+        for it in items.iter_mut() {
+            if let Some(cid) = it.channel_id.as_ref().filter(|c| c.starts_with("UC")) {
+                if let Some(av) = &it.channel_avatar_url {
+                    self.channel_avatars.insert(cid.clone(), av.clone());
+                } else if let Some(cached) = self.channel_avatars.get(cid) {
+                    it.channel_avatar_url = Some(cached.clone());
+                } else if !self.avatar_requested.contains(cid) && missing.len() < 36 {
+                    self.avatar_requested.insert(cid.clone());
+                    missing.push(cid.clone());
+                }
+            }
+        }
+        if !missing.is_empty() {
+            let _ = self
+                .backend
+                .tx
+                .send(Request::ResolveChannelAvatars { channel_ids: missing });
+        }
+    }
+
+    fn patch_all_channel_avatars(&mut self) {
+        let map = &self.channel_avatars;
+        let patch = |list: &mut [VideoItem]| {
+            for it in list {
+                if it.channel_avatar_url.is_none() {
+                    if let Some(cid) = &it.channel_id {
+                        if let Some(av) = map.get(cid) {
+                            it.channel_avatar_url = Some(av.clone());
+                        }
+                    }
+                }
+            }
+        };
+        patch(&mut self.home_items);
+        patch(&mut self.subs_items);
+        patch(&mut self.playlist_items);
+        patch(&mut self.trending_items);
+        patch(&mut self.channel_items);
+        patch(&mut self.search_items);
+        patch(&mut self.remote_history);
+        patch(&mut self.history);
+        patch(&mut self.saved);
+        patch(&mut self.queue);
+        if let Some(w) = &mut self.watch {
+            patch(&mut w.related);
+        }
+    }
+
     pub(super) fn open_playlist_picker(&mut self, video: VideoItem) {
         self.playlist_filter.clear();
         self.new_playlist_title.clear();
@@ -799,12 +900,14 @@ impl YtApp {
                 self.queue.retain(|x| x.id != it.id);
                 let title = it.title.clone();
                 self.queue.insert(0, it);
+                self.persist_queue();
                 self.toast(format!("Playing next: {title}"));
             }
             GridAction::AddQueue(it) => {
                 if !self.queue.iter().any(|x| x.id == it.id) {
                     let title = it.title.clone();
                     self.queue.push(it);
+                    self.persist_queue();
                     self.toast(format!("Queued: {title}"));
                 } else {
                     self.toast("Already in Queue");
@@ -853,6 +956,171 @@ impl YtApp {
         ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
     }
 
+    fn current_nav_entry(&self) -> NavEntry {
+        match self.page {
+            Page::Home => NavEntry::Home,
+            Page::Subscriptions => NavEntry::Subscriptions,
+            Page::Trending => NavEntry::Trending,
+            Page::Playlists => NavEntry::Playlists,
+            Page::Playlist => NavEntry::Playlist {
+                browse_id: self.active_playlist_id.clone().unwrap_or_default(),
+                title: self.active_playlist_title.clone(),
+            },
+            Page::Channel => NavEntry::Channel {
+                channel_id: self.channel_id.clone().unwrap_or_default(),
+                name: self.channel_name.clone(),
+            },
+            Page::Search => NavEntry::Search {
+                query: self.active_query.clone(),
+            },
+            Page::Watch => NavEntry::Watch {
+                video_id: self
+                    .active_watch_id
+                    .clone()
+                    .or_else(|| self.watch.as_ref().map(|w| w.id.clone()))
+                    .unwrap_or_default(),
+            },
+            Page::History => NavEntry::History,
+            Page::Saved => NavEntry::Saved,
+            Page::Downloads => NavEntry::Downloads,
+            Page::Settings => NavEntry::Settings,
+        }
+    }
+
+    fn apply_nav_entry(&mut self, entry: NavEntry) {
+        match entry {
+            NavEntry::Home => {
+                self.page = Page::Home;
+                if self.home_items.is_empty() && !self.home_loading {
+                    self.home_loading = true;
+                    let _ = self.backend.tx.send(Request::LoadHome {
+                        params: None,
+                        continuation: None,
+                    });
+                }
+            }
+            NavEntry::Subscriptions => {
+                self.page = Page::Subscriptions;
+                if self.signed_in && self.subs_items.is_empty() && !self.subs_loading {
+                    self.subs_loading = true;
+                    let _ = self
+                        .backend
+                        .tx
+                        .send(Request::LoadSubscriptions { continuation: None });
+                }
+            }
+            NavEntry::Trending => {
+                self.page = Page::Trending;
+                if self.trending_items.is_empty() && !self.trending_loading {
+                    self.trending_loading = true;
+                    let _ = self.backend.tx.send(Request::LoadTrending);
+                }
+            }
+            NavEntry::Playlists => {
+                self.page = Page::Playlists;
+            }
+            NavEntry::Playlist { browse_id, title } => {
+                if self.active_playlist_id.as_deref() == Some(browse_id.as_str())
+                    && !self.playlist_items.is_empty()
+                {
+                    self.page = Page::Playlist;
+                } else if !browse_id.is_empty() {
+                    self.open_playlist(browse_id, title);
+                }
+            }
+            NavEntry::Channel { channel_id, name } => {
+                if self.channel_id.as_deref() == Some(channel_id.as_str())
+                    && !self.channel_items.is_empty()
+                {
+                    self.page = Page::Channel;
+                } else if !channel_id.is_empty() {
+                    self.open_channel(channel_id, name);
+                }
+            }
+            NavEntry::Search { query } => {
+                if self.active_query == query && !self.search_items.is_empty() {
+                    self.page = Page::Search;
+                } else if !query.is_empty() {
+                    self.search_input = query.clone();
+                    self.active_query = query.clone();
+                    self.page = Page::Search;
+                    self.search_items.clear();
+                    self.search_continuation = None;
+                    self.search_loading = true;
+                    let _ = self.backend.tx.send(Request::Search {
+                        query,
+                        continuation: None,
+                    });
+                }
+            }
+            NavEntry::Watch { video_id } => {
+                if self.watch.as_ref().is_some_and(|w| w.id == video_id)
+                    && self.active_watch_id.as_deref() == Some(video_id.as_str())
+                {
+                    self.page = Page::Watch;
+                    self.watch_scrolled_into_pip = false;
+                    self.scroll_watch_to_top = true;
+                } else if !video_id.is_empty() && !video_id.starts_with("local:") {
+                    self.open_video_id(&video_id);
+                } else if self.watch.is_some() {
+                    self.page = Page::Watch;
+                }
+            }
+            NavEntry::History => {
+                self.page = Page::History;
+                if self.signed_in
+                    && self.sync_history
+                    && self.remote_history.is_empty()
+                    && !self.remote_history_loading
+                {
+                    self.remote_history_loading = true;
+                    let _ = self
+                        .backend
+                        .tx
+                        .send(Request::LoadHistory { continuation: None });
+                }
+            }
+            NavEntry::Saved => self.page = Page::Saved,
+            NavEntry::Downloads => self.page = Page::Downloads,
+            NavEntry::Settings => self.page = Page::Settings,
+        }
+    }
+
+    pub(super) fn nav_go_back(&mut self) {
+        if let Some(target) = self.nav_back.pop() {
+            let cur = self.current_nav_entry();
+            self.nav_forward.push(cur);
+            self.nav_applying = true;
+            self.apply_nav_entry(target);
+        } else if self.page == Page::Watch {
+            self.page = self.prev_page;
+        }
+    }
+
+    pub(super) fn nav_go_forward(&mut self) {
+        if let Some(target) = self.nav_forward.pop() {
+            let cur = self.current_nav_entry();
+            self.nav_back.push(cur);
+            self.nav_applying = true;
+            self.apply_nav_entry(target);
+        }
+    }
+
+    fn record_nav_transition(&mut self) {
+        let cur = self.current_nav_entry();
+        if cur != self.last_nav {
+            if !self.nav_applying {
+                if self.nav_back.len() >= 50 {
+                    self.nav_back.remove(0);
+                }
+                self.nav_back.push(self.last_nav.clone());
+                self.nav_forward.clear();
+            }
+            self.last_nav = cur;
+        }
+        self.nav_applying = false;
+    }
+
     fn drain_backend(&mut self, ctx: &egui::Context) {
         while let Ok(resp) = self.backend.rx.try_recv() {
             match resp {
@@ -866,6 +1134,7 @@ impl YtApp {
                     self.home_loading = false;
                     self.home_is_fallback = is_fallback_trending;
                     self.ingest_resume_metadata(&mut items);
+                    self.ingest_and_request_avatars(&mut items);
                     if !chips.is_empty() {
                         self.home_chips = chips;
                     }
@@ -887,6 +1156,7 @@ impl YtApp {
                 } => {
                     self.subs_loading = false;
                     self.ingest_resume_metadata(&mut items);
+                    self.ingest_and_request_avatars(&mut items);
                     if append {
                         for it in items {
                             if !self.subs_items.iter().any(|x| x.id == it.id) {
@@ -905,6 +1175,7 @@ impl YtApp {
                 } => {
                     self.remote_history_loading = false;
                     self.ingest_resume_metadata(&mut items);
+                    self.ingest_and_request_avatars(&mut items);
                     if append {
                         for it in items {
                             if !self.remote_history.iter().any(|x| x.id == it.id) {
@@ -920,8 +1191,14 @@ impl YtApp {
                     channels,
                     playlists,
                 } => {
+                    for ch in &channels {
+                        if let Some(av) = &ch.avatar_url {
+                            self.channel_avatars.insert(ch.browse_id.clone(), av.clone());
+                        }
+                    }
                     self.guide_channels = channels;
                     self.guide_playlists = playlists;
+                    self.patch_all_channel_avatars();
                 }
                 Response::PlaylistLoaded {
                     browse_id,
@@ -944,6 +1221,7 @@ impl YtApp {
                     if self.active_playlist_id.as_deref() == Some(browse_id.as_str()) {
                         self.playlist_loading = false;
                         self.ingest_resume_metadata(&mut items);
+                        self.ingest_and_request_avatars(&mut items);
                         if !title.is_empty() {
                             self.active_playlist_title = title;
                         }
@@ -962,6 +1240,7 @@ impl YtApp {
                 Response::TrendingLoaded { mut items } => {
                     self.trending_loading = false;
                     self.ingest_resume_metadata(&mut items);
+                    self.ingest_and_request_avatars(&mut items);
                     self.trending_items = items;
                 }
                 Response::ChannelLoaded {
@@ -1001,6 +1280,7 @@ impl YtApp {
                     if query == self.active_query {
                         self.search_loading = false;
                         self.ingest_resume_metadata(&mut items);
+                        self.ingest_and_request_avatars(&mut items);
                         if append {
                             for it in items {
                                 if !self.search_items.iter().any(|x| x.id == it.id) {
@@ -1019,12 +1299,16 @@ impl YtApp {
                     }
                 }
                 Response::WatchReady {
-                    data,
+                    mut data,
                     selected_video_url,
                     selected_audio_url,
                     selected_format_idx,
                     used_ytdlp,
                 } => {
+                    if let (Some(cid), Some(av)) = (&data.channel_id, &data.channel_avatar_url) {
+                        self.channel_avatars.insert(cid.clone(), av.clone());
+                    }
+                    self.ingest_and_request_avatars(&mut data.related);
                     self.watch_loading = false;
                     self.selected_format_idx = selected_format_idx;
                     self.selected_audio_idx = 0;
@@ -1207,6 +1491,29 @@ impl YtApp {
                         }
                     }
                 }
+                Response::PlaylistThumbsResolved(resolved) => {
+                    for gp in &mut self.guide_playlists {
+                        let key = gp.browse_id.strip_prefix("VL").unwrap_or(&gp.browse_id);
+                        if gp.thumbnail_url.is_none() {
+                            if let Some(url) = resolved.get(key) {
+                                gp.thumbnail_url = Some(url.clone());
+                            }
+                        }
+                    }
+                    for opt in &mut self.playlist_options {
+                        if opt.thumbnail_url.is_none() {
+                            if let Some(url) = resolved.get(&opt.id) {
+                                opt.thumbnail_url = Some(url.clone());
+                            }
+                        }
+                    }
+                }
+                Response::ChannelAvatarsResolved(resolved) => {
+                    for (cid, av) in resolved {
+                        self.channel_avatars.insert(cid, av);
+                    }
+                    self.patch_all_channel_avatars();
+                }
                 Response::PlaylistCreated { title } => {
                     self.toast(format!("Created playlist \"{title}\""));
                 }
@@ -1313,7 +1620,31 @@ impl YtApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let (mouse_back, mouse_forward, alt_back, alt_forward) = ctx.input(|i| {
+            (
+                i.pointer.button_pressed(egui::PointerButton::Extra1),
+                i.pointer.button_pressed(egui::PointerButton::Extra2),
+                i.modifiers.alt && i.key_pressed(Key::ArrowLeft),
+                i.modifiers.alt && i.key_pressed(Key::ArrowRight),
+            )
+        });
+        if mouse_back {
+            self.nav_go_back();
+            return;
+        }
+        if mouse_forward {
+            self.nav_go_forward();
+            return;
+        }
         if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        if alt_back {
+            self.nav_go_back();
+            return;
+        }
+        if alt_forward {
+            self.nav_go_forward();
             return;
         }
         let mut hud_msg: Option<(HudIcon, &'static str)> = None;
@@ -1509,6 +1840,7 @@ impl YtApp {
         if self.autoplay_next && self.playback.eof && !was_eof && self.playback.duration > 1.0 {
             if !self.queue.is_empty() {
                 let next = self.queue.remove(0);
+                self.persist_queue();
                 self.open_video(next);
             } else if let Some(next) = self.watch.as_ref().and_then(|w| w.related.first()).cloned()
             {
@@ -1520,6 +1852,7 @@ impl YtApp {
 
 impl eframe::App for YtApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.persist_queue();
         storage.set_string("volume", format!("{:.1}", self.volume));
         storage.set_string(
             "sponsorblock",
@@ -1572,6 +1905,7 @@ impl eframe::App for YtApp {
 
     fn on_exit(&mut self, gl: Option<&glow::Context>) {
         self.flush_last_watched_now();
+        self.persist_queue();
         self.backend.cursor.stop();
         if let Some(mpv) = &self.mpv {
             mpv.destroy_gl(gl);
@@ -1732,6 +2066,7 @@ impl eframe::App for YtApp {
         }
         self.draw_playlist_picker_modal(&ctx);
         self.draw_toast_snackbar(&ctx);
+        self.record_nav_transition();
     }
 }
 
@@ -1772,6 +2107,34 @@ fn save_last_watched_file(data_dir: &std::path::Path, lw: &LastWatched) {
     if let Ok(json) = serde_json::to_string(lw) {
         let dest = last_watched_path(data_dir);
         let tmp = data_dir.join("last_watch.json.tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            if std::fs::rename(&tmp, &dest).is_err() {
+                let _ = std::fs::write(&dest, &json);
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+    }
+}
+
+fn queue_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("queue.json")
+}
+
+fn load_queue_file(data_dir: &std::path::Path) -> Vec<VideoItem> {
+    let Ok(raw) = std::fs::read_to_string(queue_path(data_dir)) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<VideoItem>>(&raw).unwrap_or_default()
+}
+
+fn save_queue_file(data_dir: &std::path::Path, queue: &[VideoItem]) {
+    let dest = queue_path(data_dir);
+    if queue.is_empty() {
+        let _ = std::fs::remove_file(&dest);
+        return;
+    }
+    if let Ok(json) = serde_json::to_string(queue) {
+        let tmp = data_dir.join("queue.json.tmp");
         if std::fs::write(&tmp, &json).is_ok() {
             if std::fs::rename(&tmp, &dest).is_err() {
                 let _ = std::fs::write(&dest, &json);

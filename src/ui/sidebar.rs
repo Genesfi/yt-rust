@@ -324,6 +324,7 @@ impl YtApp {
                                                 &mut pl_ui,
                                                 &pl.title,
                                                 &pl.subtitle,
+                                                pl.thumbnail_url.as_deref(),
                                                 active,
                                                 pl_alpha,
                                             ) {
@@ -509,7 +510,7 @@ impl YtApp {
             });
     }
 
-    fn open_subscriptions_feed(&mut self) {
+    pub(super) fn open_subscriptions_feed(&mut self) {
         self.page = Page::Subscriptions;
         if self.signed_in && self.subs_items.is_empty() && !self.subs_loading {
             self.subs_loading = true;
@@ -520,7 +521,7 @@ impl YtApp {
         }
     }
 
-    fn open_history_page(&mut self) {
+    pub(super) fn open_history_page(&mut self) {
         self.page = Page::History;
         if self.signed_in && self.sync_history && !self.remote_history_loading {
             self.remote_history_loading = true;
@@ -693,6 +694,7 @@ fn sidebar_playlist_item(
     ui: &mut egui::Ui,
     title: &str,
     subtitle: &str,
+    thumbnail_url: Option<&str>,
     active: bool,
     alpha: f32,
 ) -> bool {
@@ -717,13 +719,30 @@ fn sidebar_playlist_item(
     }
 
     let text_col = if active { Color32::WHITE } else { theme::TEXT }.gamma_multiply(alpha);
-    theme::draw_icon_centered(
-        ui.painter(),
-        pos2(rect.left() + 22.0, rect.center().y),
-        icon::LIST_MUSIC,
-        16.5,
-        text_col,
-    );
+    if let Some(thumb) = thumbnail_url.filter(|u| !u.is_empty()) {
+        if alpha > 0.15 {
+            let thumb_rect = Rect::from_min_size(
+                pos2(rect.left() + 10.0, rect.center().y - 8.0),
+                Vec2::new(24.0, 16.0),
+            );
+            theme::paint_image_rounded(ui, thumb, thumb_rect, 4);
+            if alpha < 0.98 {
+                ui.painter().rect_filled(
+                    thumb_rect,
+                    4.0,
+                    theme::BG.gamma_multiply(1.0 - alpha),
+                );
+            }
+        }
+    } else {
+        theme::draw_icon_centered(
+            ui.painter(),
+            pos2(rect.left() + 22.0, rect.center().y),
+            icon::LIST_MUSIC,
+            16.5,
+            text_col,
+        );
+    }
     let max_text_w = (rect.width() - 52.0).max(20.0);
     let display = truncate_text(ui, title, theme::regular(13.0), max_text_w);
     ui.painter().text(

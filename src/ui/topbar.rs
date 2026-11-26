@@ -59,10 +59,25 @@ impl YtApp {
 
                     ui.add_space(6.0);
 
-                    if self.page == Page::Watch {
-                        if icon_circle_button(ui, icon::CHEVRON_LEFT, 18.0, "Back") {
-                            self.page = self.prev_page;
-                        }
+                    if (!self.nav_back.is_empty() || self.page == Page::Watch)
+                        && icon_circle_button(ui, icon::CHEVRON_LEFT, 18.0, "Back (Mouse Back / Alt+Left)")
+                    {
+                        self.nav_go_back();
+                    }
+                    if !self.nav_forward.is_empty()
+                        && icon_circle_button(
+                            ui,
+                            icon::CHEVRON_RIGHT,
+                            18.0,
+                            "Forward (Mouse Forward / Alt+Right)",
+                        )
+                    {
+                        self.nav_go_forward();
+                    }
+                    if !self.nav_back.is_empty()
+                        || !self.nav_forward.is_empty()
+                        || self.page == Page::Watch
+                    {
                         ui.add_space(4.0);
                     }
 

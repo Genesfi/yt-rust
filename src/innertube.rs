@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -258,7 +258,7 @@ pub async fn history_feed(
     })
 }
 
-pub async fn fetch_guide(
+pub async fn fetch_guide_fast(
     http: &reqwest::Client,
     cfg: &WebConfig,
     session: &Session,
@@ -305,84 +305,165 @@ pub async fn fetch_guide(
     if let Ok(lib_val) = lib_res {
         merge_playlists_from_browse(&lib_val, &mut playlists);
     }
-
-    // Backfill remaining playlist thumbnails concurrently from their first video
-    let missing: Vec<(usize, String)> = playlists
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| p.thumbnail_url.is_none() && !p.browse_id.is_empty())
-        .take(24)
-        .map(|(i, p)| (i, p.browse_id.clone()))
-        .collect();
-    if !missing.is_empty() {
-        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(6));
-        let mut set = tokio::task::JoinSet::new();
-        for (idx, bid) in missing {
-            let http = http.clone();
-            let cfg = cfg.clone();
-            let session = session.clone();
-            let sem = sem.clone();
-            set.spawn(async move {
-                let _permit = sem.acquire_owned().await.ok()?;
-                let v = post_web(&http, "browse", json!({ "browseId": bid }), &cfg, Some(&session))
-                    .await
-                    .ok()?;
-                let thumb = extract_first_playlist_video_thumb(&v);
-                Some((idx, thumb))
-            });
-        }
-        while let Some(res) = set.join_next().await {
-            if let Ok(Some((idx, Some(thumb)))) = res {
-                if let Some(p) = playlists.get_mut(idx) {
-                    if p.thumbnail_url.is_none() {
-                        p.thumbnail_url = Some(thumb);
-                    }
-                }
-            }
-        }
-    }
-
     Ok((channels, playlists))
 }
 
+/// Fetches thumbnail URLs for playlists that lack one by inspecting each playlist's
+/// header banner or first video concurrently. Keys in the returned map are stripped
+/// of any `VL` prefix so both `GuideLoaded` (`VL...`) and `PlaylistOption` (`PL...`) match.
+pub async fn fetch_missing_playlist_thumbs(
+    http: &reqwest::Client,
+    playlist_ids: Vec<String>,
+    cfg: &WebConfig,
+    session: &Session,
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(10));
+    let mut set = tokio::task::JoinSet::new();
+    let mut seen = HashSet::new();
+
+    for raw in playlist_ids.into_iter().take(200) {
+        let stripped = raw.strip_prefix("VL").unwrap_or(&raw).to_owned();
+        if stripped.is_empty() || stripped == "WL" || !seen.insert(stripped.clone()) {
+            continue;
+        }
+        let bid = if raw.starts_with("VL") {
+            raw
+        } else {
+            format!("VL{stripped}")
+        };
+        let http = http.clone();
+        let cfg = cfg.clone();
+        let session = session.clone();
+        let sem = sem.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.ok()?;
+            let v = post_web(&http, "browse", json!({ "browseId": bid }), &cfg, Some(&session))
+                .await
+                .ok()?;
+            let thumb = extract_first_playlist_video_thumb(&v)?;
+            Some((stripped, thumb))
+        });
+    }
+
+    while let Some(res) = set.join_next().await {
+        if let Ok(Some((pid, thumb))) = res {
+            out.insert(pid, thumb);
+        }
+    }
+    out
+}
+
+/// Resolves channel avatar URLs concurrently from `browse(UC...)` for feed cards
+/// whose renderer (e.g. `playlistVideoRenderer`) omits channel thumbnails.
+pub async fn fetch_channel_avatars(
+    http: &reqwest::Client,
+    channel_ids: Vec<String>,
+    cfg: &WebConfig,
+    session: Option<&Session>,
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+    let mut set = tokio::task::JoinSet::new();
+    let mut seen = HashSet::new();
+
+    for cid in channel_ids.into_iter().take(36) {
+        if !cid.starts_with("UC") || !seen.insert(cid.clone()) {
+            continue;
+        }
+        let http = http.clone();
+        let cfg = cfg.clone();
+        let sess = session.cloned();
+        let sem = sem.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.ok()?;
+            let v = post_web(
+                &http,
+                "browse",
+                json!({ "browseId": cid }),
+                &cfg,
+                sess.as_ref(),
+            )
+            .await
+            .ok()?;
+            let avatar = extract_channel_avatar_from_browse(&v)?;
+            Some((cid, avatar))
+        });
+    }
+
+    while let Some(res) = set.join_next().await {
+        if let Ok(Some((cid, avatar))) = res {
+            out.insert(cid, avatar);
+        }
+    }
+    out
+}
+
+fn extract_channel_avatar_from_browse(v: &Value) -> Option<String> {
+    let c4 = &v["header"]["c4TabbedHeaderRenderer"];
+    let ph = &v["header"]["pageHeaderRenderer"]["content"]["pageHeaderViewModel"];
+    c4["avatar"]["thumbnails"]
+        .as_array()
+        .and_then(|a| a.last())
+        .and_then(|t| t["url"].as_str())
+        .map(normalize_url)
+        .or_else(|| find_first_thumb_url(&ph["image"]))
+        .or_else(|| find_first_thumb_url(&v["metadata"]["channelMetadataRenderer"]["avatar"]))
+}
+
 fn extract_first_playlist_video_thumb(v: &Value) -> Option<String> {
-    match v {
-        Value::Object(map) => {
-            for key in [
-                "playlistVideoRenderer",
-                "playlistPanelVideoRenderer",
-                "gridVideoRenderer",
-                "videoRenderer",
-            ] {
-                if let Some(item) = map.get(key) {
-                    if let Some(u) = find_first_thumb_url(&item["thumbnail"]) {
+    if let Some(u) = find_first_thumb_url(
+        &v["header"]["playlistHeaderRenderer"]["playlistHeaderBanner"]
+            ["heroPlaylistThumbnailRenderer"]["thumbnail"],
+    )
+    .or_else(|| {
+        find_first_thumb_url(
+            &v["header"]["pageHeaderRenderer"]["content"]["pageHeaderViewModel"]["heroImage"],
+        )
+    }) {
+        return Some(u);
+    }
+
+    fn walk(v: &Value) -> Option<String> {
+        match v {
+            Value::Object(map) => {
+                for key in [
+                    "playlistVideoRenderer",
+                    "playlistPanelVideoRenderer",
+                    "gridVideoRenderer",
+                    "videoRenderer",
+                ] {
+                    if let Some(item) = map.get(key) {
+                        if let Some(u) = find_first_thumb_url(&item["thumbnail"]) {
+                            return Some(u);
+                        }
+                        if let Some(vid) = item["videoId"].as_str() {
+                            return Some(format!("https://i.ytimg.com/vi/{vid}/mqdefault.jpg"));
+                        }
+                    }
+                }
+                if let Some(lm) = map.get("lockupViewModel") {
+                    if let Some(u) = find_first_thumb_url(&lm["contentImage"]) {
                         return Some(u);
                     }
-                    if let Some(vid) = item["videoId"].as_str() {
-                        return Some(format!("https://i.ytimg.com/vi/{vid}/mqdefault.jpg"));
+                    if let Some(vid) = lm["contentId"].as_str() {
+                        if vid.len() == 11 {
+                            return Some(format!("https://i.ytimg.com/vi/{vid}/mqdefault.jpg"));
+                        }
                     }
                 }
-            }
-            if let Some(lm) = map.get("lockupViewModel") {
-                if let Some(u) = find_first_thumb_url(&lm["contentImage"]) {
-                    return Some(u);
-                }
-                if let Some(vid) = lm["contentId"].as_str() {
-                    if vid.len() == 11 {
-                        return Some(format!("https://i.ytimg.com/vi/{vid}/mqdefault.jpg"));
+                for val in map.values() {
+                    if let Some(u) = walk(val) {
+                        return Some(u);
                     }
                 }
+                None
             }
-            for val in map.values() {
-                if let Some(u) = extract_first_playlist_video_thumb(val) {
-                    return Some(u);
-                }
-            }
-            None
+            Value::Array(arr) => arr.iter().find_map(walk),
+            _ => None,
         }
-        Value::Array(arr) => arr.iter().find_map(extract_first_playlist_video_thumb),
-        _ => None,
     }
+    walk(v)
 }
 
 fn find_first_thumb_url(v: &Value) -> Option<String> {
@@ -2533,7 +2614,9 @@ fn parse_video_renderer(vr: &Value) -> Option<VideoItem> {
         .as_array()
         .and_then(|a| a.first())
         .and_then(|t| t["url"].as_str())
-        .map(normalize_url);
+        .map(normalize_url)
+        .or_else(|| find_first_thumb_url(&vr["channelThumbnailSupportedRenderers"]))
+        .or_else(|| find_first_thumb_url(&vr["channelThumbnail"]));
     let views_text = text(&vr["shortViewCountText"])
         .or_else(|| text(&vr["viewCountText"]))
         .unwrap_or_default();
@@ -2661,12 +2744,7 @@ fn parse_lockup_view_model(lm: &Value) -> Option<VideoItem> {
         }
     }
 
-    let channel_avatar_url = meta["image"]["decoratedAvatarViewModel"]["avatar"]["avatarViewModel"]
-        ["image"]["sources"]
-        .as_array()
-        .and_then(|a| a.first())
-        .and_then(|s| s["url"].as_str())
-        .map(normalize_url);
+    let channel_avatar_url = find_first_thumb_url(&meta["image"]);
 
     let thumb_vm = &lm["contentImage"]["thumbnailViewModel"];
     let thumbnail_url = pick_thumb(&thumb_vm["image"]["sources"], &id);
@@ -2675,7 +2753,10 @@ fn parse_lockup_view_model(lm: &Value) -> Option<VideoItem> {
     let channel_id = meta["image"]["decoratedAvatarViewModel"]["rendererContext"]
         ["commandContext"]["onTap"]["innertubeCommand"]["browseEndpoint"]["browseId"]
         .as_str()
-        .map(str::to_owned);
+        .filter(|s| s.starts_with("UC"))
+        .map(str::to_owned)
+        .or_else(|| find_first_uc_browse_id(&meta["image"]))
+        .or_else(|| find_first_uc_browse_id(meta));
     let mut resume_secs = find_start_time_seconds(lm);
     if watched_percent.is_none() {
         if let (Some(rs), Some(dur)) = (resume_secs, parse_timestamp(&duration_text)) {
@@ -2706,6 +2787,29 @@ fn parse_lockup_view_model(lm: &Value) -> Option<VideoItem> {
         resume_secs,
         playlist_browse_id: None,
     })
+}
+
+fn find_first_uc_browse_id(v: &Value) -> Option<String> {
+    match v {
+        Value::Object(map) => {
+            if let Some(bid) = map
+                .get("browseEndpoint")
+                .and_then(|b| b.get("browseId"))
+                .and_then(|s| s.as_str())
+                .filter(|s| s.starts_with("UC"))
+            {
+                return Some(bid.to_owned());
+            }
+            for val in map.values() {
+                if let Some(bid) = find_first_uc_browse_id(val) {
+                    return Some(bid);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => arr.iter().find_map(find_first_uc_browse_id),
+        _ => None,
+    }
 }
 
 fn extract_lockup_thumb_meta(v: &Value) -> (String, Option<f32>) {

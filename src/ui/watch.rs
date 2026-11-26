@@ -581,6 +581,7 @@ impl YtApp {
                     any_interacted = true;
                     if !self.queue.is_empty() {
                         let v = self.queue.remove(0);
+                        self.persist_queue();
                         self.open_video(v);
                     } else {
                         self.open_video(next_vid);
@@ -1958,81 +1959,261 @@ impl YtApp {
         }
 
         if has_queue && self.right_tab == RightTab::Queue {
+            let mut clear_queue = false;
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(format!("{} queued", self.queue.len()))
-                        .font(theme::regular(12.0))
+                        .font(theme::semibold(12.5))
                         .color(theme::TEXT_DIM),
                 );
+                if self.queue.len() > 1 {
+                    ui.label(
+                        RichText::new("· Right-drag to reorder")
+                            .font(theme::regular(11.5))
+                            .color(theme::TEXT_FAINT),
+                    );
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui
-                        .small_button(format!("{} Clear", icon::TRASH_2))
-                        .clicked()
-                    {
-                        self.queue.clear();
-                        self.right_tab = RightTab::UpNext;
+                    let (crect, cresp) =
+                        ui.allocate_exact_size(Vec2::new(66.0, 26.0), Sense::click());
+                    let chov = ui
+                        .ctx()
+                        .animate_bool_with_time(cresp.id, cresp.hovered(), 0.12);
+                    if cresp.hovered() {
+                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    }
+                    ui.painter().rect_filled(
+                        crect,
+                        8.0,
+                        theme::lerp_color(theme::CHIP, theme::CHIP_HOVER, chov),
+                    );
+                    theme::draw_icon_centered(
+                        ui.painter(),
+                        pos2(crect.left() + 15.0, crect.center().y),
+                        icon::TRASH_2,
+                        12.5,
+                        theme::TEXT,
+                    );
+                    ui.painter().text(
+                        pos2(crect.left() + 26.0, crect.center().y),
+                        Align2::LEFT_CENTER,
+                        "Clear",
+                        theme::medium(12.0),
+                        theme::TEXT,
+                    );
+                    if cresp.clicked() {
+                        clear_queue = true;
                     }
                 });
             });
+            if clear_queue {
+                self.queue.clear();
+                self.queue_drag_idx = None;
+                self.persist_queue();
+                self.right_tab = RightTab::UpNext;
+                return;
+            }
             ui.add_space(6.0);
             let q_items = self.queue.clone();
             let mut play_idx = None;
             let mut remove_idx = None;
+            let mut queue_reordered = false;
+            let mut row_rects: Vec<(usize, Rect)> = Vec::with_capacity(q_items.len());
             ScrollArea::vertical().id_salt("queue_scroll").show(ui, |ui| {
                 for (qi, item) in q_items.iter().enumerate() {
                     let (row_rect, row_resp) = ui.allocate_exact_size(
                         Vec2::new(ui.available_width(), 82.0),
+                        Sense::click_and_drag(),
+                    );
+                    row_rects.push((qi, row_rect));
+
+                    if row_resp.drag_started_by(egui::PointerButton::Secondary) {
+                        self.queue_drag_idx = Some(qi);
+                    }
+                    let is_dragging = self.queue_drag_idx == Some(qi);
+                    let hover_t = ui
+                        .ctx()
+                        .animate_bool_with_time(row_resp.id, row_resp.hovered(), 0.12);
+                    if is_dragging {
+                        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                    } else if row_resp.hovered() {
+                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    }
+
+                    let row_fill = if is_dragging {
+                        theme::CHIP
+                    } else if hover_t > 0.01 {
+                        theme::SURFACE.gamma_multiply(hover_t)
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+                    if row_fill != Color32::TRANSPARENT {
+                        ui.painter().rect_filled(row_rect, 10.0, row_fill);
+                    }
+                    if is_dragging {
+                        ui.painter().rect_stroke(
+                            row_rect,
+                            10.0,
+                            Stroke::new(1.5, theme::YT_BLUE),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+
+                    let inner = row_rect.shrink(6.0);
+                    let num_w = 18.0;
+                    let remove_w = 28.0;
+                    let thumb_w = 122.0;
+                    let thumb_h = 68.0;
+                    let idx_pos = pos2(inner.left() + num_w * 0.5, inner.center().y);
+                    ui.painter().text(
+                        idx_pos,
+                        Align2::CENTER_CENTER,
+                        format!("{}", qi + 1),
+                        theme::semibold(11.5),
+                        if qi == 0 {
+                            theme::YT_BLUE
+                        } else {
+                            theme::TEXT_DIM
+                        },
+                    );
+
+                    let thumb_rect = Rect::from_min_size(
+                        pos2(inner.left() + num_w + 4.0, inner.center().y - thumb_h * 0.5),
+                        Vec2::new(thumb_w, thumb_h),
+                    );
+                    let mut thumb_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(thumb_rect)
+                            .layout(Layout::left_to_right(Align::Center)),
+                    );
+                    draw_thumbnail(
+                        &mut thumb_ui,
+                        &item.thumbnail_url,
+                        &item.duration_text,
+                        Vec2::new(thumb_w, thumb_h),
+                        7.0,
+                        item.watched_percent,
+                    );
+
+                    let x_rect = Rect::from_center_size(
+                        pos2(inner.right() - remove_w * 0.5, inner.center().y),
+                        Vec2::splat(remove_w),
+                    );
+                    let x_resp = ui.interact(
+                        x_rect,
+                        ui.scope_id().with(("q_rm", qi, &item.id)),
                         Sense::click(),
                     );
-                    if row_resp.hovered() {
-                        ui.painter().rect_filled(row_rect, 8.0, theme::SURFACE);
+                    let x_hov = ui
+                        .ctx()
+                        .animate_bool_with_time(x_resp.id, x_resp.hovered(), 0.12);
+                    if x_resp.hovered() {
+                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                     }
-                    let inner = row_rect.shrink(4.0);
-                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
-                    child.horizontal(|ui| {
-                        let thumb_size = Vec2::new(132.0, 74.0);
-                        draw_thumbnail(
-                            ui,
-                            &item.thumbnail_url,
-                            &item.duration_text,
-                            thumb_size,
-                            8.0,
-                            item.watched_percent,
+                    if x_hov > 0.01 {
+                        ui.painter().circle_filled(
+                            x_rect.center(),
+                            13.0,
+                            Color32::from_white_alpha((26.0 * x_hov) as u8),
                         );
-                        ui.add_space(6.0);
-                        ui.vertical(|ui| {
-                            ui.set_max_width((inner.width() - 168.0).max(60.0));
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(&item.title)
-                                        .font(theme::medium(12.5))
-                                        .color(theme::TEXT),
-                                )
-                                .truncate(),
-                            );
-                            ui.label(
+                    }
+                    theme::draw_icon_centered(
+                        ui.painter(),
+                        x_rect.center(),
+                        icon::X,
+                        13.5,
+                        if x_resp.hovered() {
+                            Color32::WHITE
+                        } else {
+                            theme::TEXT_DIM
+                        },
+                    );
+                    let x_hovered = x_resp.hovered();
+                    if x_resp.on_hover_text("Remove from queue").clicked() {
+                        remove_idx = Some(qi);
+                    }
+
+                    let text_rect = Rect::from_min_max(
+                        pos2(thumb_rect.right() + 8.0, inner.top() + 2.0),
+                        pos2(x_rect.left() - 6.0, inner.bottom() - 2.0),
+                    );
+                    let mut text_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(text_rect)
+                            .layout(Layout::top_down(Align::LEFT)),
+                    );
+                    let tclip = text_ui.clip_rect().intersect(text_rect);
+                    text_ui.set_clip_rect(tclip);
+                    text_ui.vertical_centered_justified(|ui| {
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        let clamped = clamp_two_lines(
+                            ui,
+                            &item.title,
+                            theme::medium(12.5),
+                            (text_rect.width() - 4.0).max(40.0),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(clamped)
+                                    .font(theme::medium(12.5))
+                                    .color(theme::TEXT),
+                            )
+                            .wrap(),
+                        );
+                        ui.add(
+                            egui::Label::new(
                                 RichText::new(&item.channel)
                                     .font(theme::regular(11.5))
                                     .color(theme::TEXT_DIM),
-                            );
-                        });
-                        if ui.small_button(icon::X.to_string()).clicked() {
-                            remove_idx = Some(qi);
-                        }
+                            )
+                            .truncate(),
+                        );
                     });
-                    if row_resp.clicked() {
+
+                    if row_resp.clicked() && !x_hovered && self.queue_drag_idx.is_none() {
                         play_idx = Some(qi);
                     }
                     ui.add_space(4.0);
                 }
             });
+
+            // Live right-click drag reordering across Queue items
+            let (sec_down, ptr_pos) = ui
+                .ctx()
+                .input(|i| (i.pointer.secondary_down(), i.pointer.interact_pos()));
+            if sec_down {
+                if let (Some(drag_i), Some(pos)) = (self.queue_drag_idx, ptr_pos) {
+                    ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                    if let Some(&(target_i, _)) = row_rects
+                        .iter()
+                        .find(|&&(i, r)| i != drag_i && pos.y >= r.top() && pos.y <= r.bottom())
+                    {
+                        if drag_i < self.queue.len() && target_i < self.queue.len() {
+                            let moved = self.queue.remove(drag_i);
+                            self.queue.insert(target_i, moved);
+                            self.queue_drag_idx = Some(target_i);
+                            queue_reordered = true;
+                        }
+                    }
+                }
+            } else if self.queue_drag_idx.is_some() {
+                self.queue_drag_idx = None;
+            }
+
+            if queue_reordered {
+                self.persist_queue();
+            }
             if let Some(i) = remove_idx {
                 self.queue.remove(i);
+                self.queue_drag_idx = None;
+                self.persist_queue();
                 if self.queue.is_empty() {
                     self.right_tab = RightTab::UpNext;
                 }
             } else if let Some(i) = play_idx {
                 let next = self.queue.remove(i);
+                self.queue_drag_idx = None;
+                self.persist_queue();
                 self.open_video(next);
             }
             return;
