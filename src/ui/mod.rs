@@ -17,9 +17,10 @@ use crate::innertube;
 use crate::model::{
     AmbientMode, ChannelInfo, ChannelNotificationParams, CommentItem, FeedChip,
     HoverPreviewQuality, HwdecMode, KeyBinding, LastWatched, LiveChatEmote, LiveChatMessage,
-    NotificationMenuItem, PlaylistOption, PlaylistSummary, PoTokenMode, PreferredQuality,
-    SearchChannelResult, SearchFilter, ShortcutConfig, ShortcutSlot, SidebarChannel,
-    SponsorCategory, SponsorSegment, UpNextFilterMode, VideoItem, WatchData, WindowMaterial,
+    NotificationMenuItem, PlaylistOption, PlaylistPrivacy, PlaylistSummary, PoTokenMode,
+    PreferredQuality, SearchChannelResult, SearchFilter, ShortcutConfig, ShortcutSlot,
+    SidebarChannel, SponsorCategory, SponsorSegment, UpNextFilterMode, VideoItem, WatchData,
+    WindowMaterial,
 };
 use crate::mpv::{GlProcAddrFn, MpvPlayer, PlaybackState};
 use crate::os_media::OsMedia;
@@ -430,11 +431,18 @@ pub struct YtApp {
 
     pub(super) active_playlist_id: Option<String>,
     pub(super) active_playlist_title: String,
+    pub(super) active_playlist_description: String,
+    pub(super) active_playlist_privacy: Option<PlaylistPrivacy>,
     pub(super) playlist_items: Vec<VideoItem>,
     pub(super) playlist_continuation: Option<String>,
     pub(super) playlist_loading: bool,
     pub(super) playlist_is_editable: bool,
     pub(super) playlist_manage_mode: bool,
+    pub(super) playlist_search_query: String,
+    pub(super) playlist_meta_edit_open: bool,
+    pub(super) playlist_edit_title: String,
+    pub(super) playlist_edit_desc: String,
+    pub(super) playlist_edit_privacy: PlaylistPrivacy,
     pub(super) playlist_drag_idx: Option<usize>,
     pub(super) playlist_drag_origin: Option<(egui::Pos2, Instant)>,
     pub(super) playlist_drag_active: bool,
@@ -483,6 +491,12 @@ pub struct YtApp {
     pub(super) remote_history: Vec<VideoItem>,
     pub(super) remote_history_continuation: Option<String>,
     pub(super) remote_history_loading: bool,
+    pub(super) history_search_input: String,
+    pub(super) history_search_active: String,
+    pub(super) history_clear_confirm: bool,
+    pub(super) history_paused: bool,
+    pub(super) history_clear_token: Option<String>,
+    pub(super) history_pause_token: Option<String>,
     pub(super) saved: Vec<VideoItem>,
     pub(super) queue: Vec<VideoItem>,
     pub(super) queue_drag_idx: Option<usize>,
@@ -490,6 +504,7 @@ pub struct YtApp {
     pub(super) queue_drag_active: bool,
     pub(super) save_queue_open: bool,
     pub(super) save_queue_title: String,
+    pub(super) save_queue_privacy: PlaylistPrivacy,
     pub(super) resume_positions: HashMap<String, f64>,
     pub(super) pending_resume: Option<(String, f64, Option<f32>)>,
 
@@ -647,6 +662,7 @@ pub struct YtApp {
     pub(super) playlist_options_loading: bool,
     pub(super) playlist_filter: String,
     pub(super) new_playlist_title: String,
+    pub(super) new_playlist_privacy: PlaylistPrivacy,
     pub(super) channel_avatars: HashMap<String, String>,
     pub(super) avatar_requested: HashSet<String>,
 }
@@ -917,11 +933,18 @@ impl YtApp {
             playlists_sidebar_expanded: false,
             active_playlist_id: None,
             active_playlist_title: String::new(),
+            active_playlist_description: String::new(),
+            active_playlist_privacy: None,
             playlist_items: Vec::new(),
             playlist_continuation: None,
             playlist_loading: false,
             playlist_is_editable: false,
             playlist_manage_mode: false,
+            playlist_search_query: String::new(),
+            playlist_meta_edit_open: false,
+            playlist_edit_title: String::new(),
+            playlist_edit_desc: String::new(),
+            playlist_edit_privacy: PlaylistPrivacy::Private,
             playlist_drag_idx: None,
             playlist_drag_origin: None,
             playlist_drag_active: false,
@@ -963,6 +986,12 @@ impl YtApp {
             remote_history: Vec::new(),
             remote_history_continuation: None,
             remote_history_loading: false,
+            history_search_input: String::new(),
+            history_search_active: String::new(),
+            history_clear_confirm: false,
+            history_paused: false,
+            history_clear_token: None,
+            history_pause_token: None,
             saved,
             queue: Vec::new(),
             queue_drag_idx: None,
@@ -970,6 +999,7 @@ impl YtApp {
             queue_drag_active: false,
             save_queue_open: false,
             save_queue_title: String::new(),
+            save_queue_privacy: PlaylistPrivacy::Private,
             resume_positions,
             pending_resume: None,
             watch_loading: false,
@@ -1122,6 +1152,7 @@ impl YtApp {
             playlist_options_loading: false,
             playlist_filter: String::new(),
             new_playlist_title: String::new(),
+            new_playlist_privacy: PlaylistPrivacy::Private,
         };
         if !queue.is_empty() {
             app.ingest_and_request_avatars(&mut queue);
@@ -1405,11 +1436,18 @@ impl YtApp {
         self.page = Page::Playlist;
         self.active_playlist_id = Some(browse_id.clone());
         self.active_playlist_title = title;
+        self.active_playlist_description.clear();
+        self.active_playlist_privacy = None;
         self.playlist_items.clear();
         self.playlist_continuation = None;
         self.playlist_loading = true;
         self.playlist_is_editable = false;
         self.playlist_manage_mode = false;
+        self.playlist_search_query.clear();
+        self.playlist_meta_edit_open = false;
+        self.playlist_edit_title.clear();
+        self.playlist_edit_desc.clear();
+        self.playlist_edit_privacy = PlaylistPrivacy::Private;
         self.playlist_drag_idx = None;
         self.playlist_drag_origin = None;
         self.playlist_drag_active = false;
@@ -1916,7 +1954,7 @@ impl YtApp {
         let _ = self.backend.tx.send(Request::Watch {
             video_id: item.id,
             quality: self.shorts_quality(),
-            sync_history: self.sync_history,
+            sync_history: self.sync_history && !self.history_paused,
         });
         self.trigger_shorts_prefetch();
         if need_seq {
@@ -2441,7 +2479,7 @@ impl YtApp {
         let _ = self.backend.tx.send(Request::Watch {
             video_id: video_id.to_owned(),
             quality: self.preferred_quality,
-            sync_history: self.sync_history,
+            sync_history: self.sync_history && !self.history_paused,
         });
         if self.dearrow_enabled || self.ryd_enabled {
             let _ = self.backend.tx.send(Request::LoadCommunityMeta {
@@ -2453,6 +2491,9 @@ impl YtApp {
     }
 
     fn record_history(&mut self, item: VideoItem) {
+        if self.history_paused {
+            return;
+        }
         self.history.retain(|x| x.id != item.id);
         self.history.insert(0, item);
         self.history.truncate(100);
@@ -3064,10 +3105,12 @@ impl YtApp {
                     && !self.remote_history_loading
                 {
                     self.remote_history_loading = true;
-                    let _ = self
-                        .backend
-                        .tx
-                        .send(Request::LoadHistory { continuation: None });
+                    let query = (!self.history_search_active.trim().is_empty())
+                        .then(|| self.history_search_active.trim().to_owned());
+                    let _ = self.backend.tx.send(Request::LoadHistory {
+                        query,
+                        continuation: None,
+                    });
                 }
             }
             NavEntry::Saved => self.page = Page::Saved,
@@ -3163,10 +3206,22 @@ impl YtApp {
                     continuation,
                     append,
                     feedback_tokens,
+                    clear_token,
+                    pause_token,
+                    is_paused,
                 } => {
                     self.remote_history_loading = false;
                     self.ingest_resume_metadata(&mut items);
                     self.ingest_and_request_avatars(&mut items);
+                    if clear_token.is_some() {
+                        self.history_clear_token = clear_token;
+                    }
+                    if pause_token.is_some() {
+                        self.history_pause_token = pause_token;
+                    }
+                    if !append {
+                        self.history_paused = is_paused;
+                    }
                     if !append {
                         self.history_feedback_tokens = feedback_tokens;
                     } else {
@@ -3182,6 +3237,37 @@ impl YtApp {
                         self.remote_history = items;
                     }
                     self.remote_history_continuation = continuation;
+                }
+                Response::HistoryCleared => {
+                    self.history.clear();
+                    self.remote_history.clear();
+                    self.remote_history_continuation = None;
+                    self.history_feedback_tokens.clear();
+                    self.history_clear_confirm = false;
+                    self.toast("Watch history cleared");
+                    if self.signed_in && self.sync_history {
+                        self.remote_history_loading = true;
+                        let _ = self.backend.tx.send(Request::LoadHistory {
+                            query: None,
+                            continuation: None,
+                        });
+                    }
+                }
+                Response::HistoryPauseUpdated(paused) => {
+                    self.history_paused = paused;
+                    self.toast(if paused {
+                        "Watch history paused"
+                    } else {
+                        "Watch history resumed"
+                    });
+                    if self.signed_in && self.sync_history {
+                        let query = (!self.history_search_active.trim().is_empty())
+                            .then(|| self.history_search_active.trim().to_owned());
+                        let _ = self.backend.tx.send(Request::LoadHistory {
+                            query,
+                            continuation: None,
+                        });
+                    }
                 }
                 Response::GuideLoaded {
                     channels,
@@ -3199,6 +3285,8 @@ impl YtApp {
                 Response::PlaylistLoaded {
                     browse_id,
                     title,
+                    description,
+                    privacy,
                     is_editable,
                     mut items,
                     continuation,
@@ -3222,6 +3310,10 @@ impl YtApp {
                         self.ingest_and_request_avatars(&mut items);
                         if !title.is_empty() {
                             self.active_playlist_title = title;
+                        }
+                        if !append {
+                            self.active_playlist_description = description;
+                            self.active_playlist_privacy = Some(privacy);
                         }
                         if append {
                             for it in items {
@@ -3775,6 +3867,44 @@ impl YtApp {
                 }
                 Response::PlaylistCreated { title } => {
                     self.toast(format!("Created playlist \"{title}\""));
+                }
+                Response::PlaylistMetaUpdated {
+                    playlist_id,
+                    title,
+                    description,
+                    privacy,
+                } => {
+                    if self
+                        .active_playlist_id
+                        .as_deref()
+                        .map(|id| id.strip_prefix("VL").unwrap_or(id))
+                        == Some(playlist_id.as_str())
+                    {
+                        if let Some(t) = &title {
+                            self.active_playlist_title = t.clone();
+                        }
+                        if let Some(d) = &description {
+                            self.active_playlist_description = d.clone();
+                        }
+                        if let Some(p) = privacy {
+                            self.active_playlist_privacy = Some(p);
+                        }
+                    }
+                    if let Some(t) = title {
+                        for gp in &mut self.guide_playlists {
+                            if gp.browse_id.strip_prefix("VL").unwrap_or(&gp.browse_id)
+                                == playlist_id
+                            {
+                                gp.title = t.clone();
+                            }
+                        }
+                        for opt in &mut self.playlist_options {
+                            if opt.id == playlist_id {
+                                opt.title = t.clone();
+                            }
+                        }
+                    }
+                    self.toast("Updated playlist details");
                 }
                 Response::SubscribeUpdated {
                     channel_id,
@@ -5671,40 +5801,7 @@ impl eframe::App for YtApp {
                     Page::Playlist => self.draw_playlist_page(ui, &ctx),
                     Page::Channel => self.draw_channel_page(ui, &ctx),
                     Page::Search => self.draw_search_page(ui, &ctx),
-                    Page::History => {
-                        if self.signed_in && self.sync_history {
-                            let items = self.remote_history.clone();
-                            let loading = self.remote_history_loading;
-                            let cont = self.remote_history_continuation.clone();
-                            if let Some(act) = cards::draw_history_feed(
-                                ui,
-                                "Watch History (Synced with YouTube)",
-                                &items,
-                                &mut self.history_filter,
-                                loading,
-                                cont.is_some(),
-                            ) {
-                                self.handle_grid_action(&ctx, act, |app| {
-                                    app.remote_history_loading = true;
-                                    let _ = app.backend.tx.send(Request::LoadHistory {
-                                        continuation: cont,
-                                    });
-                                });
-                            }
-                        } else {
-                            let items = self.history.clone();
-                            if let Some(act) = cards::draw_history_feed(
-                                ui,
-                                "Watch History (Local)",
-                                &items,
-                                &mut self.history_filter,
-                                false,
-                                false,
-                            ) {
-                                self.handle_grid_action(&ctx, act, |_| {});
-                            }
-                        }
-                    }
+                    Page::History => self.draw_history_page(ui, &ctx),
                     Page::Saved => {
                         let items = self.saved.clone();
                         if let Some(act) =

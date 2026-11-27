@@ -281,6 +281,32 @@ impl YtApp {
                     );
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Visibility:")
+                                .font(theme::regular(11.5))
+                                .color(theme::TEXT_DIM),
+                        );
+                        for vis in crate::model::PlaylistPrivacy::ALL {
+                            let selected = self.new_playlist_privacy == vis;
+                            if ui
+                                .selectable_label(
+                                    selected,
+                                    RichText::new(vis.label())
+                                        .font(theme::semibold(11.5))
+                                        .color(if selected {
+                                            theme::YT_BLUE
+                                        } else {
+                                            theme::TEXT_DIM
+                                        }),
+                                )
+                                .clicked()
+                            {
+                                self.new_playlist_privacy = vis;
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
                         let resp = ui.add_sized(
                             Vec2::new((ui.available_width() - 78.0).max(120.0), 32.0),
                             egui::TextEdit::singleline(&mut self.new_playlist_title)
@@ -304,6 +330,8 @@ impl YtApp {
                             if !title.is_empty() {
                                 let _ = self.backend.tx.send(Request::CreatePlaylist {
                                     title,
+                                    description: None,
+                                    privacy: self.new_playlist_privacy,
                                     video_ids: vec![video.id.clone()],
                                 });
                                 self.new_playlist_title.clear();

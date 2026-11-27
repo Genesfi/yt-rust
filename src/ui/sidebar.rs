@@ -553,10 +553,10 @@ impl YtApp {
         self.page = Page::History;
         if self.signed_in && self.sync_history && !self.remote_history_loading {
             self.remote_history_loading = true;
-            let _ = self
-                .backend
-                .tx
-                .send(Request::LoadHistory { continuation: None });
+            let _ = self.backend.tx.send(Request::LoadHistory {
+                query: None,
+                continuation: None,
+            });
         }
     }
 }

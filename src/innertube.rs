@@ -7,9 +7,9 @@ use crate::auth::Session;
 use crate::model::{
     AudioTrack, CaptionTrack, ChannelInfo, ChannelNotificationParams, ChannelTab, Chapter,
     CommentItem, FeedChip, LiveChatEmote, LiveChatKind, LiveChatMessage, LiveChatRun,
-    NotificationLevel, NotificationMenuItem, PlaylistOption, PlaylistSummary, SearchChannelResult,
-    SearchDateFilter, SearchDurationFilter, SearchFilter, SearchSortBy, SearchTypeFilter,
-    SidebarChannel, StoryboardSpec, VideoFormat, VideoItem, WatchData,
+    NotificationLevel, NotificationMenuItem, PlaylistOption, PlaylistPrivacy, PlaylistSummary,
+    SearchChannelResult, SearchDateFilter, SearchDurationFilter, SearchFilter, SearchSortBy,
+    SearchTypeFilter, SidebarChannel, StoryboardSpec, VideoFormat, VideoItem, WatchData,
 };
 
 const ORIGIN: &str = "https://www.youtube.com";
@@ -258,15 +258,26 @@ pub async fn subscriptions_feed(
     })
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct HistoryFeedMeta {
+    pub clear_token: Option<String>,
+    pub pause_token: Option<String>,
+    pub is_paused: bool,
+}
+
 pub async fn history_feed(
     http: &reqwest::Client,
+    query: Option<&str>,
     continuation: Option<&str>,
     cfg: &WebConfig,
     session: &Session,
-) -> anyhow::Result<(FeedPage, HashMap<String, String>)> {
+) -> anyhow::Result<(FeedPage, HashMap<String, String>, HistoryFeedMeta)> {
     let body = match continuation {
         Some(token) => json!({ "continuation": token }),
-        None => json!({ "browseId": "FEhistory" }),
+        None => match query.map(str::trim).filter(|q| !q.is_empty()) {
+            Some(q) => json!({ "browseId": "FEhistory", "query": q }),
+            None => json!({ "browseId": "FEhistory" }),
+        },
     };
     let v = post_web(http, "browse", body, cfg, Some(session)).await?;
     let new_vd = v["responseContext"]["visitorData"]
@@ -277,6 +288,7 @@ pub async fn history_feed(
     collect_videos(&v, &mut items, &mut seen);
     let mut feedback_tokens = HashMap::new();
     collect_history_feedback_tokens(&v, &mut feedback_tokens);
+    let meta = parse_history_feed_meta(&v);
     let cont = find_continuation(&v);
     Ok((
         FeedPage {
@@ -287,7 +299,78 @@ pub async fn history_feed(
             is_fallback_trending: false,
         },
         feedback_tokens,
+        meta,
     ))
+}
+
+fn parse_history_feed_meta(v: &Value) -> HistoryFeedMeta {
+    let mut meta = HistoryFeedMeta::default();
+    fn walk(v: &Value, meta: &mut HistoryFeedMeta) {
+        match v {
+            Value::Object(map) => {
+                if let Some(actions) = map
+                    .get("browseFeedActionsRenderer")
+                    .and_then(|b| b.get("contents"))
+                    .and_then(Value::as_array)
+                {
+                    for entry in actions {
+                        if let Some(br) = entry.get("buttonRenderer") {
+                            let label = text(&br["text"]).unwrap_or_default().to_ascii_lowercase();
+                            let tok = find_first_feedback_token(br);
+                            if label.contains("clear") && meta.clear_token.is_none() {
+                                meta.clear_token = tok;
+                            } else if (label.contains("pause") || label.contains("turn on"))
+                                && meta.pause_token.is_none()
+                            {
+                                meta.is_paused = label.contains("turn on");
+                                meta.pause_token = tok;
+                            }
+                        }
+                        if let Some(tbr) = entry.get("toggleButtonRenderer") {
+                            let def_lbl =
+                                text(&tbr["defaultText"]).unwrap_or_default().to_ascii_lowercase();
+                            let tog_lbl =
+                                text(&tbr["toggledText"]).unwrap_or_default().to_ascii_lowercase();
+                            if def_lbl.contains("pause") || tog_lbl.contains("turn on") {
+                                let toggled = tbr["isToggled"].as_bool().unwrap_or(false);
+                                meta.is_paused = toggled;
+                                meta.pause_token = if toggled {
+                                    find_first_feedback_token(&tbr["toggledServiceEndpoint"])
+                                        .or_else(|| find_first_feedback_token(tbr))
+                                } else {
+                                    find_first_feedback_token(&tbr["defaultServiceEndpoint"])
+                                        .or_else(|| find_first_feedback_token(tbr))
+                                };
+                            }
+                        }
+                        if let Some(bvm) = entry.get("buttonViewModel") {
+                            let label = bvm["title"].as_str().unwrap_or_default().to_ascii_lowercase();
+                            let tok = find_first_feedback_token(bvm);
+                            if label.contains("clear") && meta.clear_token.is_none() {
+                                meta.clear_token = tok;
+                            } else if (label.contains("pause") || label.contains("turn on"))
+                                && meta.pause_token.is_none()
+                            {
+                                meta.is_paused = label.contains("turn on");
+                                meta.pause_token = tok;
+                            }
+                        }
+                    }
+                }
+                for val in map.values() {
+                    walk(val, meta);
+                }
+            }
+            Value::Array(arr) => {
+                for val in arr {
+                    walk(val, meta);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(v, &mut meta);
+    meta
 }
 
 fn find_first_feedback_token(v: &Value) -> Option<String> {
@@ -808,13 +891,21 @@ fn parse_guide_response(v: &Value) -> (Vec<SidebarChannel>, Vec<PlaylistSummary>
     (channels, playlists)
 }
 
+#[derive(Clone, Debug)]
+pub struct PlaylistPageMeta {
+    pub title: String,
+    pub description: String,
+    pub privacy: PlaylistPrivacy,
+    pub is_editable: bool,
+}
+
 pub async fn playlist_feed(
     http: &reqwest::Client,
     browse_id: &str,
     continuation: Option<&str>,
     cfg: &WebConfig,
     session: Option<&Session>,
-) -> anyhow::Result<(String, bool, FeedPage)> {
+) -> anyhow::Result<(PlaylistPageMeta, FeedPage)> {
     let body = match continuation {
         Some(token) => json!({ "continuation": token }),
         None => json!({ "browseId": browse_id }),
@@ -823,31 +914,18 @@ pub async fn playlist_feed(
     let new_vd = v["responseContext"]["visitorData"]
         .as_str()
         .map(str::to_owned);
-    let title = v["metadata"]["playlistMetadataRenderer"]["title"]
-        .as_str()
-        .map(str::to_owned)
-        .or_else(|| text(&v["header"]["playlistHeaderRenderer"]["title"]))
-        .or_else(|| text(&v["header"]["pageHeaderRenderer"]["pageTitle"]))
-        .unwrap_or_else(|| match browse_id {
-            "VLWL" => "Watch Later".to_owned(),
-            "VLLL" => "Liked Videos".to_owned(),
-            _ => "Playlist".to_owned(),
-        });
+    let meta = parse_playlist_page_meta(&v, browse_id, session.is_some());
     let mut items = Vec::new();
     let mut seen = HashSet::new();
     collect_videos(&v, &mut items, &mut seen);
     let cont = find_continuation(&v);
-    let is_editable = browse_id != "VLLL"
-        && session.is_some()
-        && (v["header"]["playlistHeaderRenderer"]["isEditable"]
-            .as_bool()
-            .unwrap_or(false)
-            || find_nested_bool(&v, "isEditable").unwrap_or(false)
-            || browse_id == "VLWL"
-            || items.iter().any(|it| it.playlist_set_video_id.is_some()));
+    let has_set_ids = items.iter().any(|it| it.playlist_set_video_id.is_some());
+    let meta = PlaylistPageMeta {
+        is_editable: meta.is_editable || (browse_id != "VLLL" && session.is_some() && has_set_ids),
+        ..meta
+    };
     Ok((
-        title,
-        is_editable,
+        meta,
         FeedPage {
             items,
             chips: Vec::new(),
@@ -856,6 +934,64 @@ pub async fn playlist_feed(
             is_fallback_trending: false,
         },
     ))
+}
+
+fn parse_playlist_page_meta(v: &Value, browse_id: &str, signed_in: bool) -> PlaylistPageMeta {
+    let hdr = &v["header"]["playlistHeaderRenderer"];
+    let title = v["metadata"]["playlistMetadataRenderer"]["title"]
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| text(&hdr["title"]))
+        .or_else(|| text(&v["header"]["pageHeaderRenderer"]["pageTitle"]))
+        .unwrap_or_else(|| match browse_id {
+            "VLWL" => "Watch Later".to_owned(),
+            "VLLL" => "Liked Videos".to_owned(),
+            _ => "Playlist".to_owned(),
+        });
+    let description = text(&hdr["descriptionText"])
+        .or_else(|| {
+            v["metadata"]["playlistMetadataRenderer"]["description"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    let privacy_raw = hdr["privacy"]
+        .as_str()
+        .or_else(|| {
+            hdr["privacyForm"]["dropdownFormFieldRenderer"]["dropdown"]["dropdownRenderer"]
+                ["entries"]
+                .as_array()
+                .and_then(|arr| {
+                    arr.iter().find_map(|e| {
+                        let it = &e["dropdownItemRenderer"];
+                        if it["isSelected"].as_bool().unwrap_or(false) {
+                            it["int32Value"]
+                                .as_i64()
+                                .map(|n| match n {
+                                    0 => "PUBLIC",
+                                    2 => "UNLISTED",
+                                    _ => "PRIVATE",
+                                })
+                                .or_else(|| it["stringValue"].as_str())
+                                .or_else(|| it["label"]["simpleText"].as_str())
+                        } else {
+                            None
+                        }
+                    })
+                })
+        })
+        .unwrap_or("PRIVATE");
+    let is_editable = browse_id != "VLLL"
+        && signed_in
+        && (hdr["isEditable"].as_bool().unwrap_or(false)
+            || find_nested_bool(v, "isEditable").unwrap_or(false)
+            || browse_id == "VLWL");
+    PlaylistPageMeta {
+        title,
+        description,
+        privacy: PlaylistPrivacy::from_api(privacy_raw),
+        is_editable,
+    }
 }
 
 fn find_nested_bool(v: &Value, key: &str) -> Option<bool> {
@@ -1040,17 +1176,68 @@ fn parse_add_to_playlist(v: &Value) -> Vec<PlaylistOption> {
     out
 }
 
+pub async fn update_playlist_metadata(
+    http: &reqwest::Client,
+    playlist_id: &str,
+    title: Option<&str>,
+    description: Option<&str>,
+    privacy: Option<PlaylistPrivacy>,
+    cfg: &WebConfig,
+    session: &Session,
+) -> anyhow::Result<()> {
+    let pid = playlist_id.strip_prefix("VL").unwrap_or(playlist_id);
+    let mut actions = Vec::new();
+    if let Some(name) = title.map(str::trim).filter(|s| !s.is_empty()) {
+        actions.push(json!({
+            "action": "ACTION_SET_PLAYLIST_NAME",
+            "playlistName": name,
+        }));
+    }
+    if let Some(desc) = description {
+        actions.push(json!({
+            "action": "ACTION_SET_PLAYLIST_DESCRIPTION",
+            "playlistDescription": desc.trim(),
+        }));
+    }
+    if let Some(priv_val) = privacy {
+        actions.push(json!({
+            "action": "ACTION_SET_PLAYLIST_PRIVACY",
+            "playlistPrivacy": priv_val.api_value(),
+        }));
+    }
+    if actions.is_empty() {
+        return Ok(());
+    }
+    post_web(
+        http,
+        "browse/edit_playlist",
+        json!({
+            "playlistId": pid,
+            "actions": actions,
+        }),
+        cfg,
+        Some(session),
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn create_playlist(
     http: &reqwest::Client,
     title: &str,
+    description: Option<&str>,
+    privacy: PlaylistPrivacy,
     video_ids: &[String],
     cfg: &WebConfig,
     session: &Session,
 ) -> anyhow::Result<()> {
     let mut body = json!({
         "title": title,
-        "privacyStatus": "PRIVATE",
+        "privacyStatus": privacy.api_value(),
     });
+    if let Some(desc) = description.map(str::trim).filter(|s| !s.is_empty()) {
+        body["description"] = json!(desc);
+    }
     if !video_ids.is_empty() {
         body["videoIds"] = json!(video_ids);
     }
@@ -1439,23 +1626,19 @@ pub async fn search(
     Ok(parse_search_results(&v))
 }
 
-pub async fn channel_videos(
-    http: &reqwest::Client,
-    channel_id: &str,
-    params: Option<&str>,
-    continuation: Option<&str>,
-    cfg: &WebConfig,
-    session: Option<&Session>,
-) -> anyhow::Result<(ChannelInfo, FeedPage)> {
-    // EgZ2aWRlb3PyBgQKAjoA selects the Videos tab on a channel page when no tab params specified
-    let body = match continuation {
-        Some(token) => json!({ "continuation": token }),
-        None => json!({
-            "browseId": channel_id,
-            "params": params.unwrap_or("EgZ2aWRlb3PyBgQKAjoA"),
-        }),
-    };
-    let v = post_web(http, "browse", body, cfg, session).await?;
+const DEFAULT_CHANNEL_VIDEOS_PARAMS: &str = "EgZ2aWRlb3PyBgQKAjoA";
+
+fn fallback_videos_tab_params(tabs: &[ChannelTab], requested_params: &str) -> Option<String> {
+    tabs.iter().find_map(|t| {
+        (t.title.eq_ignore_ascii_case("Videos") && !t.selected)
+            .then_some(t.params.as_deref())
+            .flatten()
+            .filter(|p| *p != requested_params)
+            .map(str::to_owned)
+    })
+}
+
+fn parse_channel_response(v: &Value, channel_id: &str) -> (ChannelInfo, FeedPage) {
     let new_vd = v["responseContext"]["visitorData"]
         .as_str()
         .map(str::to_owned);
@@ -1524,19 +1707,19 @@ pub async fn channel_videos(
     let subscribers_text = sub_parts.join(" · ");
     let is_subscribed = find_is_subscribed(&v["header"]);
     let notifications = parse_channel_notification_params(&v["header"]);
-    let tabs = parse_channel_tabs(&v);
+    let tabs = parse_channel_tabs(v);
 
     let mut items = Vec::new();
     let mut seen = HashSet::new();
-    collect_videos_with_channel_items(&v, &mut items, &mut seen, &channel_name, channel_id);
+    collect_videos_with_channel_items(v, &mut items, &mut seen, &channel_name, channel_id);
     for it in &mut items {
         if it.channel_avatar_url.is_none() {
             it.channel_avatar_url = avatar_url.clone();
         }
     }
-    let cont = find_continuation(&v);
-    let chips = collect_chips(&v);
-    Ok((
+    let cont = find_continuation(v);
+    let chips = collect_chips(v);
+    (
         ChannelInfo {
             id: channel_id.to_owned(),
             name: channel_name,
@@ -1555,7 +1738,44 @@ pub async fn channel_videos(
             visitor_data: new_vd,
             is_fallback_trending: false,
         },
-    ))
+    )
+}
+
+pub async fn channel_videos(
+    http: &reqwest::Client,
+    channel_id: &str,
+    params: Option<&str>,
+    continuation: Option<&str>,
+    cfg: &WebConfig,
+    session: Option<&Session>,
+) -> anyhow::Result<(ChannelInfo, FeedPage)> {
+    // DEFAULT_CHANNEL_VIDEOS_PARAMS selects the Videos tab when opening a channel;
+    // if YouTube still falls back to another tab (e.g. Home) and advertises a different
+    // `params` token for its Videos tab, retry once with that channel's actual token.
+    let initial_params = params.unwrap_or(DEFAULT_CHANNEL_VIDEOS_PARAMS);
+    let body = match continuation {
+        Some(token) => json!({ "continuation": token }),
+        None => json!({
+            "browseId": channel_id,
+            "params": initial_params,
+        }),
+    };
+    let v = post_web(http, "browse", body, cfg, session).await?;
+    let (info, page) = parse_channel_response(&v, channel_id);
+    if params.is_none() && continuation.is_none() {
+        if let Some(actual_videos_params) =
+            fallback_videos_tab_params(&info.tabs, DEFAULT_CHANNEL_VIDEOS_PARAMS)
+        {
+            let retry_body = json!({
+                "browseId": channel_id,
+                "params": actual_videos_params,
+            });
+            if let Ok(v2) = post_web(http, "browse", retry_body, cfg, session).await {
+                return Ok(parse_channel_response(&v2, channel_id));
+            }
+        }
+    }
+    Ok((info, page))
 }
 
 fn parse_channel_search_response(v: &Value, channel_id: &str) -> FeedPage {
@@ -7204,5 +7424,107 @@ mod tests {
         assert_eq!(fb[2].section.as_deref(), Some("Other notifications"));
         assert!(fb[2].read);
         assert_eq!(fb[2].channel_avatar_url.as_deref(), Some("https://yt3.ggpht.com/tirta.jpg"));
+    }
+
+    #[test]
+    fn parses_history_feed_meta_and_playlist_header_meta() {
+        let hist = json!({
+            "contents": {
+                "twoColumnBrowseResultsRenderer": {
+                    "secondaryContents": {
+                        "browseFeedActionsRenderer": {
+                            "contents": [
+                                {
+                                    "buttonRenderer": {
+                                        "text": { "simpleText": "Clear all watch history" },
+                                        "navigationEndpoint": {
+                                            "confirmDialogEndpoint": {
+                                                "content": {
+                                                    "confirmDialogRenderer": {
+                                                        "confirmButton": {
+                                                            "buttonRenderer": {
+                                                                "serviceEndpoint": {
+                                                                    "feedbackEndpoint": { "feedbackToken": "TOK_CLEAR_ALL" }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                {
+                                    "toggleButtonRenderer": {
+                                        "defaultText": { "simpleText": "Pause watch history" },
+                                        "toggledText": { "simpleText": "Turn on watch history" },
+                                        "isToggled": true,
+                                        "toggledServiceEndpoint": {
+                                            "feedbackEndpoint": { "feedbackToken": "TOK_RESUME" }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+        let hmeta = parse_history_feed_meta(&hist);
+        assert_eq!(hmeta.clear_token.as_deref(), Some("TOK_CLEAR_ALL"));
+        assert_eq!(hmeta.pause_token.as_deref(), Some("TOK_RESUME"));
+        assert!(hmeta.is_paused);
+
+        let pl = json!({
+            "header": {
+                "playlistHeaderRenderer": {
+                    "title": { "simpleText": "Anime OST" },
+                    "descriptionText": { "simpleText": "Favorites" },
+                    "privacy": "UNLISTED",
+                    "isEditable": true
+                }
+            }
+        });
+        let pmeta = parse_playlist_page_meta(&pl, "VLPL_TEST", true);
+        assert_eq!(pmeta.title, "Anime OST");
+        assert_eq!(pmeta.description, "Favorites");
+        assert_eq!(pmeta.privacy, PlaylistPrivacy::Unlisted);
+        assert!(pmeta.is_editable);
+    }
+
+    #[test]
+    fn fallback_videos_tab_params_detects_home_fallback() {
+        let tabs = vec![
+            ChannelTab {
+                title: "Home".into(),
+                params: Some("HOME_P".into()),
+                selected: true,
+            },
+            ChannelTab {
+                title: "Videos".into(),
+                params: Some("ACTUAL_VIDEOS_P".into()),
+                selected: false,
+            },
+        ];
+        assert_eq!(
+            fallback_videos_tab_params(&tabs, DEFAULT_CHANNEL_VIDEOS_PARAMS).as_deref(),
+            Some("ACTUAL_VIDEOS_P")
+        );
+        let already_videos = vec![
+            ChannelTab {
+                title: "Home".into(),
+                params: Some("HOME_P".into()),
+                selected: false,
+            },
+            ChannelTab {
+                title: "Videos".into(),
+                params: Some("ACTUAL_VIDEOS_P".into()),
+                selected: true,
+            },
+        ];
+        assert_eq!(
+            fallback_videos_tab_params(&already_videos, DEFAULT_CHANNEL_VIDEOS_PARAMS),
+            None
+        );
     }
 }

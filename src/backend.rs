@@ -10,9 +10,9 @@ use crate::auth::Session;
 use crate::innertube::{self, FeedPage, WebConfig};
 use crate::model::{
     AudioTrack, ChannelInfo, ChannelNotificationParams, CommentItem, FeedChip, LiveChatEmote,
-    LiveChatMessage, NotificationLevel, NotificationMenuItem, PlaylistOption, PlaylistSummary,
-    PoTokenMode, PreferredQuality, SearchChannelResult, SearchFilter, SidebarChannel,
-    SponsorSegment, UpNextFilterMode, VideoFormat, VideoItem, WatchData,
+    LiveChatMessage, NotificationLevel, NotificationMenuItem, PlaylistOption, PlaylistPrivacy,
+    PlaylistSummary, PoTokenMode, PreferredQuality, SearchChannelResult, SearchFilter,
+    SidebarChannel, SponsorSegment, UpNextFilterMode, VideoFormat, VideoItem, WatchData,
 };
 use crate::potoken::PoTokenClient;
 use crate::proxy::StreamProxy;
@@ -33,7 +33,15 @@ pub enum Request {
         continuation: Option<String>,
     },
     LoadHistory {
+        query: Option<String>,
         continuation: Option<String>,
+    },
+    ClearWatchHistory {
+        feedback_token: Option<String>,
+    },
+    TogglePauseWatchHistory {
+        pause: bool,
+        feedback_token: Option<String>,
     },
     LoadPlaylist {
         browse_id: String,
@@ -167,7 +175,15 @@ pub enum Request {
     },
     CreatePlaylist {
         title: String,
+        description: Option<String>,
+        privacy: PlaylistPrivacy,
         video_ids: Vec<String>,
+    },
+    UpdatePlaylistMeta {
+        playlist_id: String,
+        title: Option<String>,
+        description: Option<String>,
+        privacy: Option<PlaylistPrivacy>,
     },
     SetSubscribe {
         channel_id: String,
@@ -235,7 +251,12 @@ pub enum Response {
         continuation: Option<String>,
         append: bool,
         feedback_tokens: HashMap<String, String>,
+        clear_token: Option<String>,
+        pause_token: Option<String>,
+        is_paused: bool,
     },
+    HistoryCleared,
+    HistoryPauseUpdated(bool),
     GuideLoaded {
         channels: Vec<SidebarChannel>,
         playlists: Vec<PlaylistSummary>,
@@ -243,10 +264,18 @@ pub enum Response {
     PlaylistLoaded {
         browse_id: String,
         title: String,
+        description: String,
+        privacy: PlaylistPrivacy,
         is_editable: bool,
         items: Vec<VideoItem>,
         continuation: Option<String>,
         append: bool,
+    },
+    PlaylistMetaUpdated {
+        playlist_id: String,
+        title: Option<String>,
+        description: Option<String>,
+        privacy: Option<PlaylistPrivacy>,
     },
     FullPlaylistQueueLoaded {
         items: Vec<VideoItem>,
@@ -942,13 +971,17 @@ impl Backend {
                                 }
                                 wake();
                             }
-                            Request::LoadHistory { continuation } => {
+                            Request::LoadHistory {
+                                query,
+                                continuation,
+                            } => {
                                 let Some(ref s) = session else {
                                     continue;
                                 };
                                 let append = continuation.is_some();
                                 match innertube::history_feed(
                                     &http,
+                                    query.as_deref(),
                                     continuation.as_deref(),
                                     &cfg,
                                     s,
@@ -963,6 +996,7 @@ impl Backend {
                                             ..
                                         },
                                         feedback_tokens,
+                                        hmeta,
                                     )) => {
                                         if visitor_data.is_some() {
                                             cfg.visitor_data = visitor_data;
@@ -972,6 +1006,9 @@ impl Backend {
                                             continuation,
                                             append,
                                             feedback_tokens,
+                                            clear_token: hmeta.clear_token,
+                                            pause_token: hmeta.pause_token,
+                                            is_paused: hmeta.is_paused,
                                         });
                                     }
                                     Err(e) => {
@@ -981,6 +1018,66 @@ impl Backend {
                                     }
                                 }
                                 wake();
+                            }
+                            Request::ClearWatchHistory { feedback_token } => {
+                                if let (Some(tok), Some(s)) = (feedback_token, session.clone()) {
+                                    let cfg_clone = cfg.clone();
+                                    tokio::spawn(async move {
+                                        match innertube::remove_from_history(
+                                            &http,
+                                            &tok,
+                                            &cfg_clone,
+                                            &s,
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => {
+                                                let _ = resp_tx.send(Response::HistoryCleared);
+                                            }
+                                            Err(e) => {
+                                                let _ = resp_tx.send(Response::Error(format!(
+                                                    "Clear watch history failed: {e:#}"
+                                                )));
+                                            }
+                                        }
+                                        wake();
+                                    });
+                                } else {
+                                    let _ = resp_tx.send(Response::HistoryCleared);
+                                    wake();
+                                }
+                            }
+                            Request::TogglePauseWatchHistory {
+                                pause,
+                                feedback_token,
+                            } => {
+                                if let (Some(tok), Some(s)) = (feedback_token, session.clone()) {
+                                    let cfg_clone = cfg.clone();
+                                    tokio::spawn(async move {
+                                        match innertube::remove_from_history(
+                                            &http,
+                                            &tok,
+                                            &cfg_clone,
+                                            &s,
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => {
+                                                let _ = resp_tx
+                                                    .send(Response::HistoryPauseUpdated(pause));
+                                            }
+                                            Err(e) => {
+                                                let _ = resp_tx.send(Response::Error(format!(
+                                                    "Update watch history setting failed: {e:#}"
+                                                )));
+                                            }
+                                        }
+                                        wake();
+                                    });
+                                } else {
+                                    let _ = resp_tx.send(Response::HistoryPauseUpdated(pause));
+                                    wake();
+                                }
                             }
                             Request::LoadPlaylist {
                                 browse_id,
@@ -1000,8 +1097,7 @@ impl Backend {
                                     .await
                                     {
                                         Ok((
-                                            title,
-                                            is_editable,
+                                            meta,
                                             FeedPage {
                                                 items,
                                                 continuation,
@@ -1010,8 +1106,10 @@ impl Backend {
                                         )) => {
                                             let _ = resp_tx.send(Response::PlaylistLoaded {
                                                 browse_id,
-                                                title,
-                                                is_editable,
+                                                title: meta.title,
+                                                description: meta.description,
+                                                privacy: meta.privacy,
+                                                is_editable: meta.is_editable,
                                                 items,
                                                 continuation,
                                                 append,
@@ -1047,7 +1145,7 @@ impl Backend {
                                         )
                                         .await
                                         {
-                                            Ok((_, _, page)) => {
+                                            Ok((_, page)) => {
                                                 all.extend(page.items);
                                                 cont = page.continuation;
                                             }
@@ -1799,7 +1897,12 @@ impl Backend {
                                     wake();
                                 });
                             }
-                            Request::CreatePlaylist { title, video_ids } => {
+                            Request::CreatePlaylist {
+                                title,
+                                description,
+                                privacy,
+                                video_ids,
+                            } => {
                                 let Some(s) = session.clone() else {
                                     let _ = resp_tx.send(Response::Error(
                                         "Sign in to create playlists".into(),
@@ -1813,6 +1916,8 @@ impl Backend {
                                     match innertube::create_playlist(
                                         &http,
                                         &title,
+                                        description.as_deref(),
+                                        privacy,
                                         &video_ids,
                                         &cfg_clone,
                                         &s,
@@ -1838,6 +1943,57 @@ impl Backend {
                                         Err(e) => {
                                             let _ = resp_tx.send(Response::Error(format!(
                                                 "Create playlist failed: {e:#}"
+                                            )));
+                                        }
+                                    }
+                                    wake();
+                                });
+                            }
+                            Request::UpdatePlaylistMeta {
+                                playlist_id,
+                                title,
+                                description,
+                                privacy,
+                            } => {
+                                let Some(s) = session.clone() else {
+                                    continue;
+                                };
+                                let cfg_clone = cfg.clone();
+                                let guide_snap = latest_guide_channels.clone();
+                                tokio::spawn(async move {
+                                    match innertube::update_playlist_metadata(
+                                        &http,
+                                        &playlist_id,
+                                        title.as_deref(),
+                                        description.as_deref(),
+                                        privacy,
+                                        &cfg_clone,
+                                        &s,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            let _ = resp_tx.send(Response::PlaylistMetaUpdated {
+                                                playlist_id,
+                                                title,
+                                                description,
+                                                privacy,
+                                            });
+                                            load_guide_and_backfill_thumbs(
+                                                http,
+                                                cfg_clone,
+                                                s,
+                                                thumb_cache,
+                                                guide_snap,
+                                                data_dir,
+                                                resp_tx.clone(),
+                                                wake.clone(),
+                                            )
+                                            .await;
+                                        }
+                                        Err(e) => {
+                                            let _ = resp_tx.send(Response::Error(format!(
+                                                "Update playlist failed: {e:#}"
                                             )));
                                         }
                                     }

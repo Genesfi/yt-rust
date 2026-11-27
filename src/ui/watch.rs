@@ -861,7 +861,7 @@ impl YtApp {
                 }
             }
             if self.watch.is_some() && !is_sliding_short {
-                ui.painter().add(mpv.paint_callback(rect));
+                ui.painter().add(mpv.paint_callback_rounded(rect, radius, radius));
             }
         } else if (self.watch_loading || crate::mpv::find_libmpv(&self.backend.data_dir).is_some())
             && self.mpv_error.is_none()
@@ -884,7 +884,12 @@ impl YtApp {
             };
             draw_buffering_overlay(ui, ctx, rect, radius, label);
             if is_shorts && radius > 0.5 {
-                paint_rounded_corners_mask(ui.painter(), rect, radius, theme::BG, true);
+                ui.painter().rect_stroke(
+                    rect,
+                    radius,
+                    Stroke::new(1.0, Color32::from_white_alpha(22)),
+                    egui::StrokeKind::Inside,
+                );
             }
             return open_channel;
         } else {
@@ -1037,11 +1042,12 @@ impl YtApp {
                 pos2(rect.left(), rect.bottom() - base_scrim_h),
                 rect.max,
             );
-            paint_vertical_gradient(
+            paint_vertical_gradient_rounded(
                 ui.painter(),
                 base_scrim,
                 Color32::TRANSPARENT,
                 Color32::from_black_alpha(175),
+                radius,
             );
             if let Some(w) = self.watch.clone() {
                 let lift_y = overlay_alpha * 54.0;
@@ -1147,11 +1153,12 @@ impl YtApp {
                 pos2(rect.left(), rect.bottom() - scrim_h),
                 rect.max,
             );
-            paint_vertical_gradient(
+            paint_vertical_gradient_rounded(
                 ui.painter(),
                 scrim_rect,
                 Color32::TRANSPARENT,
                 Color32::from_black_alpha((220.0 * overlay_alpha).round() as u8),
+                radius,
             );
             let (interacted, toggled) =
                 self.draw_overlaid_controls(ui, ctx, rect, overlay_alpha, is_shorts);
@@ -1160,7 +1167,6 @@ impl YtApp {
         }
 
         if is_shorts && radius > 0.5 {
-            paint_rounded_corners_mask(ui.painter(), rect, radius, theme::BG, true);
             ui.painter().rect_stroke(
                 rect,
                 radius,
@@ -3938,6 +3944,8 @@ impl YtApp {
                                     if !video_ids.is_empty() {
                                         let _ = self.backend.tx.send(Request::CreatePlaylist {
                                             title,
+                                            description: None,
+                                            privacy: self.save_queue_privacy,
                                             video_ids,
                                         });
                                         self.save_queue_title.clear();
@@ -3949,6 +3957,32 @@ impl YtApp {
                             }
                             if icon_circle_button(ui, icon::X, 13.0, "Cancel") {
                                 self.save_queue_open = false;
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("Visibility:")
+                                    .font(theme::regular(11.0))
+                                    .color(theme::TEXT_DIM),
+                            );
+                            for vis in crate::model::PlaylistPrivacy::ALL {
+                                let selected = self.save_queue_privacy == vis;
+                                if ui
+                                    .selectable_label(
+                                        selected,
+                                        RichText::new(vis.label())
+                                            .font(theme::semibold(11.0))
+                                            .color(if selected {
+                                                theme::YT_BLUE
+                                            } else {
+                                                theme::TEXT_DIM
+                                            }),
+                                    )
+                                    .clicked()
+                                {
+                                    self.save_queue_privacy = vis;
+                                }
                             }
                         });
                     });
@@ -4772,10 +4806,8 @@ impl YtApp {
                         let (vrect, vresp) = ui.allocate_exact_size(video_size, Sense::click());
                         ui.painter().rect_filled(vrect, 11.0, Color32::BLACK);
                         if let Some(mpv) = &self.mpv {
-                            ui.painter().add(mpv.paint_callback(vrect));
+                            ui.painter().add(mpv.paint_callback_rounded(vrect, 11.0, 0.0));
                         }
-                        // Round top corners cleanly over the OpenGL blit using corner masks matching Frame fill
-                        paint_rounded_corners_mask(ui.painter(), vrect, 11.0, theme::SURFACE, false);
 
                         let video_hovered =
                             vresp.hovered() || ui.rect_contains_pointer(vrect);
@@ -5929,6 +5961,53 @@ fn paint_hover_circle(ui: &egui::Ui, rect: Rect, resp: &egui::Response, alpha: f
     }
 }
 
+fn paint_vertical_gradient_rounded(
+    painter: &egui::Painter,
+    rect: Rect,
+    top_col: Color32,
+    bottom_col: Color32,
+    bottom_radius: f32,
+) {
+    let r = bottom_radius.min(rect.width() * 0.5).min(rect.height());
+    if r <= 0.5 {
+        paint_vertical_gradient(painter, rect, top_col, bottom_col);
+        return;
+    }
+    let split_y = rect.bottom() - r;
+    let frac = ((split_y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
+    let lerp_col = |t: f32| -> Color32 {
+        Color32::from_rgba_premultiplied(
+            ((top_col.r() as f32) + ((bottom_col.r() as f32) - (top_col.r() as f32)) * t).round()
+                as u8,
+            ((top_col.g() as f32) + ((bottom_col.g() as f32) - (top_col.g() as f32)) * t).round()
+                as u8,
+            ((top_col.b() as f32) + ((bottom_col.b() as f32) - (top_col.b() as f32)) * t).round()
+                as u8,
+            ((top_col.a() as f32) + ((bottom_col.a() as f32) - (top_col.a() as f32)) * t).round()
+                as u8,
+        )
+    };
+    let mid_col = lerp_col(frac);
+    let top_band = Rect::from_min_max(rect.min, pos2(rect.right(), split_y));
+    paint_vertical_gradient(painter, top_band, top_col, mid_col);
+
+    // Bottom rounded band using horizontal strips so alpha gradient & rounded corners both match cleanly
+    let strips = 8usize;
+    for s in 0..strips {
+        let t0 = s as f32 / strips as f32;
+        let t1 = (s + 1) as f32 / strips as f32;
+        let y0 = split_y + r * t0;
+        let y1 = split_y + r * t1;
+        let dy = ((y0 + y1) * 0.5) - split_y;
+        let x_span = (r * r - dy * dy).max(0.0).sqrt();
+        let inset = r - x_span;
+        let band = Rect::from_min_max(pos2(rect.left() + inset, y0), pos2(rect.right() - inset, y1));
+        let col0 = lerp_col(frac + (1.0 - frac) * t0);
+        let col1 = lerp_col(frac + (1.0 - frac) * t1);
+        paint_vertical_gradient(painter, band, col0, col1);
+    }
+}
+
 fn paint_vertical_gradient(
     painter: &egui::Painter,
     rect: Rect,
@@ -5943,45 +6022,6 @@ fn paint_vertical_gradient(
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(0, 2, 3);
     painter.add(egui::Shape::mesh(mesh));
-}
-
-fn paint_rounded_corners_mask(
-    painter: &egui::Painter,
-    rect: Rect,
-    r: f32,
-    bg: Color32,
-    include_bottom: bool,
-) {
-    let steps = 8;
-    let corners: &[(bool, bool)] = if include_bottom {
-        &[(false, false), (true, false), (false, true), (true, true)]
-    } else {
-        &[(false, false), (true, false)]
-    };
-    for &(is_right, is_bottom) in corners {
-        let mut pts = Vec::with_capacity(steps + 2);
-        let corner = match (is_right, is_bottom) {
-            (false, false) => rect.left_top(),
-            (true, false) => rect.right_top(),
-            (false, true) => rect.left_bottom(),
-            (true, true) => rect.right_bottom(),
-        };
-        let cx = if is_right { rect.right() - r } else { rect.left() + r };
-        let cy = if is_bottom { rect.bottom() - r } else { rect.top() + r };
-        let (a0, a1) = match (is_right, is_bottom) {
-            (false, false) => (std::f32::consts::PI, std::f32::consts::PI * 1.5),
-            (true, false) => (std::f32::consts::PI * 1.5, std::f32::consts::TAU),
-            (true, true) => (0.0, std::f32::consts::FRAC_PI_2),
-            (false, true) => (std::f32::consts::FRAC_PI_2, std::f32::consts::PI),
-        };
-        pts.push(corner);
-        for i in 0..=steps {
-            let t = i as f32 / steps as f32;
-            let ang = a0 + (a1 - a0) * t;
-            pts.push(pos2(cx + r * ang.cos(), cy + r * ang.sin()));
-        }
-        painter.add(egui::Shape::convex_polygon(pts, bg, Stroke::NONE));
-    }
 }
 
 fn build_up_next_chips(
@@ -6041,11 +6081,12 @@ fn draw_shorts_transition_card(
     }
     let scrim_h = 148.0_f32.min(rect.height() * 0.45);
     let scrim = Rect::from_min_max(pos2(rect.left(), rect.bottom() - scrim_h), rect.max);
-    paint_vertical_gradient(
+    paint_vertical_gradient_rounded(
         ui.painter(),
         scrim,
         Color32::TRANSPARENT,
         Color32::from_black_alpha(180),
+        radius,
     );
     let text_painter = ui.painter().with_clip_rect(rect.shrink2(vec2(14.0, 8.0)));
     if !out.channel.is_empty() {
@@ -6066,7 +6107,6 @@ fn draw_shorts_transition_card(
             Color32::WHITE,
         );
     }
-    paint_rounded_corners_mask(ui.painter(), rect, radius, theme::BG, true);
     ui.painter().rect_stroke(
         rect,
         radius,

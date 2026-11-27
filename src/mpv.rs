@@ -227,13 +227,22 @@ pub struct MpvRenderHandle(Arc<Mutex<Option<RenderContextHolder>>>);
 
 impl MpvRenderHandle {
     pub fn paint_callback(&self, rect: egui::Rect) -> egui::PaintCallback {
+        self.paint_callback_rounded(rect, 0.0, 0.0)
+    }
+
+    pub fn paint_callback_rounded(
+        &self,
+        rect: egui::Rect,
+        top_radius: f32,
+        bottom_radius: f32,
+    ) -> egui::PaintCallback {
         let holder = self.0.clone();
         egui::PaintCallback {
             rect,
             callback: Arc::new(eframe::egui_glow::CallbackFn::new(move |info, painter| {
                 let Ok(mut guard) = holder.lock() else { return };
                 let Some(ctx) = guard.as_mut() else { return };
-                render_into_egui(ctx, info, painter);
+                render_into_egui(ctx, info, painter, top_radius, bottom_radius);
             })),
         }
     }
@@ -683,6 +692,16 @@ impl MpvPlayer {
         self.render_handle().paint_callback(rect)
     }
 
+    pub fn paint_callback_rounded(
+        &self,
+        rect: egui::Rect,
+        top_radius: f32,
+        bottom_radius: f32,
+    ) -> egui::PaintCallback {
+        self.render_handle()
+            .paint_callback_rounded(rect, top_radius, bottom_radius)
+    }
+
     pub fn destroy_gl(&self, gl: Option<&glow::Context>) {
         if let Ok(mut guard) = self.render.lock() {
             if let Some(mut ctx) = guard.take() {
@@ -788,6 +807,8 @@ fn render_into_egui(
     ctx: &mut RenderContextHolder,
     info: egui::PaintCallbackInfo,
     painter: &eframe::egui_glow::Painter,
+    top_radius: f32,
+    bottom_radius: f32,
 ) {
     let gl = painter.gl();
     let vp = info.viewport_in_pixels();
@@ -899,22 +920,66 @@ fn render_into_egui(
         let clip_h = ((scr_h - clip_min_y).clamp(0, scr_h) - clip_y).max(0);
 
         gl.enable(glow::SCISSOR_TEST);
-        gl.scissor(clip_x, clip_y, clip_w, clip_h);
         gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(surf.fbo));
         let draw_target = std::num::NonZeroU32::new(prev_draw_fbo).map(glow::NativeFramebuffer);
         gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, draw_target);
-        gl.blit_framebuffer(
-            0,
-            0,
-            w,
-            h,
-            vp.left_px,
-            vp.from_bottom_px,
-            vp.left_px + vp.width_px,
-            vp.from_bottom_px + vp.height_px,
-            glow::COLOR_BUFFER_BIT,
-            glow::LINEAR,
-        );
+
+        let max_r = (vp.width_px.min(vp.height_px) / 2).max(0);
+        let top_r = ((top_radius.max(0.0) * info.pixels_per_point).round() as i32).clamp(0, max_r);
+        let bot_r =
+            ((bottom_radius.max(0.0) * info.pixels_per_point).round() as i32).clamp(0, max_r);
+
+        let blit_with_scissor = |sx: i32, sy: i32, sw: i32, sh: i32| {
+            let x0 = sx.max(clip_x);
+            let y0 = sy.max(clip_y);
+            let x1 = (sx + sw).min(clip_x + clip_w);
+            let y1 = (sy + sh).min(clip_y + clip_h);
+            if x1 > x0 && y1 > y0 {
+                gl.scissor(x0, y0, x1 - x0, y1 - y0);
+                gl.blit_framebuffer(
+                    0,
+                    0,
+                    w,
+                    h,
+                    vp.left_px,
+                    vp.from_bottom_px,
+                    vp.left_px + vp.width_px,
+                    vp.from_bottom_px + vp.height_px,
+                    glow::COLOR_BUFFER_BIT,
+                    glow::LINEAR,
+                );
+            }
+        };
+
+        if top_r == 0 && bot_r == 0 {
+            blit_with_scissor(clip_x, clip_y, clip_w, clip_h);
+        } else {
+            let mid_y = vp.from_bottom_px + bot_r;
+            let mid_h = (vp.height_px - top_r - bot_r).max(0);
+            if mid_h > 0 {
+                blit_with_scissor(vp.left_px, mid_y, vp.width_px, mid_h);
+            }
+            for dy in 0..bot_r {
+                let d = bot_r as f32 - (dy as f32 + 0.5);
+                let span = ((bot_r as f32).powi(2) - d * d).max(0.0).sqrt();
+                let inset = ((bot_r as f32) - span).ceil() as i32;
+                let row_w = (vp.width_px - inset * 2).max(0);
+                if row_w > 0 {
+                    blit_with_scissor(vp.left_px + inset, vp.from_bottom_px + dy, row_w, 1);
+                }
+            }
+            for dy in 0..top_r {
+                let d = top_r as f32 - (dy as f32 + 0.5);
+                let span = ((top_r as f32).powi(2) - d * d).max(0.0).sqrt();
+                let inset = ((top_r as f32) - span).ceil() as i32;
+                let row_w = (vp.width_px - inset * 2).max(0);
+                if row_w > 0 {
+                    let y = vp.from_bottom_px + vp.height_px - 1 - dy;
+                    blit_with_scissor(vp.left_px + inset, y, row_w, 1);
+                }
+            }
+            gl.scissor(clip_x, clip_y, clip_w, clip_h);
+        }
         let read_target = std::num::NonZeroU32::new(prev_read_fbo).map(glow::NativeFramebuffer);
         gl.bind_framebuffer(glow::READ_FRAMEBUFFER, read_target);
     }

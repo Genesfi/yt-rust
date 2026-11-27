@@ -65,8 +65,8 @@ Phases 1–7 are complete (`42/42` unit tests passing via `cargo test --locked`,
 ## Next Roadmap (v0.3.0+ — Planned Feature Ideas)
 
 ### Phase 8 — History Controls, Playlist Tools & Radio/Mixes
-- [ ] **Watch History Search, Clear & Pause Controls**: In-page Watch History search filter (`FEhistory`), "Clear Watch History" confirmation action, and "Pause Watch History" toggle synced with Google account preferences.
-- [ ] **Playlist Privacy & Metadata Editing**: Visibility selector (`Private` / `Unlisted` / `Public`) when creating or editing playlists, inline title/description editing, and search/filter inside large playlists.
+- [x] **Watch History Search, Clear & Pause Controls**: In-page Watch History search filter (`FEhistory`), "Clear Watch History" confirmation action, and "Pause Watch History" toggle synced with Google account preferences.
+- [x] **Playlist Privacy & Metadata Editing**: Visibility selector (`Private` / `Unlisted` / `Public`) when creating or editing playlists, inline title/description editing, and search/filter inside large playlists.
 - [ ] **YouTube Mixes / Radio (`RD...`) Queues**: Detect and render YouTube Mix cards (`compactRadioRenderer` / `lockupViewModel`) with auto-refilling endless Up Next mixes.
 - [ ] **Channel Community Posts**: Parse and render Channel **Posts** (`Community` tab — text posts, polls with vote results, and attached images/video previews).
 

@@ -266,6 +266,42 @@ pub struct PlaylistSummary {
     pub thumbnail_url: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PlaylistPrivacy {
+    #[default]
+    Private,
+    Unlisted,
+    Public,
+}
+
+impl PlaylistPrivacy {
+    pub const ALL: [Self; 3] = [Self::Private, Self::Unlisted, Self::Public];
+
+    pub fn api_value(self) -> &'static str {
+        match self {
+            Self::Private => "PRIVATE",
+            Self::Unlisted => "UNLISTED",
+            Self::Public => "PUBLIC",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Private => "Private",
+            Self::Unlisted => "Unlisted",
+            Self::Public => "Public",
+        }
+    }
+
+    pub fn from_api(s: &str) -> Self {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "PUBLIC" => Self::Public,
+            "UNLISTED" => Self::Unlisted,
+            _ => Self::Private,
+        }
+    }
+}
+
 /// Selectable playlist entry from `playlist/get_add_to_playlist`.
 #[derive(Clone, Debug)]
 pub struct PlaylistOption {

@@ -6,14 +6,16 @@ use egui::{
 use crate::backend::Request;
 use crate::innertube;
 use crate::model::{
-    AmbientMode, ChannelInfo, HwdecMode, PoTokenMode, PreferredQuality, SearchDateFilter,
-    SearchDurationFilter, SearchFilter, SearchSortBy, SearchTypeFilter, VideoItem, WindowMaterial,
+    AmbientMode, ChannelInfo, HwdecMode, PlaylistPrivacy, PoTokenMode, PreferredQuality,
+    SearchDateFilter, SearchDurationFilter, SearchFilter, SearchSortBy, SearchTypeFilter,
+    VideoItem, WindowMaterial,
 };
 use crate::theme::{self, icon};
 use crate::ytdlp;
 
 use super::cards::{
-    draw_avatar, draw_thumbnail, draw_video_grid, draw_video_grid_with_flags, icon_circle_button,
+    draw_avatar, draw_history_feed, draw_thumbnail, draw_video_grid,
+    draw_video_grid_with_flags, icon_circle_button,
 };
 use super::{GUEST_TOPICS, Page, SettingsTab, SubsFilter, YtApp, format_duration};
 
@@ -3230,19 +3232,39 @@ impl YtApp {
         let loading = self.playlist_loading;
         let cont = self.playlist_continuation.clone();
         let editable = self.playlist_is_editable && self.signed_in;
-        let has_videos = items.iter().any(|it| it.playlist_browse_id.is_none());
+        let filter_active = !self.playlist_search_query.trim().is_empty();
+        let visible_items = filter_videos_by_query(&items, &self.playlist_search_query);
+        let has_videos = visible_items.iter().any(|it| it.playlist_browse_id.is_none());
 
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(&heading).font(theme::bold(20.0)));
+            if let Some(priv_val) = self.active_playlist_privacy {
+                Frame::new()
+                    .fill(theme::CHIP)
+                    .corner_radius(10)
+                    .inner_margin(Margin::symmetric(8, 3))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(priv_val.label())
+                                .font(theme::medium(11.5))
+                                .color(theme::TEXT_DIM),
+                        );
+                    });
+            }
             if !items.is_empty() {
-                ui.label(
-                    RichText::new(format!(
+                let count_label = if filter_active {
+                    format!("{} of {} videos", visible_items.len(), items.len())
+                } else {
+                    format!(
                         "{} video{}",
                         items.len(),
                         if items.len() == 1 { "" } else { "s" }
-                    ))
-                    .font(theme::regular(13.0))
-                    .color(theme::TEXT_DIM),
+                    )
+                };
+                ui.label(
+                    RichText::new(count_label)
+                        .font(theme::regular(13.0))
+                        .color(theme::TEXT_DIM),
                 );
             }
             if loading {
@@ -3250,10 +3272,11 @@ impl YtApp {
             }
             if has_videos {
                 ui.add_space(10.0);
-                let pl_cont = self
-                    .active_playlist_id
-                    .clone()
-                    .zip(cont.clone());
+                let pl_cont = if filter_active {
+                    None
+                } else {
+                    self.active_playlist_id.clone().zip(cont.clone())
+                };
                 if ui
                     .add(
                         egui::Button::new(
@@ -3266,7 +3289,7 @@ impl YtApp {
                     )
                     .clicked()
                 {
-                    self.play_all(&items, false, pl_cont.clone());
+                    self.play_all(&visible_items, false, pl_cont.clone());
                 }
                 let (sh_rect, sh_resp) =
                     ui.allocate_exact_size(Vec2::new(92.0, 32.0), Sense::click());
@@ -3296,7 +3319,43 @@ impl YtApp {
                     theme::TEXT,
                 );
                 if sh_resp.clicked() {
-                    self.play_all(&items, true, pl_cont);
+                    self.play_all(&visible_items, true, pl_cont);
+                }
+            }
+            if editable {
+                let edit_fill = if self.playlist_meta_edit_open {
+                    theme::YT_BLUE.gamma_multiply(0.24)
+                } else {
+                    theme::CHIP
+                };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(if self.playlist_meta_edit_open {
+                                "Close editor"
+                            } else {
+                                "Edit details"
+                            })
+                            .font(theme::medium(12.5))
+                            .color(if self.playlist_meta_edit_open {
+                                theme::YT_BLUE
+                            } else {
+                                theme::TEXT
+                            }),
+                        )
+                        .fill(edit_fill)
+                        .corner_radius(18),
+                    )
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    self.playlist_meta_edit_open = !self.playlist_meta_edit_open;
+                    if self.playlist_meta_edit_open {
+                        self.playlist_edit_title = self.active_playlist_title.clone();
+                        self.playlist_edit_desc = self.active_playlist_description.clone();
+                        self.playlist_edit_privacy =
+                            self.active_playlist_privacy.unwrap_or(PlaylistPrivacy::Private);
+                    }
                 }
             }
             if editable && !items.is_empty() {
@@ -3333,6 +3392,136 @@ impl YtApp {
                 }
             }
         });
+        if !self.active_playlist_description.is_empty() && !self.playlist_meta_edit_open {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(&self.active_playlist_description)
+                    .font(theme::regular(12.5))
+                    .color(theme::TEXT_DIM),
+            );
+        }
+        if editable && self.playlist_meta_edit_open {
+            ui.add_space(8.0);
+            Frame::new()
+                .fill(theme::SURFACE)
+                .stroke(Stroke::new(1.0, theme::BORDER))
+                .corner_radius(10)
+                .inner_margin(Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Title")
+                                .font(theme::medium(12.5))
+                                .color(theme::TEXT_DIM),
+                        );
+                        ui.add_space(8.0);
+                        ui.add_sized(
+                            Vec2::new((ui.available_width() - 60.0).clamp(180.0, 420.0), 28.0),
+                            egui::TextEdit::singleline(&mut self.playlist_edit_title)
+                                .hint_text("Playlist title"),
+                        );
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal_top(|ui| {
+                        ui.label(
+                            RichText::new("Description")
+                                .font(theme::medium(12.5))
+                                .color(theme::TEXT_DIM),
+                        );
+                        ui.add_space(8.0);
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.playlist_edit_desc)
+                                .desired_rows(2)
+                                .desired_width((ui.available_width() - 20.0).clamp(200.0, 480.0))
+                                .hint_text("Add a description..."),
+                        );
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Visibility")
+                                .font(theme::medium(12.5))
+                                .color(theme::TEXT_DIM),
+                        );
+                        ui.add_space(8.0);
+                        for vis in PlaylistPrivacy::ALL {
+                            let selected = self.playlist_edit_privacy == vis;
+                            if ui
+                                .selectable_label(
+                                    selected,
+                                    RichText::new(vis.label())
+                                        .font(theme::semibold(12.0))
+                                        .color(if selected {
+                                            theme::YT_BLUE
+                                        } else {
+                                            theme::TEXT_DIM
+                                        }),
+                                )
+                                .clicked()
+                            {
+                                self.playlist_edit_privacy = vis;
+                            }
+                        }
+                        ui.add_space(16.0);
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(format!("{}  Save changes", icon::CHECK))
+                                        .font(theme::semibold(12.5))
+                                        .color(Color32::from_rgb(15, 15, 15)),
+                                )
+                                .fill(theme::YT_BLUE)
+                                .corner_radius(16),
+                            )
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            let new_title = self.playlist_edit_title.trim().to_owned();
+                            if !new_title.is_empty() {
+                                if let Some(bid) = self.active_playlist_id.clone() {
+                                    let _ = self.backend.tx.send(Request::UpdatePlaylistMeta {
+                                        playlist_id: bid,
+                                        title: (new_title != self.active_playlist_title)
+                                            .then_some(new_title),
+                                        description: (self.playlist_edit_desc
+                                            != self.active_playlist_description)
+                                            .then(|| self.playlist_edit_desc.clone()),
+                                        privacy: (Some(self.playlist_edit_privacy)
+                                            != self.active_playlist_privacy)
+                                            .then_some(self.playlist_edit_privacy),
+                                    });
+                                    self.playlist_meta_edit_open = false;
+                                }
+                            } else {
+                                self.toast("Playlist title cannot be empty");
+                            }
+                        }
+                        if settings_pill_btn(ui, "Cancel", Some(icon::X)).clicked() {
+                            self.playlist_meta_edit_open = false;
+                        }
+                    });
+                });
+        }
+        if !items.is_empty() {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    Vec2::new(ui.available_width().min(320.0), 28.0),
+                    egui::TextEdit::singleline(&mut self.playlist_search_query)
+                        .hint_text("Filter videos in playlist..."),
+                );
+                if filter_active && icon_circle_button(ui, icon::X, 13.0, "Clear filter") {
+                    self.playlist_search_query.clear();
+                }
+                if self.playlist_manage_mode && filter_active {
+                    ui.label(
+                        RichText::new("Clear filter to reorder videos")
+                            .font(theme::regular(12.0))
+                            .color(theme::TEXT_DIM),
+                    );
+                }
+            });
+        }
         ui.add_space(10.0);
 
         if self.playlist_manage_mode && editable {
@@ -3354,7 +3543,8 @@ impl YtApp {
                 .id_salt("playlist_manage_scroll")
                 .show(ui, |ui| {
                     let row_w = ui.available_width().min(860.0);
-                    for (idx, it) in items.iter().enumerate() {
+                    let list_ref = if filter_active { &visible_items } else { &items };
+                    for (idx, it) in list_ref.iter().enumerate() {
                         let is_dragged =
                             self.playlist_drag_active && self.playlist_drag_idx == Some(idx);
                         let frame_resp = Frame::new()
@@ -3430,7 +3620,7 @@ impl YtApp {
                                         ) {
                                             remove_item = Some(it.clone());
                                         }
-                                        if it.playlist_set_video_id.is_some() {
+                                        if !filter_active && it.playlist_set_video_id.is_some() {
                                             if idx + 1 < items.len()
                                                 && icon_circle_button(
                                                     ui,
@@ -3457,7 +3647,8 @@ impl YtApp {
                             });
                         let rect = frame_resp.response.rect;
                         row_rects.push((idx, rect));
-                        if it.playlist_set_video_id.is_some()
+                        if !filter_active
+                            && it.playlist_set_video_id.is_some()
                             && frame_resp.response.hovered()
                             && ui.input(|i| i.pointer.primary_pressed())
                         {
@@ -3529,10 +3720,21 @@ impl YtApp {
             return;
         }
 
+        if visible_items.is_empty() && !items.is_empty() {
+            ui.label(
+                RichText::new(format!(
+                    "No videos matching \"{}\"",
+                    self.playlist_search_query.trim()
+                ))
+                .font(theme::regular(13.5))
+                .color(theme::TEXT_DIM),
+            );
+            return;
+        }
         if let Some(act) = draw_video_grid_with_flags(
             ui,
             "",
-            &items,
+            &visible_items,
             loading,
             cont.is_some(),
             false,
@@ -3549,6 +3751,190 @@ impl YtApp {
             });
         }
     }
+
+    pub(super) fn draw_history_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let synced = self.signed_in && self.sync_history;
+        ui.horizontal_wrapped(|ui| {
+            let te = ui.add_sized(
+                Vec2::new(ui.available_width().clamp(180.0, 300.0), 30.0),
+                egui::TextEdit::singleline(&mut self.history_search_input)
+                    .hint_text("Search watch history..."),
+            );
+            let submit_search = settings_pill_btn(ui, "Search", Some(icon::SEARCH)).clicked()
+                || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            if submit_search {
+                let q = self.history_search_input.trim().to_owned();
+                self.history_search_active = q.clone();
+                if synced {
+                    self.remote_history_loading = true;
+                    let _ = self.backend.tx.send(Request::LoadHistory {
+                        query: (!q.is_empty()).then_some(q),
+                        continuation: None,
+                    });
+                }
+            }
+            if (!self.history_search_input.is_empty() || !self.history_search_active.is_empty())
+                && icon_circle_button(ui, icon::X, 13.0, "Clear history search")
+            {
+                let was_active = !self.history_search_active.is_empty();
+                self.history_search_input.clear();
+                self.history_search_active.clear();
+                if synced && was_active {
+                    self.remote_history_loading = true;
+                    let _ = self.backend.tx.send(Request::LoadHistory {
+                        query: None,
+                        continuation: None,
+                    });
+                }
+            }
+            ui.add_space(6.0);
+            let pause_label = if self.history_paused {
+                "Resume watch history"
+            } else {
+                "Pause watch history"
+            };
+            let pause_icon = if self.history_paused {
+                icon::PLAY
+            } else {
+                icon::PAUSE
+            };
+            if settings_pill_btn(ui, pause_label, Some(pause_icon)).clicked() {
+                if synced {
+                    let _ = self.backend.tx.send(Request::TogglePauseWatchHistory {
+                        pause: !self.history_paused,
+                        feedback_token: self.history_pause_token.clone(),
+                    });
+                } else {
+                    self.history_paused = !self.history_paused;
+                    self.toast(if self.history_paused {
+                        "Local watch history paused"
+                    } else {
+                        "Local watch history resumed"
+                    });
+                }
+            }
+            if settings_pill_btn(ui, "Clear watch history", Some(icon::TRASH_2)).clicked() {
+                self.history_clear_confirm = true;
+            }
+        });
+
+        if self.history_paused {
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Watch history is paused. Newly watched videos won't be recorded.")
+                    .font(theme::regular(12.5))
+                    .color(theme::TEXT_DIM),
+            );
+        }
+
+        if self.history_clear_confirm {
+            ui.add_space(8.0);
+            Frame::new()
+                .fill(theme::SURFACE)
+                .stroke(Stroke::new(1.0, theme::YT_RED.gamma_multiply(0.6)))
+                .corner_radius(10)
+                .inner_margin(Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(if synced {
+                                "Clear all YouTube and local watch history?"
+                            } else {
+                                "Clear local watch history?"
+                            })
+                            .font(theme::medium(13.0))
+                            .color(Color32::WHITE),
+                        );
+                        ui.add_space(8.0);
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Confirm Clear")
+                                        .font(theme::semibold(12.5))
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(theme::YT_RED)
+                                .corner_radius(16),
+                            )
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            if synced {
+                                let _ = self.backend.tx.send(Request::ClearWatchHistory {
+                                    feedback_token: self.history_clear_token.clone(),
+                                });
+                            } else {
+                                self.history.clear();
+                                self.history_clear_confirm = false;
+                                self.toast("Cleared local watch history");
+                            }
+                        }
+                        if settings_pill_btn(ui, "Cancel", Some(icon::X)).clicked() {
+                            self.history_clear_confirm = false;
+                        }
+                    });
+                });
+        }
+        ui.add_space(8.0);
+
+        if synced {
+            let visible = filter_videos_by_query(&self.remote_history, &self.history_search_input);
+            let loading = self.remote_history_loading;
+            let cont = self.remote_history_continuation.clone();
+            let q_active = (!self.history_search_active.trim().is_empty())
+                .then(|| self.history_search_active.trim().to_owned());
+            if let Some(act) = draw_history_feed(
+                ui,
+                "Watch History (Synced with YouTube)",
+                &visible,
+                &mut self.history_filter,
+                loading,
+                cont.is_some(),
+            ) {
+                self.handle_grid_action(ctx, act, |app| {
+                    app.remote_history_loading = true;
+                    let _ = app.backend.tx.send(Request::LoadHistory {
+                        query: q_active,
+                        continuation: cont,
+                    });
+                });
+            }
+        } else {
+            let visible = filter_videos_by_query(&self.history, &self.history_search_input);
+            if let Some(act) = draw_history_feed(
+                ui,
+                "Watch History (Local)",
+                &visible,
+                &mut self.history_filter,
+                false,
+                false,
+            ) {
+                self.handle_grid_action(ctx, act, |_| {});
+            }
+        }
+    }
+}
+
+pub(super) fn filter_videos_by_query(items: &[VideoItem], query: &str) -> Vec<VideoItem> {
+    let words: Vec<String> = query
+        .split_whitespace()
+        .map(|w| w.to_ascii_lowercase())
+        .collect();
+    if words.is_empty() {
+        return items.to_vec();
+    }
+    items
+        .iter()
+        .filter(|it| {
+            let hay = format!(
+                "{} {}",
+                it.title.to_ascii_lowercase(),
+                it.channel.to_ascii_lowercase()
+            );
+            words.iter().all(|w| hay.contains(w.as_str()))
+        })
+        .cloned()
+        .collect()
 }
 
 fn settings_match(words: &[String], group: &str, text: &str) -> bool {
@@ -3688,7 +4074,8 @@ fn settings_pill_btn(ui: &mut egui::Ui, label: &str, ico: Option<char>) -> egui:
 
 #[cfg(test)]
 mod settings_tests {
-    use super::settings_match;
+    use super::{filter_videos_by_query, settings_match};
+    use crate::model::VideoItem;
 
     #[test]
     fn settings_match_filters_by_group_and_row() {
@@ -3699,5 +4086,36 @@ mod settings_tests {
         let q_group = vec!["playback".to_owned(), "token".to_owned()];
         assert!(settings_match(&q_group, "Playback", "BotGuard PO Token"));
         assert!(!settings_match(&q_group, "Appearance", "Ambient background"));
+    }
+
+    #[test]
+    fn filter_videos_by_query_matches_title_and_channel() {
+        let make = |id: &str, title: &str, channel: &str| VideoItem {
+            id: id.into(),
+            title: title.into(),
+            channel: channel.into(),
+            channel_id: None,
+            channel_avatar_url: None,
+            views_text: String::new(),
+            published_text: String::new(),
+            duration_text: String::new(),
+            thumbnail_url: String::new(),
+            is_live: false,
+            watched_percent: None,
+            resume_secs: None,
+            playlist_browse_id: None,
+            playlist_set_video_id: None,
+            is_new: false,
+            is_members_only: false,
+        };
+        let items = vec![
+            make("1", "Rust Async Deep Dive", "Jon Gjengset"),
+            make("2", "Anime OP Piano Cover", "Animenz"),
+        ];
+        assert_eq!(filter_videos_by_query(&items, "").len(), 2);
+        let r = filter_videos_by_query(&items, "jon async");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].id, "1");
+        assert!(filter_videos_by_query(&items, "nonexistent").is_empty());
     }
 }
