@@ -1253,6 +1253,7 @@ fn draw_video_card_row(
             let can_preview = hover_in.enabled
                 && !item.is_short()
                 && item.playlist_browse_id.is_none()
+                && item.mix_playlist_id.is_none()
                 && !any_popup_open;
             if can_preview && hovered {
                 ui.ctx().data_mut(|d| {
@@ -1524,6 +1525,7 @@ fn draw_video_card_row(
                 && action.is_none()
                 && !item.is_short()
                 && item.playlist_browse_id.is_none()
+                && item.mix_playlist_id.is_none()
             {
                 *action = Some(GridAction::OpenInSecondTab(item.clone()));
             } else if card_hover_resp.clicked() && !child_clicked_override && action.is_none() {
@@ -1542,6 +1544,16 @@ pub(super) fn draw_video_context_menu(
     action: &mut Option<GridAction>,
     show_play_next: bool,
 ) {
+    if item.mix_playlist_id.is_some() {
+        if ui
+            .button(format!("{}  Start Radio Mix", icon::RADIO))
+            .clicked()
+        {
+            *action = Some(GridAction::Open(item.clone()));
+            ui.close();
+        }
+        return;
+    }
     if !item.is_short()
         && item.playlist_browse_id.is_none()
         && ui
@@ -1764,8 +1776,16 @@ fn draw_thumbnail_with_hover(
 
     if !badge_text.is_empty() {
         let is_live = badge_text.eq_ignore_ascii_case("LIVE");
+        let is_mix = badge_text.eq_ignore_ascii_case("Mix");
+        let display_badge = if is_mix {
+            format!("{} Mix", icon::RADIO)
+        } else {
+            badge_text
+        };
         let bg = if is_live {
             theme::YT_RED
+        } else if is_mix {
+            Color32::from_rgba_unmultiplied(36, 48, 78, 232)
         } else {
             Color32::from_black_alpha(210)
         };
@@ -1775,7 +1795,7 @@ fn draw_thumbnail_with_hover(
         let offset = if compact { vec2(3.0, 3.0) } else { vec2(7.0, 7.0) };
         let corner = if compact { 3.0 } else { 4.0 };
         let galley = ui.painter().layout_no_wrap(
-            badge_text,
+            display_badge,
             font,
             Color32::WHITE,
         );

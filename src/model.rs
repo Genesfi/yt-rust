@@ -10,7 +10,7 @@ pub struct FeedChip {
 }
 
 /// A video card shown in Home feed, Subscriptions, Trending, Search, History, Channel, or Related list.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct VideoItem {
     pub id: String,
     pub title: String,
@@ -32,6 +32,9 @@ pub struct VideoItem {
     /// Set when a card represents a playlist (e.g. inside a channel's Playlists tab).
     #[serde(default)]
     pub playlist_browse_id: Option<String>,
+    /// Set when a card represents a YouTube Mix / Radio (`RD...` playlistId).
+    #[serde(default)]
+    pub mix_playlist_id: Option<String>,
     /// Playlist item instance ID (`playlistVideoRenderer.setVideoId`) for remove/reorder actions.
     #[serde(default)]
     pub playlist_set_video_id: Option<String>,
@@ -40,6 +43,39 @@ pub struct VideoItem {
     pub is_new: bool,
     /// True if this video/Short is Members-only.
     #[serde(default)]
+    pub is_members_only: bool,
+}
+
+/// A single choice inside a Channel Community poll (`pollRenderer`).
+#[derive(Clone, Debug, Default)]
+pub struct CommunityPollChoice {
+    pub text: String,
+    pub num_votes_text: String,
+    pub vote_ratio: Option<f32>,
+    pub selected: bool,
+    pub vote_params: Option<String>,
+}
+
+/// A post inside a channel's Community / Posts tab.
+#[derive(Clone, Debug, Default)]
+pub struct CommunityPost {
+    pub id: String,
+    pub author: String,
+    pub author_avatar_url: Option<String>,
+    pub published_text: String,
+    pub content: String,
+    pub likes_text: String,
+    pub is_liked: bool,
+    pub like_params: Option<String>,
+    pub unlike_params: Option<String>,
+    pub comments_text: String,
+    pub comments_browse_id: Option<String>,
+    pub comments_browse_params: Option<String>,
+    pub comments_token: Option<String>,
+    pub images: Vec<String>,
+    pub attached_video: Option<VideoItem>,
+    pub poll_total_votes: String,
+    pub poll_choices: Vec<CommunityPollChoice>,
     pub is_members_only: bool,
 }
 

@@ -15,7 +15,7 @@ use egui::{Align, Color32, Frame, Key, Layout, Margin, ViewportCommand};
 use crate::backend::{Backend, Request, Response};
 use crate::innertube;
 use crate::model::{
-    AmbientMode, ChannelInfo, ChannelNotificationParams, CommentItem, FeedChip,
+    AmbientMode, ChannelInfo, ChannelNotificationParams, CommentItem, CommunityPost, FeedChip,
     HoverPreviewQuality, HwdecMode, KeyBinding, LastWatched, LiveChatEmote, LiveChatMessage,
     NotificationMenuItem, PlaylistOption, PlaylistPrivacy, PlaylistSummary, PoTokenMode,
     PreferredQuality, SearchChannelResult, SearchFilter, ShortcutConfig, ShortcutSlot,
@@ -404,6 +404,8 @@ pub struct YtApp {
     pub(super) signing_in: bool,
     pub(super) account_name: Option<String>,
     pub(super) account_avatar: Option<String>,
+    pub(super) account_channel_id: Option<String>,
+    pub(super) show_topbar_account_name: bool,
 
     pub(super) notifications: Vec<NotificationMenuItem>,
     pub(super) notifications_loading: bool,
@@ -475,6 +477,16 @@ pub struct YtApp {
     pub(super) channel_tab_params: Option<String>,
     pub(super) channel_chips: Vec<FeedChip>,
     pub(super) channel_items: Vec<VideoItem>,
+    pub(super) channel_posts: Vec<CommunityPost>,
+    pub(super) expanded_post_id: Option<String>,
+    pub(super) post_comments: Vec<CommentItem>,
+    pub(super) post_comments_next_token: Option<String>,
+    pub(super) post_comments_loading: bool,
+    pub(super) post_comment_create_params: Option<String>,
+    pub(super) post_comment_draft: String,
+    pub(super) post_reply_target_id: Option<String>,
+    pub(super) post_reply_target_author: String,
+    pub(super) post_reply_draft: String,
     pub(super) channel_continuation: Option<String>,
     pub(super) channel_loading: bool,
     pub(super) channel_search_input: String,
@@ -499,6 +511,10 @@ pub struct YtApp {
     pub(super) history_pause_token: Option<String>,
     pub(super) saved: Vec<VideoItem>,
     pub(super) queue: Vec<VideoItem>,
+    pub(super) active_mix_id: Option<String>,
+    pub(super) active_mix_title: String,
+    pub(super) active_mix_continuation: Option<String>,
+    pub(super) active_mix_loading: bool,
     pub(super) queue_drag_idx: Option<usize>,
     pub(super) queue_drag_origin: Option<(egui::Pos2, Instant)>,
     pub(super) queue_drag_active: bool,
@@ -727,6 +743,8 @@ impl YtApp {
         let mut preferred_quality = PreferredQuality::P1080;
         let mut hover_preview_quality = HoverPreviewQuality::P480;
         let mut hover_preview_muted = true;
+        let mut show_topbar_account_name = false;
+        let mut sleep_timer = SleepTimer::Off;
         let mut hwdec_mode = HwdecMode::AutoCopy;
         let mut download_dir = String::new();
         let mut sidebar_expanded = true;
@@ -781,6 +799,21 @@ impl YtApp {
             }
             if let Some(ag) = storage.get_string("ambient_glow") {
                 ambient_glow = ag != "0";
+            }
+            if let Some(sn) = storage.get_string("show_topbar_account_name") {
+                show_topbar_account_name = sn == "1";
+            }
+            let sleep_mode = storage.get_string("sleep_timer_mode");
+            let sleep_until = storage
+                .get_string("sleep_timer_until_unix")
+                .and_then(|s| s.parse::<f64>().ok());
+            if sleep_mode.is_some() || sleep_until.is_some() {
+                sleep_timer = restore_sleep_timer(
+                    sleep_mode.as_deref(),
+                    sleep_until,
+                    unix_now_secs(),
+                    Instant::now(),
+                );
             }
             if let Some(pt) = storage.get_string("po_token_mode") {
                 po_token_mode = match pt.as_str() {
@@ -910,6 +943,8 @@ impl YtApp {
             signing_in: false,
             account_name: None,
             account_avatar: None,
+            account_channel_id: None,
+            show_topbar_account_name,
             notifications: Vec::new(),
             notifications_loading: false,
             notifications_open: false,
@@ -972,6 +1007,16 @@ impl YtApp {
             channel_tab_params: None,
             channel_chips: Vec::new(),
             channel_items: Vec::new(),
+            channel_posts: Vec::new(),
+            expanded_post_id: None,
+            post_comments: Vec::new(),
+            post_comments_next_token: None,
+            post_comments_loading: false,
+            post_comment_create_params: None,
+            post_comment_draft: String::new(),
+            post_reply_target_id: None,
+            post_reply_target_author: String::new(),
+            post_reply_draft: String::new(),
             channel_continuation: None,
             channel_loading: false,
             channel_search_input: String::new(),
@@ -994,6 +1039,10 @@ impl YtApp {
             history_pause_token: None,
             saved,
             queue: Vec::new(),
+            active_mix_id: None,
+            active_mix_title: String::new(),
+            active_mix_continuation: None,
+            active_mix_loading: false,
             queue_drag_idx: None,
             queue_drag_origin: None,
             queue_drag_active: false,
@@ -1103,7 +1152,7 @@ impl YtApp {
             win_pip_saved_aot: always_on_top,
             win_pip_saved_page: Page::Home,
             always_on_top,
-            sleep_timer: SleepTimer::Off,
+            sleep_timer,
             sleep_timer_input: String::new(),
             start_paused: false,
             close_to_tray,
@@ -1182,6 +1231,7 @@ impl YtApp {
         self.signing_in = false;
         self.account_name = None;
         self.account_avatar = None;
+        self.account_channel_id = None;
         self.notifications.clear();
         self.notifications_open = false;
         self.unread_notifications = 0;
@@ -1419,6 +1469,14 @@ impl YtApp {
         self.channel_tab_params = None;
         self.channel_chips.clear();
         self.channel_items.clear();
+        self.channel_posts.clear();
+        self.expanded_post_id = None;
+        self.post_comments.clear();
+        self.post_comments_next_token = None;
+        self.post_comments_loading = false;
+        self.post_comment_create_params = None;
+        self.post_comment_draft.clear();
+        self.post_reply_target_id = None;
         self.channel_continuation = None;
         self.channel_loading = true;
         self.channel_search_input.clear();
@@ -1946,8 +2004,10 @@ impl YtApp {
 
         self.record_history(item.clone());
         if let Some(m) = &self.shorts_slot.mpv {
-            m.set_paused(true);
+            m.stop();
         }
+        self.shorts_slot.playback = PlaybackState::default();
+        self.shorts_slot.watch = None;
         self.shorts_opened_at = Some(Instant::now());
         self.shorts_slot.clear_for_new_video(&item.id);
         self.shorts_slot.pending_resume = None;
@@ -2239,6 +2299,7 @@ impl YtApp {
                 .and_then(|s| (data.duration_secs > 10.0).then_some((s / data.duration_secs) as f32)),
             resume_secs: start_at,
             playlist_browse_id: None,
+            mix_playlist_id: None,
             playlist_set_video_id: None,
         };
         self.record_history(hist_item);
@@ -2504,6 +2565,16 @@ impl YtApp {
         if q.is_empty() {
             return;
         }
+        if let Some((mix_id, opt_vid)) = innertube::extract_mix_list_id(&q) {
+            let seed = opt_vid.map(|vid| VideoItem {
+                id: vid.clone(),
+                title: format!("Mix {mix_id}"),
+                thumbnail_url: format!("https://i.ytimg.com/vi/{vid}/mqdefault.jpg"),
+                ..Default::default()
+            });
+            self.start_mix(mix_id, seed, "YouTube Mix".to_owned());
+            return;
+        }
         if let Some(vid) = innertube::extract_video_id(&q) {
             if q.contains("/shorts/") {
                 let item = VideoItem {
@@ -2520,6 +2591,7 @@ impl YtApp {
                     watched_percent: None,
                     resume_secs: None,
                     playlist_browse_id: None,
+                    mix_playlist_id: None,
                     playlist_set_video_id: None,
                     is_new: false,
                     is_members_only: false,
@@ -2882,7 +2954,14 @@ impl YtApp {
     ) {
         match action {
             GridAction::Open(it) => {
-                if let Some(bid) = it.playlist_browse_id.clone() {
+                if let Some(mix_id) = it.mix_playlist_id.clone() {
+                    let seed = (it.id.len() == 11).then(|| {
+                        let mut v = it.clone();
+                        v.mix_playlist_id = None;
+                        v
+                    });
+                    self.start_mix(mix_id, seed, it.title);
+                } else if let Some(bid) = it.playlist_browse_id.clone() {
                     self.open_playlist(bid, it.title);
                 } else if it.duration_text == "Short" || self.page == Page::Shorts {
                     let list = match self.page {
@@ -3394,6 +3473,7 @@ impl YtApp {
                     channel_id,
                     info,
                     mut items,
+                    mut posts,
                     chips,
                     continuation,
                     append,
@@ -3401,6 +3481,12 @@ impl YtApp {
                     if self.channel_id.as_deref() == Some(channel_id.as_str()) {
                         self.channel_loading = false;
                         self.ingest_resume_metadata(&mut items);
+                        for p in &mut posts {
+                            if let Some(v) = p.attached_video.as_mut() {
+                                let single = std::slice::from_mut(v);
+                                self.ingest_resume_metadata(single);
+                            }
+                        }
                         if !info.name.is_empty() && info.name != "Channel" {
                             self.channel_name = info.name.clone();
                         }
@@ -3432,11 +3518,70 @@ impl YtApp {
                                     self.channel_items.push(it);
                                 }
                             }
+                            for p in posts {
+                                if !self.channel_posts.iter().any(|x| x.id == p.id) {
+                                    self.channel_posts.push(p);
+                                }
+                            }
                         } else {
                             self.channel_items = items;
+                            self.channel_posts = posts;
                         }
                         self.channel_continuation = continuation;
                     }
+                }
+                Response::MixQueueLoaded {
+                    playlist_id,
+                    title,
+                    mut items,
+                    continuation,
+                    append,
+                } => {
+                    if self.active_mix_id.as_deref() == Some(playlist_id.as_str()) {
+                        self.active_mix_loading = false;
+                        self.active_mix_continuation = continuation;
+                        if !title.is_empty() {
+                            self.active_mix_title = title;
+                        }
+                        self.ingest_resume_metadata(&mut items);
+                        self.ingest_and_request_avatars(&mut items);
+                        let cur_id = self.watch.as_ref().map(|w| w.id.clone());
+                        items.retain(|it| {
+                            cur_id.as_deref() != Some(it.id.as_str())
+                                && !self.queue.iter().any(|q| q.id == it.id)
+                        });
+                        if !append && self.watch.is_none() && !items.is_empty() {
+                            let first = items.remove(0);
+                            self.open_video(first);
+                        }
+                        self.queue.extend(items);
+                        self.persist_queue();
+                        if !self.queue.is_empty() {
+                            self.right_tab = RightTab::Queue;
+                        }
+                    }
+                }
+                Response::CommunityPollVoted {
+                    post_id,
+                    choice_idx,
+                    synced,
+                } => {
+                    if let Some(post) = self.channel_posts.iter_mut().find(|p| p.id == post_id) {
+                        for (i, ch) in post.poll_choices.iter_mut().enumerate() {
+                            ch.selected = i == choice_idx;
+                        }
+                    }
+                    if synced {
+                        self.toast("Vote submitted");
+                    } else if !self.signed_in {
+                        self.toast("Vote recorded locally (sign in to sync)");
+                    }
+                }
+                Response::CommunityPostLikeUpdated { post_id, liked } => {
+                    if let Some(post) = self.channel_posts.iter_mut().find(|p| p.id == post_id) {
+                        post.is_liked = liked;
+                    }
+                    self.toast(if liked { "Liked post" } else { "Removed like" });
                 }
                 Response::ChannelSearchLoaded {
                     channel_id,
@@ -3512,6 +3657,7 @@ impl YtApp {
                     video_url,
                     audio_url,
                     duration_secs,
+                    is_live,
                 } => {
                     if self.hover_preview_quality != HoverPreviewQuality::Off
                         && self.hover_preview_loading_id.as_deref() == Some(video_id.as_str())
@@ -3542,7 +3688,8 @@ impl YtApp {
                             mpv.set_hwdec(self.hwdec_mode);
                             mpv.set_volume(self.volume);
                             mpv.set_mute(self.hover_preview_muted);
-                            mpv.load_stream(&video_url, audio_url.as_deref(), Some(0.0));
+                            let start_at = if is_live { None } else { Some(0.0) };
+                            mpv.load_stream(&video_url, audio_url.as_deref(), start_at);
                             self.hover_preview_active_id = Some(video_id);
                             self.hover_preview_loading_id = None;
                             self.hover_preview_duration = duration_secs;
@@ -3642,21 +3789,34 @@ impl YtApp {
                     create_params,
                     append,
                 } => {
-                    self.with_matching_slot(&video_id, |app, _is_shorts| {
-                        app.comments_loading = false;
-                        if !sort_options.is_empty() {
-                            app.comment_sort_options = sort_options;
-                        }
+                    if self.expanded_post_id.as_deref() == Some(video_id.as_str()) {
+                        self.post_comments_loading = false;
                         if create_params.is_some() {
-                            app.comment_create_params = create_params;
+                            self.post_comment_create_params = create_params;
                         }
                         if append {
-                            app.comments.extend(comments);
+                            self.post_comments.extend(comments);
                         } else {
-                            app.comments = comments;
+                            self.post_comments = comments;
                         }
-                        app.comments_next_token = next_token;
-                    });
+                        self.post_comments_next_token = next_token;
+                    } else {
+                        self.with_matching_slot(&video_id, |app, _is_shorts| {
+                            app.comments_loading = false;
+                            if !sort_options.is_empty() {
+                                app.comment_sort_options = sort_options;
+                            }
+                            if create_params.is_some() {
+                                app.comment_create_params = create_params;
+                            }
+                            if append {
+                                app.comments.extend(comments);
+                            } else {
+                                app.comments = comments;
+                            }
+                            app.comments_next_token = next_token;
+                        });
+                    }
                 }
                 Response::CommentRepliesLoaded {
                     video_id,
@@ -3664,31 +3824,43 @@ impl YtApp {
                     replies,
                     next_token,
                 } => {
-                    self.with_matching_slot(&video_id, |app, _is_shorts| {
-                        if let Some(c) = app.comments.iter_mut().find(|c| c.id == comment_id) {
+                    if self.expanded_post_id.as_deref() == Some(video_id.as_str()) {
+                        if let Some(c) = self.post_comments.iter_mut().find(|c| c.id == comment_id) {
                             c.replies.extend(replies);
                             c.replies_token = next_token;
                             c.replies_loading = false;
                         }
-                    });
+                    } else {
+                        self.with_matching_slot(&video_id, |app, _is_shorts| {
+                            if let Some(c) = app.comments.iter_mut().find(|c| c.id == comment_id) {
+                                c.replies.extend(replies);
+                                c.replies_token = next_token;
+                                c.replies_loading = false;
+                            }
+                        });
+                    }
                 }
                 Response::CommentPosted { video_id } => {
-                    self.with_matching_slot(&video_id, |app, _is_shorts| {
-                        app.toast("Comment posted");
-                    });
+                    if self.expanded_post_id.as_deref() == Some(video_id.as_str()) {
+                        self.toast("Comment posted");
+                    } else {
+                        self.with_matching_slot(&video_id, |app, _is_shorts| {
+                            app.toast("Comment posted");
+                        });
+                    }
                 }
                 Response::CommentReplyPosted {
                     video_id,
                     comment_id,
                     text,
                 } => {
-                    self.with_matching_slot(&video_id, |app, _is_shorts| {
-                        let author = app
+                    if self.expanded_post_id.as_deref() == Some(video_id.as_str()) {
+                        let author = self
                             .account_name
                             .clone()
                             .unwrap_or_else(|| "You".to_owned());
-                        let avatar = app.account_avatar.clone();
-                        if let Some(c) = app.comments.iter_mut().find(|c| c.id == comment_id) {
+                        let avatar = self.account_avatar.clone();
+                        if let Some(c) = self.post_comments.iter_mut().find(|c| c.id == comment_id) {
                             c.replies.push(CommentItem {
                                 id: format!("local-reply-{}", c.replies.len()),
                                 author,
@@ -3708,16 +3880,45 @@ impl YtApp {
                                 has_creator_heart: false,
                             });
                         }
-                        app.toast("Reply posted");
-                    });
+                        self.toast("Reply posted");
+                    } else {
+                        self.with_matching_slot(&video_id, |app, _is_shorts| {
+                            let author = app
+                                .account_name
+                                .clone()
+                                .unwrap_or_else(|| "You".to_owned());
+                            let avatar = app.account_avatar.clone();
+                            if let Some(c) = app.comments.iter_mut().find(|c| c.id == comment_id) {
+                                c.replies.push(CommentItem {
+                                    id: format!("local-reply-{}", c.replies.len()),
+                                    author,
+                                    avatar_url: avatar,
+                                    published: "Just now".to_owned(),
+                                    likes: String::new(),
+                                    text,
+                                    reply_count_text: String::new(),
+                                    replies_token: None,
+                                    reply_params: None,
+                                    replies: Vec::new(),
+                                    replies_loading: false,
+                                    is_liked: false,
+                                    like_action_params: None,
+                                    unlike_action_params: None,
+                                    is_pinned: false,
+                                    has_creator_heart: false,
+                                });
+                            }
+                            app.toast("Reply posted");
+                        });
+                    }
                 }
                 Response::CommentActionUpdated {
                     video_id,
                     comment_id,
                     liked,
                 } => {
-                    self.with_matching_slot(&video_id, |app, _is_shorts| {
-                        for c in &mut app.comments {
+                    if self.expanded_post_id.as_deref() == Some(video_id.as_str()) {
+                        for c in &mut self.post_comments {
                             if c.id == comment_id {
                                 c.is_liked = liked;
                             }
@@ -3727,7 +3928,20 @@ impl YtApp {
                                 }
                             }
                         }
-                    });
+                    } else {
+                        self.with_matching_slot(&video_id, |app, _is_shorts| {
+                            for c in &mut app.comments {
+                                if c.id == comment_id {
+                                    c.is_liked = liked;
+                                }
+                                for r in &mut c.replies {
+                                    if r.id == comment_id {
+                                        r.is_liked = liked;
+                                    }
+                                }
+                            }
+                        });
+                    }
                 }
                 Response::LiveChatLoaded {
                     video_id,
@@ -4107,11 +4321,16 @@ impl YtApp {
                         }
                     });
                 }
-                Response::SignedIn { name, avatar } => {
+                Response::SignedIn {
+                    name,
+                    avatar,
+                    channel_id,
+                } => {
                     self.signed_in = true;
                     self.signing_in = false;
                     self.account_name = name;
                     self.account_avatar = avatar;
+                    self.account_channel_id = channel_id;
                     self.home_is_fallback = false;
                     let _ = self.backend.tx.send(Request::LoadNotifications);
                     self.toast("Signed in to YouTube");
@@ -4243,6 +4462,8 @@ impl YtApp {
                     }
                     self.shorts_slot.watch_loading = false;
                     self.comments_loading = false;
+                    self.post_comments_loading = false;
+                    self.active_mix_loading = false;
                     self.notifications_loading = false;
                     self.signing_in = false;
                     self.last_error = Some(msg);
@@ -4730,10 +4951,64 @@ impl YtApp {
         }
     }
 
+    pub(super) fn start_mix(
+        &mut self,
+        mix_id: String,
+        seed_video: Option<VideoItem>,
+        title: String,
+    ) {
+        self.queue.clear();
+        self.active_mix_id = Some(mix_id.clone());
+        self.active_mix_title = title.clone();
+        self.active_mix_continuation = None;
+        self.active_mix_loading = true;
+        self.save_queue_open = false;
+        self.right_tab = RightTab::Queue;
+        let seed_id = seed_video.as_ref().map(|v| v.id.clone());
+        if let Some(seed) = seed_video {
+            self.open_video(seed);
+            self.right_tab = RightTab::Queue;
+        } else {
+            self.toast(format!("Loading {title}..."));
+        }
+        let _ = self.backend.tx.send(Request::LoadMixQueue {
+            playlist_id: mix_id,
+            video_id: seed_id,
+            continuation: None,
+            append: false,
+        });
+    }
+
+    pub(super) fn maybe_refill_mix_queue(&mut self) {
+        let Some(mix_id) = self.active_mix_id.clone() else {
+            return;
+        };
+        if self.active_mix_loading || self.queue.len() > 3 {
+            return;
+        }
+        let seed_vid = self
+            .queue
+            .last()
+            .map(|v| v.id.clone())
+            .or_else(|| self.watch.as_ref().map(|w| w.id.clone()));
+        let cont = self.active_mix_continuation.take();
+        if seed_vid.is_none() && cont.is_none() {
+            return;
+        }
+        self.active_mix_loading = true;
+        let _ = self.backend.tx.send(Request::LoadMixQueue {
+            playlist_id: mix_id,
+            video_id: seed_vid,
+            continuation: cont,
+            append: true,
+        });
+    }
+
     pub(super) fn play_next_video(&mut self) {
         if !self.queue.is_empty() {
             let next = self.queue.remove(0);
             self.persist_queue();
+            self.maybe_refill_mix_queue();
             self.open_video(next);
         } else if let Some(next) = self.watch.as_ref().and_then(|w| w.related.first()).cloned() {
             self.open_video(next);
@@ -5614,6 +5889,10 @@ impl eframe::App for YtApp {
             "ambient_glow",
             if self.ambient_glow { "1" } else { "0" }.into(),
         );
+        storage.set_string(
+            "show_topbar_account_name",
+            if self.show_topbar_account_name { "1" } else { "0" }.into(),
+        );
         let pt = match self.po_token_mode {
             PoTokenMode::Auto => "auto",
             PoTokenMode::On => "on",
@@ -5670,6 +5949,10 @@ impl eframe::App for YtApp {
         if let Ok(sh) = serde_json::to_string(&self.search_history) {
             storage.set_string("search_history", sh);
         }
+        let (st_mode, st_until) =
+            encode_sleep_timer(&self.sleep_timer, Instant::now(), unix_now_secs());
+        storage.set_string("sleep_timer_mode", st_mode.into());
+        storage.set_string("sleep_timer_until_unix", st_until);
     }
 
     fn on_exit(&mut self, gl: Option<&glow::Context>) {
@@ -6086,6 +6369,53 @@ pub(super) fn shuffle_vec<T>(items: &mut [T], mut seed: u64) {
     }
 }
 
+pub(super) fn unix_now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+/// Encode `SleepTimer` using a wall-clock UNIX deadline so active countdowns
+/// can survive app restarts (and expire cleanly if the deadline already passed).
+pub(super) fn encode_sleep_timer(
+    timer: &SleepTimer,
+    now_instant: Instant,
+    now_unix: f64,
+) -> (&'static str, String) {
+    match timer {
+        SleepTimer::Off => ("", String::new()),
+        SleepTimer::EndOfVideo => ("eov", String::new()),
+        SleepTimer::Until(deadline) => {
+            let rem = deadline.saturating_duration_since(now_instant);
+            if rem.is_zero() {
+                ("", String::new())
+            } else {
+                ("until", format!("{:.3}", now_unix + rem.as_secs_f64()))
+            }
+        }
+    }
+}
+
+pub(super) fn restore_sleep_timer(
+    mode: Option<&str>,
+    until_unix: Option<f64>,
+    now_unix: f64,
+    now_instant: Instant,
+) -> SleepTimer {
+    match mode.map(str::trim) {
+        Some("eov") => SleepTimer::EndOfVideo,
+        Some("until") => match until_unix {
+            Some(target) if target.is_finite() && target > now_unix => {
+                let rem = (target - now_unix).min(86_400.0 * 30.0);
+                SleepTimer::Until(now_instant + Duration::from_secs_f64(rem))
+            }
+            _ => SleepTimer::Off,
+        },
+        _ => SleepTimer::Off,
+    }
+}
+
 pub(super) fn parse_sleep_timer_input(raw: &str) -> Option<Duration> {
     let s = raw.trim().to_ascii_lowercase();
     if s.is_empty() {
@@ -6304,12 +6634,13 @@ fn should_upgrade_to_target(
 #[cfg(test)]
 mod ui_tests {
     use super::{
-        AbrFallbackAction, parse_sleep_timer_input, pick_abr_fallback_action,
-        pick_abr_recovery_idx, should_upgrade_to_target, shuffle_vec,
+        AbrFallbackAction, SleepTimer, encode_sleep_timer, parse_sleep_timer_input,
+        pick_abr_fallback_action, pick_abr_recovery_idx, restore_sleep_timer,
+        should_upgrade_to_target, shuffle_vec,
     };
     use crate::model::VideoFormat;
     use std::collections::HashSet;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn shuffle_preserves_all_elements() {
@@ -6385,6 +6716,43 @@ mod ui_tests {
         assert_eq!(
             pick_abr_recovery_idx(&formats, 1080, Some(0), &tried, true),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn persists_and_restores_sleep_timer_across_restarts() {
+        let now = Instant::now();
+        let (mode, until) = encode_sleep_timer(
+            &SleepTimer::Until(now + Duration::from_secs(600)),
+            now,
+            1_700_000_000.0,
+        );
+        assert_eq!(mode, "until");
+        let parsed: f64 = until.parse().unwrap();
+
+        // Reopen 120s later: ~480s should remain.
+        match restore_sleep_timer(Some(mode), Some(parsed), 1_700_000_120.0, now) {
+            SleepTimer::Until(deadline) => {
+                let rem = deadline.saturating_duration_since(now).as_secs_f64();
+                assert!((rem - 480.0).abs() < 0.01, "rem={rem}");
+            }
+            other => panic!("expected Until, got {:?}", other),
+        }
+
+        // Reopen after deadline passed: must clear back to Off.
+        assert_eq!(
+            restore_sleep_timer(Some(mode), Some(parsed), 1_700_000_900.0, now),
+            SleepTimer::Off
+        );
+
+        // End of video mode also persists across restarts.
+        let (eov_mode, eov_until) =
+            encode_sleep_timer(&SleepTimer::EndOfVideo, now, 1_700_000_000.0);
+        assert_eq!(eov_mode, "eov");
+        assert!(eov_until.is_empty());
+        assert_eq!(
+            restore_sleep_timer(Some(eov_mode), None, 1_700_000_900.0, now),
+            SleepTimer::EndOfVideo
         );
     }
 }

@@ -31,6 +31,8 @@ pub struct Session {
     pub account_name: Option<String>,
     #[serde(default)]
     pub account_avatar: Option<String>,
+    #[serde(default)]
+    pub account_channel_id: Option<String>,
 }
 
 impl Session {
@@ -41,6 +43,7 @@ impl Session {
             visitor_data: None,
             account_name: None,
             account_avatar: None,
+            account_channel_id: None,
         }
     }
 

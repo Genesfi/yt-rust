@@ -1145,6 +1145,43 @@ impl YtApp {
                         }
                     },
                 );
+            } else if let Some(q) = self.shorts_queue.get(self.shorts_idx).cloned() {
+                let lift_y = overlay_alpha * 54.0;
+                let info_rect = Rect::from_min_max(
+                    pos2(rect.left() + 14.0, (rect.bottom() - 150.0 - lift_y).max(rect.top() + 12.0)),
+                    pos2(rect.right() - 14.0, (rect.bottom() - 12.0 - lift_y).max(rect.top() + 36.0)),
+                );
+                let mut iui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(info_rect)
+                        .layout(Layout::bottom_up(Align::LEFT)),
+                );
+                iui.set_clip_rect(iui.clip_rect().intersect(rect));
+                let title_display =
+                    clamp_two_lines(&iui, &q.title, theme::semibold(13.5), info_rect.width());
+                iui.add(
+                    egui::Label::new(
+                        RichText::new(title_display)
+                            .font(theme::semibold(13.5))
+                            .color(Color32::WHITE),
+                    )
+                    .wrap(),
+                );
+                if !q.channel.is_empty() {
+                    iui.add_space(6.0);
+                    iui.horizontal(|ui| {
+                        draw_avatar(ui, q.channel_avatar_url.as_deref(), &q.channel, 30.0);
+                        ui.add_space(8.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&q.channel)
+                                    .font(theme::semibold(13.5))
+                                    .color(Color32::WHITE),
+                            )
+                            .truncate(),
+                        );
+                    });
+                }
             }
         }
         if overlay_alpha > 0.01 {
@@ -2964,450 +3001,69 @@ impl YtApp {
     }
 
     fn draw_comments_list(&mut self, ui: &mut egui::Ui, w: &crate::model::WatchData) {
-        let mut expand_replies: Option<(String, String)> = None;
-
-        if self.comments.is_empty() && !self.comments_loading {
-            if let Some(tok) = w.comments_token.clone() {
-                if ui.button("Load comments").clicked() {
-                    self.comments_loading = true;
-                    let _ = self.backend.tx.send(Request::LoadComments {
-                        video_id: w.id.clone(),
-                        continuation: tok,
-                        append: false,
-                    });
-                }
-            } else {
-                ui.label(
-                    RichText::new("Comments are unavailable for this video.")
-                        .font(theme::regular(13.0))
-                        .color(theme::TEXT_DIM),
-                );
-            }
+        let dur_limit = if self.playback.duration > 0.0 {
+            self.playback.duration
         } else {
-            let dur_limit = if self.playback.duration > 0.0 {
-                self.playback.duration
-            } else {
-                w.duration_secs
-            };
-            let max_seek = (!w.is_live && dur_limit > 0.0).then_some(dur_limit);
-            let mut seek_requested: Option<f64> = None;
-            let mut open_reply_for: Option<(String, String, Option<String>)> = None;
-            let mut submit_reply: Option<(String, String, String, Option<String>)> = None;
-            let mut cancel_reply = false;
-            let mut toggle_like_comment: Option<(String, String, bool)> = None;
-            let active_reply_id = self.comment_reply_target_id.clone();
-
-            let draw_reply_box = |ui: &mut egui::Ui,
-                                  draft: &mut String,
-                                  target_author: &str,
-                                  parent_cid: &str,
-                                  rp: String,
-                                  replies_tok: Option<String>,
-                                  submit_reply: &mut Option<(String, String, String, Option<String>)>,
-                                  cancel_reply: &mut bool| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    let rw = (ui.available_width() - 140.0).max(130.0);
-                    let te = ui.add_sized(
-                        Vec2::new(rw, 28.0),
-                        egui::TextEdit::singleline(draft)
-                            .hint_text(format!("Replying to {target_author}...")),
-                    );
-                    let send_clicked = ui
-                        .add_sized(
-                            Vec2::new(60.0, 28.0),
-                            egui::Button::new(
-                                RichText::new("Reply")
-                                    .font(theme::semibold(12.0))
-                                    .color(Color32::from_rgb(15, 15, 15)),
-                            )
-                            .fill(theme::YT_BLUE)
-                            .corner_radius(14),
-                        )
-                        .clicked()
-                        || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                    if send_clicked {
-                        let rtxt = draft.trim().to_owned();
-                        if !rtxt.is_empty() {
-                            *submit_reply = Some((parent_cid.to_owned(), rtxt, rp, replies_tok));
-                        }
-                    }
-                    if ui
-                        .add_sized(
-                            Vec2::new(60.0, 28.0),
-                            egui::Button::new(
-                                RichText::new("Cancel")
-                                    .font(theme::medium(12.0))
-                                    .color(theme::TEXT_DIM),
-                            )
-                            .fill(theme::CHIP)
-                            .corner_radius(14),
-                        )
-                        .clicked()
-                    {
-                        *cancel_reply = true;
-                    }
-                });
-            };
-
-            for c in &self.comments {
-                ui.horizontal_top(|ui| {
-                    draw_avatar(ui, c.avatar_url.as_deref(), &c.author, 34.0);
-                    ui.add_space(10.0);
-                    ui.vertical(|ui| {
-                        if c.is_pinned {
-                            ui.horizontal(|ui| {
-                                let (prect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
-                                theme::draw_pin_icon(
-                                    ui.painter(),
-                                    prect.center(),
-                                    11.0,
-                                    theme::TEXT_DIM,
-                                );
-                                ui.label(
-                                    RichText::new("Pinned")
-                                        .font(theme::medium(11.0))
-                                        .color(theme::TEXT_DIM),
-                                );
-                            });
-                        }
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new(&c.author).font(theme::semibold(12.5)));
-                            if !c.published.is_empty() {
-                                ui.label(
-                                    RichText::new(&c.published)
-                                        .font(theme::regular(11.5))
-                                        .color(theme::TEXT_DIM),
-                                );
-                            }
-                        });
-                        if let Some(secs) =
-                            draw_text_with_timestamps(ui, &c.text, 13.0, theme::TEXT, max_seek)
-                        {
-                            seek_requested = Some(secs);
-                        }
-                        ui.horizontal(|ui| {
-                            let can_like = self.signed_in
-                                && if c.is_liked {
-                                    c.unlike_action_params.is_some()
-                                } else {
-                                    c.like_action_params.is_some()
-                                };
-                            let like_col = if c.is_liked {
-                                theme::YT_BLUE
-                            } else {
-                                theme::TEXT_DIM
-                            };
-                            let (lrect, lresp) = ui.allocate_exact_size(
-                                vec2(22.0, 22.0),
-                                if can_like { Sense::click() } else { Sense::hover() },
-                            );
-                            if can_like && lresp.hovered() {
-                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                            }
-                            theme::draw_thumbs_up(
-                                ui.painter(),
-                                lrect.center(),
-                                13.0,
-                                like_col,
-                                c.is_liked,
-                            );
-                            if can_like && lresp.on_hover_text("Like comment").clicked() {
-                                if let Some(act) = if c.is_liked {
-                                    c.unlike_action_params.clone()
-                                } else {
-                                    c.like_action_params.clone()
-                                } {
-                                    toggle_like_comment = Some((c.id.clone(), act, !c.is_liked));
-                                }
-                            }
-                            if !c.likes.is_empty() {
-                                ui.label(
-                                    RichText::new(&c.likes)
-                                        .font(theme::regular(11.5))
-                                        .color(like_col),
-                                );
-                            }
-                            if c.has_creator_heart {
-                                ui.add_space(4.0);
-                                let (hrect, hresp) =
-                                    ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-                                theme::draw_icon_centered(
-                                    ui.painter(),
-                                    hrect.center(),
-                                    icon::HEART,
-                                    12.5,
-                                    theme::YT_RED,
-                                );
-                                hresp.on_hover_text("Hearted by creator");
-                            }
-                            if self.signed_in && c.reply_params.is_some() {
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("Reply")
-                                                .font(theme::semibold(11.5))
-                                                .color(theme::TEXT_DIM),
-                                        )
-                                        .fill(Color32::TRANSPARENT),
-                                    )
-                                    .clicked()
-                                {
-                                    open_reply_for = Some((c.id.clone(), c.author.clone(), None));
-                                }
-                            }
-                        });
-                        if active_reply_id.as_deref() == Some(c.id.as_str()) {
-                            if let Some(rp) = c.reply_params.clone() {
-                                draw_reply_box(
-                                    ui,
-                                    &mut self.comment_reply_draft,
-                                    &self.comment_reply_target_author,
-                                    &c.id,
-                                    rp,
-                                    c.replies_token.clone(),
-                                    &mut submit_reply,
-                                    &mut cancel_reply,
-                                );
-                            }
-                        }
-                        if !c.replies.is_empty() {
-                            ui.add_space(6.0);
-                            for r in &c.replies {
-                                ui.horizontal_top(|ui| {
-                                    draw_avatar(ui, r.avatar_url.as_deref(), &r.author, 24.0);
-                                    ui.add_space(8.0);
-                                    ui.vertical(|ui| {
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label(
-                                                RichText::new(&r.author).font(theme::semibold(12.0)),
-                                            );
-                                            if !r.published.is_empty() {
-                                                ui.label(
-                                                    RichText::new(&r.published)
-                                                        .font(theme::regular(11.0))
-                                                        .color(theme::TEXT_DIM),
-                                                );
-                                            }
-                                        });
-                                        if let Some(secs) = draw_text_with_timestamps(
-                                            ui,
-                                            &r.text,
-                                            12.5,
-                                            theme::TEXT,
-                                            max_seek,
-                                        ) {
-                                            seek_requested = Some(secs);
-                                        }
-                                        ui.horizontal(|ui| {
-                                            let can_like = self.signed_in
-                                                && if r.is_liked {
-                                                    r.unlike_action_params.is_some()
-                                                } else {
-                                                    r.like_action_params.is_some()
-                                                };
-                                            let like_col = if r.is_liked {
-                                                theme::YT_BLUE
-                                            } else {
-                                                theme::TEXT_DIM
-                                            };
-                                            let (lrect, lresp) = ui.allocate_exact_size(
-                                                vec2(20.0, 20.0),
-                                                if can_like {
-                                                    Sense::click()
-                                                } else {
-                                                    Sense::hover()
-                                                },
-                                            );
-                                            if can_like && lresp.hovered() {
-                                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                                            }
-                                            theme::draw_thumbs_up(
-                                                ui.painter(),
-                                                lrect.center(),
-                                                12.0,
-                                                like_col,
-                                                r.is_liked,
-                                            );
-                                            if can_like && lresp.on_hover_text("Like reply").clicked()
-                                            {
-                                                if let Some(act) = if r.is_liked {
-                                                    r.unlike_action_params.clone()
-                                                } else {
-                                                    r.like_action_params.clone()
-                                                } {
-                                                    toggle_like_comment =
-                                                        Some((r.id.clone(), act, !r.is_liked));
-                                                }
-                                            }
-                                            if !r.likes.is_empty() {
-                                                ui.label(
-                                                    RichText::new(&r.likes)
-                                                        .font(theme::regular(11.0))
-                                                        .color(like_col),
-                                                );
-                                            }
-                                            if r.has_creator_heart {
-                                                let (hrect, hresp) = ui.allocate_exact_size(
-                                                    vec2(16.0, 16.0),
-                                                    Sense::hover(),
-                                                );
-                                                theme::draw_icon_centered(
-                                                    ui.painter(),
-                                                    hrect.center(),
-                                                    icon::HEART,
-                                                    11.5,
-                                                    theme::YT_RED,
-                                                );
-                                                hresp.on_hover_text("Hearted by creator");
-                                            }
-                                            let r_params = r
-                                                .reply_params
-                                                .as_ref()
-                                                .or(c.reply_params.as_ref());
-                                            if self.signed_in && r_params.is_some() {
-                                                if ui
-                                                    .add(
-                                                        egui::Button::new(
-                                                            RichText::new("Reply")
-                                                                .font(theme::semibold(11.0))
-                                                                .color(theme::TEXT_DIM),
-                                                        )
-                                                        .fill(Color32::TRANSPARENT),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    open_reply_for = Some((
-                                                        r.id.clone(),
-                                                        r.author.clone(),
-                                                        Some(format!("@{} ", r.author)),
-                                                    ));
-                                                }
-                                            }
-                                        });
-                                        if active_reply_id.as_deref() == Some(r.id.as_str()) {
-                                            if let Some(rp) = r
-                                                .reply_params
-                                                .clone()
-                                                .or_else(|| c.reply_params.clone())
-                                            {
-                                                draw_reply_box(
-                                                    ui,
-                                                    &mut self.comment_reply_draft,
-                                                    &self.comment_reply_target_author,
-                                                    &c.id,
-                                                    rp,
-                                                    c.replies_token.clone(),
-                                                    &mut submit_reply,
-                                                    &mut cancel_reply,
-                                                );
-                                            }
-                                        }
-                                    });
-                                });
-                                ui.add_space(4.0);
-                            }
-                        }
-                        if c.replies_loading {
-                            ui.spinner();
-                        } else if let Some(rtok) = c.replies_token.clone() {
-                            let label = if c.replies.is_empty() && !c.reply_count_text.is_empty() {
-                                c.reply_count_text.clone()
-                            } else if c.replies.is_empty() {
-                                "View replies".to_owned()
-                            } else {
-                                "Load more replies".to_owned()
-                            };
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new(format!("{}  {label}", icon::CHEVRON_DOWN))
-                                            .font(theme::semibold(12.0))
-                                            .color(theme::YT_BLUE),
-                                    )
-                                    .fill(Color32::TRANSPARENT),
-                                )
-                                .clicked()
-                            {
-                                expand_replies = Some((c.id.clone(), rtok));
-                            }
-                        }
-                    });
-                });
-                ui.add_space(10.0);
-            }
-            if let Some(secs) = seek_requested {
-                if let Some(mpv) = &self.mpv {
-                    mpv.seek_abs(secs);
-                    if self.playback.eof {
-                        mpv.set_paused(false);
-                    }
-                    self.trigger_hud(HudIcon::SeekForward, format_duration(secs));
+            w.duration_secs
+        };
+        let max_seek = (!w.is_live && dur_limit > 0.0).then_some(dur_limit);
+        let backend_tx = self.backend.tx.clone();
+        let seek_req = draw_comments_thread_ui(
+            ui,
+            &w.id,
+            self.signed_in,
+            &mut self.comments,
+            &mut self.comments_loading,
+            &mut self.comments_next_token,
+            None,
+            &mut String::new(),
+            None,
+            &mut self.comment_reply_target_id,
+            &mut self.comment_reply_target_author,
+            &mut self.comment_reply_draft,
+            &backend_tx,
+            max_seek,
+            "Comments are unavailable for this video.",
+            w.comments_token.clone(),
+            false,
+        );
+        if let Some(secs) = seek_req {
+            if let Some(mpv) = &self.mpv {
+                mpv.seek_abs(secs);
+                if self.playback.eof {
+                    mpv.set_paused(false);
                 }
-            }
-            if let Some((cid, act, next_liked)) = toggle_like_comment {
-                for c in &mut self.comments {
-                    if c.id == cid {
-                        c.is_liked = next_liked;
-                    }
-                    for r in &mut c.replies {
-                        if r.id == cid {
-                            r.is_liked = next_liked;
-                        }
-                    }
-                }
-                let _ = self.backend.tx.send(Request::PerformCommentAction {
-                    video_id: w.id.clone(),
-                    comment_id: cid,
-                    action_params: act,
-                    liked: next_liked,
-                });
-            }
-            if let Some((cid, author, prefill)) = open_reply_for {
-                self.comment_reply_target_id = Some(cid);
-                self.comment_reply_target_author = author;
-                self.comment_reply_draft = prefill.unwrap_or_default();
-            } else if cancel_reply {
-                self.comment_reply_target_id = None;
-                self.comment_reply_target_author.clear();
-                self.comment_reply_draft.clear();
-            } else if let Some((cid, rtxt, rp, rtok)) = submit_reply {
-                let _ = self.backend.tx.send(Request::PostCommentReply {
-                    video_id: w.id.clone(),
-                    comment_id: cid,
-                    text: rtxt,
-                    params: rp,
-                    replies_continuation: rtok,
-                });
-                self.comment_reply_target_id = None;
-                self.comment_reply_target_author.clear();
-                self.comment_reply_draft.clear();
-            }
-            if let Some((cid, rtok)) = expand_replies {
-                if let Some(c) = self.comments.iter_mut().find(|c| c.id == cid) {
-                    c.replies_loading = true;
-                }
-                let _ = self.backend.tx.send(Request::LoadCommentReplies {
-                    video_id: w.id.clone(),
-                    comment_id: cid,
-                    continuation: rtok,
-                });
-            }
-            if !self.comments_loading {
-                if let Some(tok) = self.comments_next_token.clone() {
-                    if super::cards::pill_button(ui, icon::CHEVRON_DOWN, "Load more comments")
-                        .clicked()
-                    {
-                        self.comments_loading = true;
-                        let _ = self.backend.tx.send(Request::LoadComments {
-                            video_id: w.id.clone(),
-                            continuation: tok,
-                            append: true,
-                        });
-                    }
-                }
+                self.trigger_hud(HudIcon::SeekForward, format_duration(secs));
             }
         }
+    }
+
+    pub(super) fn draw_post_comments_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        post_id: &str,
+    ) {
+        let backend_tx = self.backend.tx.clone();
+        let create_params = self.post_comment_create_params.clone();
+        let _ = draw_comments_thread_ui(
+            ui,
+            post_id,
+            self.signed_in,
+            &mut self.post_comments,
+            &mut self.post_comments_loading,
+            &mut self.post_comments_next_token,
+            create_params.as_deref(),
+            &mut self.post_comment_draft,
+            None,
+            &mut self.post_reply_target_id,
+            &mut self.post_reply_target_author,
+            &mut self.post_reply_draft,
+            &backend_tx,
+            None,
+            "No comments yet.",
+            None,
+            true,
+        );
     }
 
     fn draw_channel_row(&mut self, ui: &mut egui::Ui, w: &WatchData) {
@@ -3536,6 +3192,7 @@ impl YtApp {
                         watched_percent: None,
                         resume_secs: None,
                         playlist_browse_id: None,
+                        mix_playlist_id: None,
                         playlist_set_video_id: None,
                     });
                 }
@@ -3893,6 +3550,10 @@ impl YtApp {
             });
             if clear_queue {
                 self.queue.clear();
+                self.active_mix_id = None;
+                self.active_mix_title.clear();
+                self.active_mix_continuation = None;
+                self.active_mix_loading = false;
                 self.queue_drag_idx = None;
                 self.queue_drag_origin = None;
                 self.queue_drag_active = false;
@@ -3900,6 +3561,43 @@ impl YtApp {
                 self.persist_queue();
                 self.right_tab = RightTab::UpNext;
                 return;
+            }
+            if self.active_mix_id.is_some() {
+                ui.add_space(4.0);
+                Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(36, 48, 78, 130))
+                    .stroke(Stroke::new(1.0, theme::YT_BLUE.gamma_multiply(0.35)))
+                    .corner_radius(8)
+                    .inner_margin(Margin::symmetric(8, 5))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            theme::draw_icon(ui, icon::RADIO, 13.5, theme::YT_BLUE);
+                            ui.add_space(4.0);
+                            let lbl = if self.active_mix_title.is_empty() {
+                                "Mix Radio · Auto-refill".to_owned()
+                            } else {
+                                format!("{} · Auto-refill", self.active_mix_title)
+                            };
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(lbl)
+                                        .font(theme::medium(11.5))
+                                        .color(Color32::WHITE),
+                                )
+                                .truncate(),
+                            );
+                            if self.active_mix_loading {
+                                ui.spinner();
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if icon_circle_button(ui, icon::X, 11.5, "Stop Mix auto-refill") {
+                                    self.active_mix_id = None;
+                                    self.active_mix_continuation = None;
+                                    self.active_mix_loading = false;
+                                }
+                            });
+                        });
+                    });
             }
             if self.save_queue_open && self.signed_in {
                 ui.add_space(6.0);
@@ -4234,6 +3932,7 @@ impl YtApp {
                 self.queue_drag_origin = None;
                 self.queue_drag_active = false;
                 self.persist_queue();
+                self.maybe_refill_mix_queue();
                 self.open_video(next);
             }
             return;
@@ -5511,6 +5210,10 @@ impl YtApp {
         if clear_queue_now {
             let was_open = self.pip_queue_open;
             self.queue.clear();
+            self.active_mix_id = None;
+            self.active_mix_title.clear();
+            self.active_mix_continuation = None;
+            self.active_mix_loading = false;
             self.pip_queue_open = false;
             self.persist_queue();
             if was_open {
@@ -5544,6 +5247,7 @@ impl YtApp {
             if pi < self.queue.len() {
                 let next = self.queue.remove(pi);
                 self.persist_queue();
+                self.maybe_refill_mix_queue();
                 if previewing_bg {
                     self.switch_player_tab();
                 }
@@ -6636,6 +6340,506 @@ fn draw_text_with_timestamps(
         }
     }
     None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_comments_thread_ui(
+    ui: &mut egui::Ui,
+    owner_id: &str,
+    signed_in: bool,
+    comments: &mut Vec<crate::model::CommentItem>,
+    comments_loading: &mut bool,
+    next_token: &mut Option<String>,
+    create_params: Option<&str>,
+    comment_draft: &mut String,
+    reload_tok: Option<String>,
+    reply_target_id: &mut Option<String>,
+    reply_target_author: &mut String,
+    reply_draft: &mut String,
+    backend_tx: &crossbeam_channel::Sender<Request>,
+    max_seek: Option<f64>,
+    empty_msg: &str,
+    allow_load_btn: Option<String>,
+    is_post: bool,
+) -> Option<f64> {
+    let mut expand_replies: Option<(String, String)> = None;
+    let mut seek_requested: Option<f64> = None;
+
+    if signed_in {
+        if let Some(params) = create_params {
+            ui.horizontal(|ui| {
+                let input_w = (ui.available_width() - 92.0).max(120.0);
+                let te = ui.add_sized(
+                    Vec2::new(input_w, 30.0),
+                    egui::TextEdit::singleline(comment_draft).hint_text("Add a comment..."),
+                );
+                let submit = ui
+                    .add_sized(
+                        Vec2::new(82.0, 30.0),
+                        egui::Button::new(
+                            RichText::new("Comment")
+                                .font(theme::semibold(12.5))
+                                .color(Color32::from_rgb(15, 15, 15)),
+                        )
+                        .fill(theme::YT_BLUE)
+                        .corner_radius(15),
+                    )
+                    .clicked()
+                    || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                if submit {
+                    let body = comment_draft.trim().to_owned();
+                    if !body.is_empty() {
+                        let _ = backend_tx.send(Request::PostComment {
+                            video_id: owner_id.to_owned(),
+                            text: body,
+                            params: params.to_owned(),
+                            reload_continuation: reload_tok,
+                        });
+                        comment_draft.clear();
+                    }
+                }
+            });
+            ui.add_space(6.0);
+        }
+    }
+
+    if *comments_loading && comments.is_empty() {
+        ui.spinner();
+        return None;
+    }
+
+    if comments.is_empty() {
+        if let Some(tok) = allow_load_btn {
+            if ui.button("Load comments").clicked() {
+                *comments_loading = true;
+                let _ = backend_tx.send(Request::LoadComments {
+                    video_id: owner_id.to_owned(),
+                    continuation: tok,
+                    append: false,
+                });
+            }
+        } else {
+            ui.label(
+                RichText::new(empty_msg)
+                    .font(theme::regular(13.0))
+                    .color(theme::TEXT_DIM),
+            );
+        }
+        return None;
+    }
+
+    let mut open_reply_for: Option<(String, String, Option<String>)> = None;
+    let mut submit_reply: Option<(String, String, String, Option<String>)> = None;
+    let mut cancel_reply = false;
+    let mut toggle_like_comment: Option<(String, String, bool)> = None;
+    let active_reply_id = reply_target_id.clone();
+
+    let draw_reply_box = |ui: &mut egui::Ui,
+                          draft: &mut String,
+                          target_author: &str,
+                          parent_cid: &str,
+                          rp: String,
+                          replies_tok: Option<String>,
+                          submit_reply: &mut Option<(String, String, String, Option<String>)>,
+                          cancel_reply: &mut bool| {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let rw = (ui.available_width() - 140.0).max(130.0);
+            let te = ui.add_sized(
+                Vec2::new(rw, 28.0),
+                egui::TextEdit::singleline(draft)
+                    .hint_text(format!("Replying to {target_author}...")),
+            );
+            let send_clicked = ui
+                .add_sized(
+                    Vec2::new(60.0, 28.0),
+                    egui::Button::new(
+                        RichText::new("Reply")
+                            .font(theme::semibold(12.0))
+                            .color(Color32::from_rgb(15, 15, 15)),
+                    )
+                    .fill(theme::YT_BLUE)
+                    .corner_radius(14),
+                )
+                .clicked()
+                || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            if send_clicked {
+                let rtxt = draft.trim().to_owned();
+                if !rtxt.is_empty() {
+                    *submit_reply = Some((parent_cid.to_owned(), rtxt, rp, replies_tok));
+                }
+            }
+            if ui
+                .add_sized(
+                    Vec2::new(60.0, 28.0),
+                    egui::Button::new(
+                        RichText::new("Cancel")
+                            .font(theme::medium(12.0))
+                            .color(theme::TEXT_DIM),
+                    )
+                    .fill(theme::CHIP)
+                    .corner_radius(14),
+                )
+                .clicked()
+            {
+                *cancel_reply = true;
+            }
+        });
+    };
+
+    for c in comments.iter() {
+        ui.horizontal_top(|ui| {
+            draw_avatar(ui, c.avatar_url.as_deref(), &c.author, 32.0);
+            ui.add_space(10.0);
+            ui.vertical(|ui| {
+                if c.is_pinned {
+                    ui.horizontal(|ui| {
+                        let (prect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                        theme::draw_pin_icon(
+                            ui.painter(),
+                            prect.center(),
+                            11.0,
+                            theme::TEXT_DIM,
+                        );
+                        ui.label(
+                            RichText::new("Pinned")
+                                .font(theme::medium(11.0))
+                                .color(theme::TEXT_DIM),
+                        );
+                    });
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(&c.author).font(theme::semibold(12.5)));
+                    if !c.published.is_empty() {
+                        ui.label(
+                            RichText::new(&c.published)
+                                .font(theme::regular(11.5))
+                                .color(theme::TEXT_DIM),
+                        );
+                    }
+                });
+                if let Some(secs) =
+                    draw_text_with_timestamps(ui, &c.text, 13.0, theme::TEXT, max_seek)
+                {
+                    seek_requested = Some(secs);
+                }
+                ui.horizontal(|ui| {
+                    let can_like = signed_in
+                        && if c.is_liked {
+                            c.unlike_action_params.is_some()
+                        } else {
+                            c.like_action_params.is_some()
+                        };
+                    let like_col = if c.is_liked {
+                        theme::YT_BLUE
+                    } else {
+                        theme::TEXT_DIM
+                    };
+                    let (lrect, lresp) = ui.allocate_exact_size(
+                        vec2(22.0, 22.0),
+                        if can_like { Sense::click() } else { Sense::hover() },
+                    );
+                    if can_like && lresp.hovered() {
+                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    }
+                    theme::draw_thumbs_up(
+                        ui.painter(),
+                        lrect.center(),
+                        13.0,
+                        like_col,
+                        c.is_liked,
+                    );
+                    if can_like && lresp.on_hover_text("Like comment").clicked() {
+                        if let Some(act) = if c.is_liked {
+                            c.unlike_action_params.clone()
+                        } else {
+                            c.like_action_params.clone()
+                        } {
+                            toggle_like_comment = Some((c.id.clone(), act, !c.is_liked));
+                        }
+                    }
+                    if !c.likes.is_empty() {
+                        ui.label(
+                            RichText::new(&c.likes)
+                                .font(theme::regular(11.5))
+                                .color(like_col),
+                        );
+                    }
+                    if c.has_creator_heart {
+                        ui.add_space(4.0);
+                        let (hrect, hresp) =
+                            ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+                        theme::draw_icon_centered(
+                            ui.painter(),
+                            hrect.center(),
+                            icon::HEART,
+                            12.5,
+                            theme::YT_RED,
+                        );
+                        hresp.on_hover_text("Hearted by creator");
+                    }
+                    if signed_in && c.reply_params.is_some() {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Reply")
+                                        .font(theme::semibold(11.5))
+                                        .color(theme::TEXT_DIM),
+                                )
+                                .fill(Color32::TRANSPARENT),
+                            )
+                            .clicked()
+                        {
+                            open_reply_for = Some((c.id.clone(), c.author.clone(), None));
+                        }
+                    }
+                });
+                if active_reply_id.as_deref() == Some(c.id.as_str()) {
+                    if let Some(rp) = c.reply_params.clone() {
+                        draw_reply_box(
+                            ui,
+                            reply_draft,
+                            reply_target_author,
+                            &c.id,
+                            rp,
+                            c.replies_token.clone(),
+                            &mut submit_reply,
+                            &mut cancel_reply,
+                        );
+                    }
+                }
+                if !c.replies.is_empty() {
+                    ui.add_space(6.0);
+                    for r in &c.replies {
+                        ui.horizontal_top(|ui| {
+                            draw_avatar(ui, r.avatar_url.as_deref(), &r.author, 24.0);
+                            ui.add_space(8.0);
+                            ui.vertical(|ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        RichText::new(&r.author).font(theme::semibold(12.0)),
+                                    );
+                                    if !r.published.is_empty() {
+                                        ui.label(
+                                            RichText::new(&r.published)
+                                                .font(theme::regular(11.0))
+                                                .color(theme::TEXT_DIM),
+                                        );
+                                    }
+                                });
+                                if let Some(secs) = draw_text_with_timestamps(
+                                    ui,
+                                    &r.text,
+                                    12.5,
+                                    theme::TEXT,
+                                    max_seek,
+                                ) {
+                                    seek_requested = Some(secs);
+                                }
+                                ui.horizontal(|ui| {
+                                    let can_like = signed_in
+                                        && if r.is_liked {
+                                            r.unlike_action_params.is_some()
+                                        } else {
+                                            r.like_action_params.is_some()
+                                        };
+                                    let like_col = if r.is_liked {
+                                        theme::YT_BLUE
+                                    } else {
+                                        theme::TEXT_DIM
+                                    };
+                                    let (lrect, lresp) = ui.allocate_exact_size(
+                                        vec2(20.0, 20.0),
+                                        if can_like {
+                                            Sense::click()
+                                        } else {
+                                            Sense::hover()
+                                        },
+                                    );
+                                    if can_like && lresp.hovered() {
+                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                    }
+                                    theme::draw_thumbs_up(
+                                        ui.painter(),
+                                        lrect.center(),
+                                        12.0,
+                                        like_col,
+                                        r.is_liked,
+                                    );
+                                    if can_like && lresp.on_hover_text("Like reply").clicked() {
+                                        if let Some(act) = if r.is_liked {
+                                            r.unlike_action_params.clone()
+                                        } else {
+                                            r.like_action_params.clone()
+                                        } {
+                                            toggle_like_comment =
+                                                Some((r.id.clone(), act, !r.is_liked));
+                                        }
+                                    }
+                                    if !r.likes.is_empty() {
+                                        ui.label(
+                                            RichText::new(&r.likes)
+                                                .font(theme::regular(11.0))
+                                                .color(like_col),
+                                        );
+                                    }
+                                    if r.has_creator_heart {
+                                        let (hrect, hresp) = ui.allocate_exact_size(
+                                            vec2(16.0, 16.0),
+                                            Sense::hover(),
+                                        );
+                                        theme::draw_icon_centered(
+                                            ui.painter(),
+                                            hrect.center(),
+                                            icon::HEART,
+                                            11.5,
+                                            theme::YT_RED,
+                                        );
+                                        hresp.on_hover_text("Hearted by creator");
+                                    }
+                                    let r_params =
+                                        r.reply_params.as_ref().or(c.reply_params.as_ref());
+                                    if signed_in && r_params.is_some() {
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new("Reply")
+                                                        .font(theme::semibold(11.0))
+                                                        .color(theme::TEXT_DIM),
+                                                )
+                                                .fill(Color32::TRANSPARENT),
+                                            )
+                                            .clicked()
+                                        {
+                                            open_reply_for = Some((
+                                                r.id.clone(),
+                                                r.author.clone(),
+                                                Some(format!("@{} ", r.author)),
+                                            ));
+                                        }
+                                    }
+                                });
+                                if active_reply_id.as_deref() == Some(r.id.as_str()) {
+                                    if let Some(rp) =
+                                        r.reply_params.clone().or_else(|| c.reply_params.clone())
+                                    {
+                                        draw_reply_box(
+                                            ui,
+                                            reply_draft,
+                                            reply_target_author,
+                                            &c.id,
+                                            rp,
+                                            c.replies_token.clone(),
+                                            &mut submit_reply,
+                                            &mut cancel_reply,
+                                        );
+                                    }
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                    }
+                }
+                if c.replies_loading {
+                    ui.spinner();
+                } else if let Some(rtok) = c.replies_token.clone() {
+                    let label = if c.replies.is_empty() && !c.reply_count_text.is_empty() {
+                        c.reply_count_text.clone()
+                    } else if c.replies.is_empty() {
+                        "View replies".to_owned()
+                    } else {
+                        "Load more replies".to_owned()
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(format!("{}  {label}", icon::CHEVRON_DOWN))
+                                    .font(theme::semibold(12.0))
+                                    .color(theme::YT_BLUE),
+                            )
+                            .fill(Color32::TRANSPARENT),
+                        )
+                        .clicked()
+                    {
+                        expand_replies = Some((c.id.clone(), rtok));
+                    }
+                }
+            });
+        });
+        ui.add_space(10.0);
+    }
+
+    if let Some((cid, act, next_liked)) = toggle_like_comment {
+        for c in comments.iter_mut() {
+            if c.id == cid {
+                c.is_liked = next_liked;
+            }
+            for r in &mut c.replies {
+                if r.id == cid {
+                    r.is_liked = next_liked;
+                }
+            }
+        }
+        let _ = backend_tx.send(Request::PerformCommentAction {
+            video_id: owner_id.to_owned(),
+            comment_id: cid,
+            action_params: act,
+            liked: next_liked,
+        });
+    }
+    if let Some((cid, author, prefill)) = open_reply_for {
+        *reply_target_id = Some(cid);
+        *reply_target_author = author;
+        *reply_draft = prefill.unwrap_or_default();
+    } else if cancel_reply {
+        *reply_target_id = None;
+        reply_target_author.clear();
+        reply_draft.clear();
+    } else if let Some((cid, rtxt, rp, rtok)) = submit_reply {
+        let _ = backend_tx.send(Request::PostCommentReply {
+            video_id: owner_id.to_owned(),
+            comment_id: cid,
+            text: rtxt,
+            params: rp,
+            replies_continuation: rtok,
+        });
+        *reply_target_id = None;
+        reply_target_author.clear();
+        reply_draft.clear();
+    }
+    if let Some((cid, rtok)) = expand_replies {
+        if let Some(c) = comments.iter_mut().find(|c| c.id == cid) {
+            c.replies_loading = true;
+        }
+        let _ = backend_tx.send(Request::LoadCommentReplies {
+            video_id: owner_id.to_owned(),
+            comment_id: cid,
+            continuation: rtok,
+        });
+    }
+    if !*comments_loading {
+        if let Some(tok) = next_token.clone() {
+            if super::cards::pill_button(ui, icon::CHEVRON_DOWN, "Load more comments").clicked() {
+                *comments_loading = true;
+                if is_post {
+                    let _ = backend_tx.send(Request::LoadPostComments {
+                        post_id: owner_id.to_owned(),
+                        browse_id: None,
+                        params: None,
+                        continuation: Some(tok),
+                        append: true,
+                    });
+                } else {
+                    let _ = backend_tx.send(Request::LoadComments {
+                        video_id: owner_id.to_owned(),
+                        continuation: tok,
+                        append: true,
+                    });
+                }
+            }
+        }
+    }
+    seek_requested
 }
 
 #[cfg(test)]

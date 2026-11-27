@@ -9,10 +9,11 @@ use serde::{Deserialize, Serialize};
 use crate::auth::Session;
 use crate::innertube::{self, FeedPage, WebConfig};
 use crate::model::{
-    AudioTrack, ChannelInfo, ChannelNotificationParams, CommentItem, FeedChip, LiveChatEmote,
-    LiveChatMessage, NotificationLevel, NotificationMenuItem, PlaylistOption, PlaylistPrivacy,
-    PlaylistSummary, PoTokenMode, PreferredQuality, SearchChannelResult, SearchFilter,
-    SidebarChannel, SponsorSegment, UpNextFilterMode, VideoFormat, VideoItem, WatchData,
+    AudioTrack, ChannelInfo, ChannelNotificationParams, CommentItem, CommunityPost, FeedChip,
+    LiveChatEmote, LiveChatMessage, NotificationLevel, NotificationMenuItem, PlaylistOption,
+    PlaylistPrivacy, PlaylistSummary, PoTokenMode, PreferredQuality, SearchChannelResult,
+    SearchFilter, SidebarChannel, SponsorSegment, UpNextFilterMode, VideoFormat, VideoItem,
+    WatchData,
 };
 use crate::potoken::PoTokenClient;
 use crate::proxy::StreamProxy;
@@ -231,6 +232,29 @@ pub enum Request {
         base_related: Vec<VideoItem>,
         home_fallback: Vec<VideoItem>,
     },
+    LoadMixQueue {
+        playlist_id: String,
+        video_id: Option<String>,
+        continuation: Option<String>,
+        append: bool,
+    },
+    VoteCommunityPoll {
+        post_id: String,
+        choice_idx: usize,
+        action_params: Option<String>,
+    },
+    LikeCommunityPost {
+        post_id: String,
+        action_params: String,
+        liked: bool,
+    },
+    LoadPostComments {
+        post_id: String,
+        browse_id: Option<String>,
+        params: Option<String>,
+        continuation: Option<String>,
+        append: bool,
+    },
 }
 
 pub enum Response {
@@ -297,9 +321,26 @@ pub enum Response {
         channel_id: String,
         info: ChannelInfo,
         items: Vec<VideoItem>,
+        posts: Vec<CommunityPost>,
         chips: Vec<FeedChip>,
         continuation: Option<String>,
         append: bool,
+    },
+    MixQueueLoaded {
+        playlist_id: String,
+        title: String,
+        items: Vec<VideoItem>,
+        continuation: Option<String>,
+        append: bool,
+    },
+    CommunityPollVoted {
+        post_id: String,
+        choice_idx: usize,
+        synced: bool,
+    },
+    CommunityPostLikeUpdated {
+        post_id: String,
+        liked: bool,
     },
     ChannelSearchLoaded {
         channel_id: String,
@@ -332,6 +373,7 @@ pub enum Response {
         video_url: String,
         audio_url: Option<String>,
         duration_secs: f64,
+        is_live: bool,
     },
     HoverPreviewFailed {
         video_id: String,
@@ -456,6 +498,7 @@ pub enum Response {
     SignedIn {
         name: Option<String>,
         avatar: Option<String>,
+        channel_id: Option<String>,
     },
     SignedOut,
     SessionRevoked,
@@ -713,21 +756,26 @@ impl Backend {
                     let mut cfg = innertube::fetch_web_config(&http, session.as_ref()).await;
 
                     if let Some(ref mut s) = session {
-                        if let Some((name, avatar)) =
+                        if let Some((name, avatar, channel_id)) =
                             innertube::fetch_account_info(&http, &cfg, s).await
                         {
                             s.account_name = Some(name.clone());
                             s.account_avatar = avatar.clone();
+                            if channel_id.is_some() {
+                                s.account_channel_id = channel_id.clone();
+                            }
                             s.save(&dir_clone);
                             let _ = resp_tx.send(Response::SignedIn {
                                 name: Some(name),
                                 avatar,
+                                channel_id: s.account_channel_id.clone(),
                             });
                             wake();
                         } else {
                             let _ = resp_tx.send(Response::SignedIn {
                                 name: s.account_name.clone(),
                                 avatar: s.account_avatar.clone(),
+                                channel_id: s.account_channel_id.clone(),
                             });
                             wake();
                         }
@@ -805,7 +853,7 @@ impl Backend {
                     let short_notify = Arc::new(tokio::sync::Notify::new());
                     let hover_cache: Arc<
                         tokio::sync::Mutex<
-                            HashMap<String, (String, Option<String>, f64, u32, std::time::Instant)>,
+                            HashMap<String, (String, Option<String>, f64, bool, u32, std::time::Instant)>,
                         >,
                     > = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
                     let hover_gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -866,6 +914,7 @@ impl Backend {
                                         continuation,
                                         visitor_data,
                                         is_fallback_trending,
+                                        ..
                                     }) => {
                                         if visitor_data.is_some() {
                                             cfg.visitor_data = visitor_data;
@@ -1306,6 +1355,7 @@ impl Backend {
                                         info,
                                         FeedPage {
                                             items,
+                                            posts,
                                             chips,
                                             continuation,
                                             visitor_data,
@@ -1319,6 +1369,7 @@ impl Backend {
                                             channel_id,
                                             info,
                                             items,
+                                            posts,
                                             chips,
                                             continuation,
                                             append,
@@ -2511,7 +2562,7 @@ impl Backend {
                                 tokio::spawn(async move {
                                     {
                                         let cache = hover_cache.lock().await;
-                                        if let Some((v_url, a_url, dur, cached_h, at)) =
+                                        if let Some((v_url, a_url, dur, is_live, cached_h, at)) =
                                             cache.get(&video_id)
                                         {
                                             if *cached_h == max_height
@@ -2525,6 +2576,7 @@ impl Backend {
                                                             video_url: v_url.clone(),
                                                             audio_url: a_url.clone(),
                                                             duration_secs: *dur,
+                                                            is_live: *is_live,
                                                         },
                                                     );
                                                     wake();
@@ -2567,13 +2619,14 @@ impl Backend {
                                             selected_audio_url,
                                             ..
                                         }) => {
-                                            let dur = data.duration_secs;
+                                            let is_live = data.is_live;
+                                            let dur = if is_live { 0.0 } else { data.duration_secs };
                                             {
                                                 let mut cache = hover_cache.lock().await;
                                                 if cache.len() >= 10 {
                                                     if let Some(oldest_k) = cache
                                                         .iter()
-                                                        .min_by_key(|(_, (_, _, _, _, at))| *at)
+                                                        .min_by_key(|(_, (_, _, _, _, _, at))| *at)
                                                         .map(|(k, _)| k.clone())
                                                     {
                                                         cache.remove(&oldest_k);
@@ -2585,6 +2638,7 @@ impl Backend {
                                                         selected_video_url.clone(),
                                                         selected_audio_url.clone(),
                                                         dur,
+                                                        is_live,
                                                         max_height,
                                                         std::time::Instant::now(),
                                                     ),
@@ -2596,6 +2650,7 @@ impl Backend {
                                                     video_url: selected_video_url,
                                                     audio_url: selected_audio_url,
                                                     duration_secs: dur,
+                                                    is_live,
                                                 });
                                                 wake();
                                             }
@@ -2742,18 +2797,24 @@ impl Backend {
                                             let mut s = Session::from_cookie(cookie);
                                             cfg = innertube::fetch_web_config(&http, Some(&s))
                                                 .await;
-                                            if let Some((name, avatar)) =
+                                            if let Some((name, avatar, channel_id)) =
                                                 innertube::fetch_account_info(&http, &cfg, &s).await
                                             {
                                                 s.account_name = Some(name);
                                                 s.account_avatar = avatar;
+                                                s.account_channel_id = channel_id;
                                             }
                                             s.save(&data_dir);
                                             let name = s.account_name.clone();
                                             let avatar = s.account_avatar.clone();
+                                            let channel_id = s.account_channel_id.clone();
                                             *shared_session.lock().unwrap() = Some(s.clone());
                                             let session_ref = Some(s);
-                                            let _ = resp_tx.send(Response::SignedIn { name, avatar });
+                                            let _ = resp_tx.send(Response::SignedIn {
+                                                name,
+                                                avatar,
+                                                channel_id,
+                                            });
                                             // Automatically refresh Home feed with authenticated session
                                             if let Ok(FeedPage {
                                                 items,
@@ -2761,6 +2822,7 @@ impl Backend {
                                                 continuation,
                                                 visitor_data,
                                                 is_fallback_trending,
+                                                ..
                                             }) = innertube::home_feed(
                                                 &http,
                                                 None,
@@ -3019,6 +3081,136 @@ impl Backend {
                                         chip_title,
                                         items,
                                     });
+                                    wake();
+                                });
+                            }
+                            Request::LoadMixQueue {
+                                playlist_id,
+                                video_id,
+                                continuation,
+                                append,
+                            } => {
+                                let cfg_clone = cfg.clone();
+                                let sess_clone = session.clone();
+                                tokio::spawn(async move {
+                                    match innertube::mix_queue(
+                                        &http,
+                                        &playlist_id,
+                                        video_id.as_deref(),
+                                        continuation.as_deref(),
+                                        &cfg_clone,
+                                        sess_clone.as_ref(),
+                                    )
+                                    .await
+                                    {
+                                        Ok((title, items, next_cont)) => {
+                                            let _ = resp_tx.send(Response::MixQueueLoaded {
+                                                playlist_id,
+                                                title,
+                                                items,
+                                                continuation: next_cont,
+                                                append,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = resp_tx.send(Response::Error(format!(
+                                                "Mix queue load failed: {e:#}"
+                                            )));
+                                        }
+                                    }
+                                    wake();
+                                });
+                            }
+                            Request::VoteCommunityPoll {
+                                post_id,
+                                choice_idx,
+                                action_params,
+                            } => {
+                                let mut synced = false;
+                                if let (Some(s), Some(act)) = (&session, &action_params) {
+                                    synced = innertube::perform_comment_action(
+                                        &http, act, &cfg, s,
+                                    )
+                                    .await
+                                    .is_ok();
+                                }
+                                let _ = resp_tx.send(Response::CommunityPollVoted {
+                                    post_id,
+                                    choice_idx,
+                                    synced,
+                                });
+                                wake();
+                            }
+                            Request::LikeCommunityPost {
+                                post_id,
+                                action_params,
+                                liked,
+                            } => {
+                                let Some(ref s) = session else {
+                                    let _ = resp_tx.send(Response::Error(
+                                        "Sign in to like posts".into(),
+                                    ));
+                                    wake();
+                                    continue;
+                                };
+                                match innertube::perform_comment_action(
+                                    &http,
+                                    &action_params,
+                                    &cfg,
+                                    s,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        let _ = resp_tx.send(Response::CommunityPostLikeUpdated {
+                                            post_id,
+                                            liked,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let _ = resp_tx.send(Response::Error(format!(
+                                            "Post like failed: {e:#}"
+                                        )));
+                                    }
+                                }
+                                wake();
+                            }
+                            Request::LoadPostComments {
+                                post_id,
+                                browse_id,
+                                params,
+                                continuation,
+                                append,
+                            } => {
+                                let cfg_clone = cfg.clone();
+                                let sess_clone = session.clone();
+                                tokio::spawn(async move {
+                                    match innertube::fetch_post_comments(
+                                        &http,
+                                        browse_id.as_deref(),
+                                        params.as_deref(),
+                                        continuation.as_deref(),
+                                        &cfg_clone,
+                                        sess_clone.as_ref(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(page) => {
+                                            let _ = resp_tx.send(Response::CommentsLoaded {
+                                                video_id: post_id,
+                                                comments: page.comments,
+                                                next_token: page.next_token,
+                                                sort_options: page.sort_options,
+                                                create_params: page.create_params,
+                                                append,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = resp_tx.send(Response::Error(format!(
+                                                "Post comments failed: {e:#}"
+                                            )));
+                                        }
+                                    }
                                     wake();
                                 });
                             }

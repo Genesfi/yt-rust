@@ -6,10 +6,11 @@ use serde_json::{Value, json};
 use crate::auth::Session;
 use crate::model::{
     AudioTrack, CaptionTrack, ChannelInfo, ChannelNotificationParams, ChannelTab, Chapter,
-    CommentItem, FeedChip, LiveChatEmote, LiveChatKind, LiveChatMessage, LiveChatRun,
-    NotificationLevel, NotificationMenuItem, PlaylistOption, PlaylistPrivacy, PlaylistSummary,
-    SearchChannelResult, SearchDateFilter, SearchDurationFilter, SearchFilter, SearchSortBy,
-    SearchTypeFilter, SidebarChannel, StoryboardSpec, VideoFormat, VideoItem, WatchData,
+    CommentItem, CommunityPollChoice, CommunityPost, FeedChip, LiveChatEmote, LiveChatKind,
+    LiveChatMessage, LiveChatRun, NotificationLevel, NotificationMenuItem, PlaylistOption,
+    PlaylistPrivacy, PlaylistSummary, SearchChannelResult, SearchDateFilter,
+    SearchDurationFilter, SearchFilter, SearchSortBy, SearchTypeFilter, SidebarChannel,
+    StoryboardSpec, VideoFormat, VideoItem, WatchData,
 };
 
 const ORIGIN: &str = "https://www.youtube.com";
@@ -37,12 +38,40 @@ impl Default for WebConfig {
     }
 }
 
+#[derive(Default)]
 pub struct FeedPage {
     pub items: Vec<VideoItem>,
+    pub posts: Vec<CommunityPost>,
     pub chips: Vec<FeedChip>,
     pub continuation: Option<String>,
     pub visitor_data: Option<String>,
     pub is_fallback_trending: bool,
+}
+
+/// Extract `(mix_playlist_id, optional_video_id)` when a URL or ID refers to a YouTube Mix (`RD...`).
+pub fn extract_mix_list_id(input: &str) -> Option<(String, Option<String>)> {
+    let s = input.trim();
+    if s.starts_with("RD")
+        && s.len() >= 4
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Some((s.to_owned(), None));
+    }
+    if let Ok(u) = url::Url::parse(s) {
+        let host = u.host_str().unwrap_or_default().to_ascii_lowercase();
+        if host.contains("youtube.com") || host.contains("youtu.be") || host.contains("youtube-nocookie.com") {
+            let list = u
+                .query_pairs()
+                .find(|(k, _)| k == "list")
+                .map(|(_, v)| v.into_owned())
+                .filter(|id| id.starts_with("RD"));
+            if let Some(pid) = list {
+                let vid = extract_video_id(s);
+                return Some((pid, vid));
+            }
+        }
+    }
+    None
 }
 
 pub fn extract_video_id(input: &str) -> Option<String> {
@@ -228,6 +257,7 @@ pub async fn home_feed(
         continuation: cont,
         visitor_data: new_vd,
         is_fallback_trending: false,
+        ..Default::default()
     })
 }
 
@@ -255,6 +285,7 @@ pub async fn subscriptions_feed(
         continuation: cont,
         visitor_data: new_vd,
         is_fallback_trending: false,
+        ..Default::default()
     })
 }
 
@@ -297,6 +328,7 @@ pub async fn history_feed(
             continuation: cont,
             visitor_data: new_vd,
             is_fallback_trending: false,
+            ..Default::default()
         },
         feedback_tokens,
         meta,
@@ -932,6 +964,7 @@ pub async fn playlist_feed(
             continuation: cont,
             visitor_data: new_vd,
             is_fallback_trending: false,
+            ..Default::default()
         },
     ))
 }
@@ -1488,6 +1521,7 @@ pub async fn trending_feed(
                     continuation: cont,
                     visitor_data: new_vd,
                     is_fallback_trending: false,
+                    ..Default::default()
                 });
             }
         }
@@ -1500,6 +1534,7 @@ pub async fn trending_feed(
             continuation: sp.continuation,
             visitor_data: sp.visitor_data,
             is_fallback_trending: false,
+            ..Default::default()
         })
 }
 
@@ -1719,6 +1754,7 @@ fn parse_channel_response(v: &Value, channel_id: &str) -> (ChannelInfo, FeedPage
     }
     let cont = find_continuation(v);
     let chips = collect_chips(v);
+    let posts = collect_community_posts(v, &channel_name, avatar_url.as_deref());
     (
         ChannelInfo {
             id: channel_id.to_owned(),
@@ -1733,6 +1769,7 @@ fn parse_channel_response(v: &Value, channel_id: &str) -> (ChannelInfo, FeedPage
         },
         FeedPage {
             items,
+            posts,
             chips,
             continuation: cont,
             visitor_data: new_vd,
@@ -1818,6 +1855,7 @@ fn parse_channel_search_response(v: &Value, channel_id: &str) -> FeedPage {
         continuation: cont,
         visitor_data: new_vd,
         is_fallback_trending: false,
+        ..Default::default()
     }
 }
 
@@ -1871,7 +1909,7 @@ fn parse_channel_tabs(v: &Value) -> Vec<ChannelTab> {
         let lower = title.to_ascii_lowercase();
         if !matches!(
             lower.as_str(),
-            "home" | "videos" | "shorts" | "live" | "playlists" | "podcasts" | "releases"
+            "home" | "videos" | "shorts" | "live" | "playlists" | "podcasts" | "releases" | "posts" | "community"
         ) {
             continue;
         }
@@ -1904,7 +1942,20 @@ fn collect_videos_with_channel_items(
     ) {
         match v {
             Value::Object(map) => {
-                if let Some(vr) = map
+                if let Some(rr) = map
+                    .get("compactRadioRenderer")
+                    .or_else(|| map.get("radioRenderer"))
+                {
+                    if let Some(item) = parse_radio_renderer(rr) {
+                        let key = format!(
+                            "mix:{}",
+                            item.mix_playlist_id.as_deref().unwrap_or(&item.id)
+                        );
+                        if seen.insert(key) {
+                            out.push(item);
+                        }
+                    }
+                } else if let Some(vr) = map
                     .get("videoRenderer")
                     .or_else(|| map.get("compactVideoRenderer"))
                     .or_else(|| map.get("gridVideoRenderer"))
@@ -1958,6 +2009,7 @@ fn collect_videos_with_channel_items(
                                     watched_percent: None,
                                     resume_secs: None,
                                     playlist_browse_id: Some(bid),
+                                    mix_playlist_id: None,
                                     playlist_set_video_id: None,
                                     is_new: false,
                                     is_members_only: false,
@@ -1971,7 +2023,12 @@ fn collect_videos_with_channel_items(
                         if item.channel_id.is_none() {
                             item.channel_id = Some(channel_id.to_owned());
                         }
-                        if seen.insert(item.id.clone()) {
+                        let key = if let Some(pid) = &item.mix_playlist_id {
+                            format!("mix:{pid}")
+                        } else {
+                            item.id.clone()
+                        };
+                        if seen.insert(key) {
                             out.push(item);
                         }
                     }
@@ -2010,6 +2067,7 @@ fn collect_videos_with_channel_items(
                                 watched_percent: None,
                                 resume_secs: None,
                                 playlist_browse_id: Some(bid),
+                                mix_playlist_id: None,
                                 playlist_set_video_id: None,
                                 is_new: false,
                                 is_members_only: false,
@@ -2030,6 +2088,461 @@ fn collect_videos_with_channel_items(
         }
     }
     walk(v, out, seen, channel_name, channel_id);
+}
+
+/// Fetch or refill a YouTube Mix / Radio (`RD...`) queue via `/youtubei/v1/next`.
+pub async fn mix_queue(
+    http: &reqwest::Client,
+    playlist_id: &str,
+    video_id: Option<&str>,
+    continuation: Option<&str>,
+    cfg: &WebConfig,
+    session: Option<&Session>,
+) -> anyhow::Result<(String, Vec<VideoItem>, Option<String>)> {
+    let body = if let Some(tok) = continuation.filter(|s| !s.is_empty()) {
+        json!({ "continuation": tok })
+    } else if let Some(vid) = video_id.filter(|v| v.len() == 11) {
+        json!({ "playlistId": playlist_id, "videoId": vid })
+    } else {
+        json!({ "playlistId": playlist_id })
+    };
+    let v = post_web(http, "next", body, cfg, session).await?;
+    Ok(parse_mix_queue_response(&v, video_id))
+}
+
+fn parse_mix_queue_response(
+    v: &Value,
+    exclude_video_id: Option<&str>,
+) -> (String, Vec<VideoItem>, Option<String>) {
+    let playlist = &v["contents"]["twoColumnWatchNextResults"]["playlist"]["playlist"];
+    let title = text(&playlist["title"])
+        .or_else(|| playlist["title"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| "YouTube Mix".to_owned());
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(ex) = exclude_video_id.filter(|s| !s.is_empty()) {
+        seen.insert(ex.to_owned());
+    }
+    if let Some(contents) = playlist["contents"].as_array() {
+        for entry in contents {
+            let pv = &entry["playlistPanelVideoRenderer"];
+            let pv = if pv.is_object() {
+                pv
+            } else {
+                &entry["playlistPanelVideoWrapperRenderer"]["primaryRenderer"]
+                    ["playlistPanelVideoRenderer"]
+            };
+            let Some(vid) = pv["videoId"].as_str().filter(|s| s.len() == 11) else {
+                continue;
+            };
+            if !seen.insert(vid.to_owned()) {
+                continue;
+            }
+            let Some(vtitle) = text(&pv["title"]) else {
+                continue;
+            };
+            let byline = pv["longBylineText"]["runs"]
+                .get(0)
+                .or_else(|| pv["shortBylineText"]["runs"].get(0));
+            let channel = byline
+                .and_then(|r| r["text"].as_str())
+                .map(str::to_owned)
+                .or_else(|| text(&pv["longBylineText"]))
+                .or_else(|| text(&pv["shortBylineText"]))
+                .unwrap_or_default();
+            let channel_id = byline
+                .and_then(|r| r["navigationEndpoint"]["browseEndpoint"]["browseId"].as_str())
+                .filter(|s| s.starts_with("UC"))
+                .map(str::to_owned)
+                .or_else(|| find_first_uc_browse_id(&pv["longBylineText"]));
+            let duration_text = text(&pv["lengthText"]).unwrap_or_default();
+            let thumbnail_url = pick_thumb(&pv["thumbnail"]["thumbnails"], vid);
+            items.push(VideoItem {
+                id: vid.to_owned(),
+                title: vtitle,
+                channel,
+                channel_id,
+                duration_text,
+                thumbnail_url,
+                ..Default::default()
+            });
+        }
+    }
+    let continuation = playlist["continuations"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter().find_map(|c| {
+                c["nextContinuationData"]["continuation"]
+                    .as_str()
+                    .or_else(|| c["reloadContinuationData"]["continuation"].as_str())
+            })
+        })
+        .map(str::to_owned)
+        .or_else(|| find_continuation(playlist))
+        .or_else(|| find_continuation(v));
+    (title, items, continuation)
+}
+
+fn parse_poll_ratio(c: &Value, selected: bool) -> Option<f32> {
+    let ratio_key = if selected {
+        "voteRatioIfSelected"
+    } else {
+        "voteRatioIfNotSelected"
+    };
+    if let Some(r) = c[ratio_key]
+        .as_f64()
+        .or_else(|| c["voteRatio"].as_f64())
+    {
+        return Some((r as f32).clamp(0.0, 1.0));
+    }
+    let pct_key = if selected {
+        "votePercentageIfSelected"
+    } else {
+        "votePercentageIfNotSelected"
+    };
+    let pct_str = text(&c[pct_key]).or_else(|| text(&c["votePercentage"]))?;
+    let num: f32 = pct_str.trim().trim_end_matches('%').trim().parse().ok()?;
+    Some((num / 100.0).clamp(0.0, 1.0))
+}
+
+fn parse_community_post(
+    pr: &Value,
+    default_author: &str,
+    default_avatar: Option<&str>,
+) -> Option<CommunityPost> {
+    let id = pr["postId"].as_str()?.to_owned();
+    let author = text(&pr["authorText"])
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default_author.to_owned());
+    let author_avatar_url = find_first_thumb_url(&pr["authorThumbnail"])
+        .or_else(|| default_avatar.map(str::to_owned));
+    let published_text = text(&pr["publishedTimeText"]).unwrap_or_default();
+    let content = text(&pr["contentText"]).unwrap_or_default();
+    let actions = &pr["actionButtons"]["commentActionButtonsRenderer"];
+    let like_tb = &actions["likeButton"]["toggleButtonRenderer"];
+    let is_liked = like_tb["isToggled"].as_bool().unwrap_or(false);
+    let like_params = like_tb["defaultServiceEndpoint"]["performCommentActionEndpoint"]["action"]
+        .as_str()
+        .map(str::to_owned);
+    let unlike_params = like_tb["toggledServiceEndpoint"]["performCommentActionEndpoint"]["action"]
+        .as_str()
+        .map(str::to_owned);
+    let likes_text = text(&pr["voteCount"])
+        .or_else(|| text(&like_tb["defaultText"]))
+        .unwrap_or_default();
+    let reply_node = &actions["replyButton"];
+    let reply_btn = &reply_node["buttonRenderer"];
+    let comments_text = text(&reply_btn["text"])
+        .or_else(|| text(&reply_node["buttonViewModel"]["title"]))
+        .unwrap_or_default();
+    let (comments_browse_id, comments_browse_params) = extract_browse_endpoint(reply_node)
+        .or_else(|| extract_browse_endpoint(&pr["publishedTimeText"]))
+        .map(|(bid, params)| (Some(bid), params))
+        .unwrap_or((None, None));
+    let comments_token = find_continuation(reply_node)
+        .or_else(|| find_continuation(pr));
+    let is_members_only =
+        pr["sponsorsOnlyBadge"].is_object() || detect_video_badges(&pr["badges"]).1;
+
+    let mut images = Vec::new();
+    let mut attached_video = None;
+    let mut poll_total_votes = String::new();
+    let mut poll_choices = Vec::new();
+
+    for att in [&pr["backstageAttachment"], &pr["attachment"]] {
+        if !att.is_object() {
+            continue;
+        }
+        if let Some(url) = find_first_thumb_url(&att["backstageImageRenderer"]["image"]) {
+            if !images.contains(&url) {
+                images.push(url);
+            }
+        }
+        if let Some(arr) = att["postMultiImageRenderer"]["images"].as_array() {
+            for item in arr {
+                if let Some(url) = find_first_thumb_url(&item["backstageImageRenderer"]["image"]) {
+                    if !images.contains(&url) {
+                        images.push(url);
+                    }
+                }
+            }
+        }
+        if attached_video.is_none() && att["videoRenderer"].is_object() {
+            attached_video = parse_video_renderer(&att["videoRenderer"]);
+        }
+        let poll = &att["pollRenderer"];
+        if poll.is_object() && poll_choices.is_empty() {
+            poll_total_votes = text(&poll["totalVotes"]).unwrap_or_default();
+            if let Some(choices) = poll["choices"].as_array() {
+                for c in choices {
+                    let ctext = text(&c["text"]).unwrap_or_default();
+                    if ctext.is_empty() {
+                        continue;
+                    }
+                    let selected = c["selected"].as_bool().unwrap_or(false);
+                    let pct_key = if selected {
+                        "votePercentageIfSelected"
+                    } else {
+                        "votePercentageIfNotSelected"
+                    };
+                    let num_votes_text = text(&c[pct_key])
+                        .or_else(|| text(&c["numVotesSelected"]))
+                        .or_else(|| text(&c["numVotes"]))
+                        .unwrap_or_default();
+                    let vote_ratio = parse_poll_ratio(c, selected);
+                    let vote_params = c["serviceEndpoint"]["performCommentActionEndpoint"]
+                        ["action"]
+                        .as_str()
+                        .or_else(|| {
+                            c["selectOptionCommand"]["performCommentActionEndpoint"]["action"]
+                                .as_str()
+                        })
+                        .map(str::to_owned);
+                    poll_choices.push(CommunityPollChoice {
+                        text: ctext,
+                        num_votes_text,
+                        vote_ratio,
+                        selected,
+                        vote_params,
+                    });
+                }
+            }
+        }
+    }
+
+    Some(CommunityPost {
+        id,
+        author,
+        author_avatar_url,
+        published_text,
+        content,
+        likes_text,
+        is_liked,
+        like_params,
+        unlike_params,
+        comments_text,
+        comments_browse_id,
+        comments_browse_params,
+        comments_token,
+        images,
+        attached_video,
+        poll_total_votes,
+        poll_choices,
+        is_members_only,
+    })
+}
+
+/// Fetch comments for a Channel Community Post using continuation or post detail browse endpoint.
+fn extract_browse_endpoint(v: &Value) -> Option<(String, Option<String>)> {
+    match v {
+        Value::Object(map) => {
+            if let Some(be) = map.get("browseEndpoint") {
+                if let Some(bid) = be.get("browseId").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    let params = be
+                        .get("params")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    return Some((bid.to_owned(), params));
+                }
+            }
+            for val in map.values() {
+                if let Some(found) = extract_browse_endpoint(val) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => arr.iter().find_map(extract_browse_endpoint),
+        _ => None,
+    }
+}
+
+pub async fn fetch_post_comments(
+    http: &reqwest::Client,
+    browse_id: Option<&str>,
+    params: Option<&str>,
+    continuation: Option<&str>,
+    cfg: &WebConfig,
+    session: Option<&Session>,
+) -> anyhow::Result<CommentPage> {
+    if let Some(tok) = continuation.filter(|s| !s.is_empty()) {
+        return fetch_comments(http, tok, cfg, session).await;
+    }
+    let bid = browse_id.unwrap_or("FEpost_detail");
+    let mut body = json!({ "browseId": bid });
+    if let Some(p) = params.filter(|s| !s.is_empty()) {
+        body["params"] = json!(p);
+    }
+    let v = post_web(http, "browse", body, cfg, session).await?;
+    let mut inline = parse_comments_page(&v);
+    if !inline.comments.is_empty() {
+        return Ok(inline);
+    }
+    let tok = inline
+        .next_token
+        .take()
+        .or_else(|| find_comment_continuation_in_browse(&v));
+    if let Some(tok) = tok {
+        let mut page = fetch_comments(http, &tok, cfg, session).await?;
+        if page.create_params.is_none() {
+            page.create_params = inline
+                .create_params
+                .or_else(|| find_nested_str(&v, "createCommentParams").map(str::to_owned));
+        }
+        return Ok(page);
+    }
+    Ok(CommentPage {
+        comments: Vec::new(),
+        next_token: None,
+        sort_options: inline.sort_options,
+        create_params: inline
+            .create_params
+            .or_else(|| find_nested_str(&v, "createCommentParams").map(str::to_owned)),
+    })
+}
+
+fn find_any_continuation_token(v: &Value) -> Option<String> {
+    match v {
+        Value::Object(map) => {
+            if let Some(tok) = map
+                .get("continuationCommand")
+                .and_then(|c| c.get("token"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    map.get("nextContinuationData")
+                        .and_then(|c| c.get("continuation"))
+                        .and_then(Value::as_str)
+                })
+                .filter(|s| !s.is_empty())
+            {
+                return Some(tok.to_owned());
+            }
+            map.values().find_map(find_any_continuation_token)
+        }
+        Value::Array(arr) => arr.iter().find_map(find_any_continuation_token),
+        _ => None,
+    }
+}
+
+fn find_comment_continuation_in_browse(v: &Value) -> Option<String> {
+    fn walk_tagged(val: &Value, in_comments: bool) -> Option<String> {
+        match val {
+            Value::Object(map) => {
+                let sec_hit = map
+                    .get("sectionIdentifier")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.to_ascii_lowercase().contains("comment"))
+                    || map
+                        .get("targetId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| s.to_ascii_lowercase().contains("comment"));
+                let under_comments = in_comments || sec_hit;
+                if under_comments {
+                    if let Some(tok) = map
+                        .get("continuationCommand")
+                        .and_then(|c| c.get("token"))
+                        .and_then(Value::as_str)
+                        .or_else(|| {
+                            map.get("nextContinuationData")
+                                .and_then(|c| c.get("continuation"))
+                                .and_then(Value::as_str)
+                        })
+                        .filter(|s| !s.is_empty())
+                    {
+                        return Some(tok.to_owned());
+                    }
+                }
+                map.values().find_map(|child| walk_tagged(child, under_comments))
+            }
+            Value::Array(arr) => arr.iter().find_map(|child| walk_tagged(child, in_comments)),
+            _ => None,
+        }
+    }
+    if let Some(tok) = walk_tagged(v, false) {
+        return Some(tok);
+    }
+
+    // Fallback: post-detail browse responses sometimes omit `sectionIdentifier` /
+    // `targetId` on the comment `itemSectionRenderer` or place the continuation
+    // inside `onResponseReceivedEndpoints` / `sectionListRenderer.contents`.
+    fn walk_post_detail_fallback(val: &Value) -> Option<String> {
+        match val {
+            Value::Object(map) => {
+                if let Some(sec) = map.get("itemSectionRenderer").and_then(Value::as_object) {
+                    let has_post = sec
+                        .get("contents")
+                        .and_then(Value::as_array)
+                        .is_some_and(|arr| {
+                            arr.iter().any(|c| {
+                                c.get("backstagePostThreadRenderer").is_some()
+                                    || c.get("backstagePostRenderer").is_some()
+                            })
+                        });
+                    let skip_id = sec
+                        .get("sectionIdentifier")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| s.contains("related") || s.contains("chip"));
+                    if !has_post && !skip_id {
+                        if let Some(tok) = find_any_continuation_token(val) {
+                            return Some(tok);
+                        }
+                    }
+                }
+                if let Some(cont_item) = map.get("continuationItemRenderer") {
+                    if let Some(tok) = find_any_continuation_token(cont_item) {
+                        return Some(tok);
+                    }
+                }
+                map.values().find_map(walk_post_detail_fallback)
+            }
+            Value::Array(arr) => arr.iter().find_map(walk_post_detail_fallback),
+            _ => None,
+        }
+    }
+    walk_post_detail_fallback(v)
+}
+
+fn collect_community_posts(
+    v: &Value,
+    default_author: &str,
+    default_avatar: Option<&str>,
+) -> Vec<CommunityPost> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    fn walk(
+        v: &Value,
+        default_author: &str,
+        default_avatar: Option<&str>,
+        out: &mut Vec<CommunityPost>,
+        seen: &mut HashSet<String>,
+    ) {
+        match v {
+            Value::Object(map) => {
+                if let Some(pr) = map
+                    .get("backstagePostRenderer")
+                    .or_else(|| map.get("postRenderer"))
+                {
+                    if let Some(post) = parse_community_post(pr, default_author, default_avatar) {
+                        if seen.insert(post.id.clone()) {
+                            out.push(post);
+                        }
+                    }
+                }
+                for val in map.values() {
+                    walk(val, default_author, default_avatar, out, seen);
+                }
+            }
+            Value::Array(arr) => {
+                for val in arr {
+                    walk(val, default_author, default_avatar, out, seen);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(v, default_author, default_avatar, &mut out, &mut seen);
+    out
 }
 
 pub struct CommentPage {
@@ -2254,7 +2767,10 @@ pub async fn fetch_comments(
         session,
     )
     .await?;
+    Ok(parse_comments_page(&v))
+}
 
+fn parse_comments_page(v: &Value) -> CommentPage {
     let mut entity_map = std::collections::HashMap::<String, Value>::new();
     let mut surface_map = std::collections::HashMap::<String, Value>::new();
     if let Some(muts) = v["frameworkUpdates"]["entityBatchUpdate"]["mutations"].as_array() {
@@ -2330,12 +2846,12 @@ pub async fn fetch_comments(
         }
     }
 
-    Ok(CommentPage {
+    CommentPage {
         comments: out,
         next_token,
         sort_options,
         create_params,
-    })
+    }
 }
 
 pub async fn fetch_comment_replies(
@@ -3905,12 +4421,12 @@ pub async fn send_live_chat_message(
     Ok(())
 }
 
-/// Fetch signed-in user display name / avatar from account_menu.
+/// Fetch signed-in user display name, avatar, and own channel ID (`UC...`) from account_menu.
 pub async fn fetch_account_info(
     http: &reqwest::Client,
     cfg: &WebConfig,
     session: &Session,
-) -> Option<(String, Option<String>)> {
+) -> Option<(String, Option<String>, Option<String>)> {
     let v = post_web(http, "account/account_menu", json!({}), cfg, Some(session))
         .await
         .ok()?;
@@ -3923,7 +4439,11 @@ pub async fn fetch_account_info(
         .and_then(|a| a.last())
         .and_then(|t| t["url"].as_str())
         .map(|u| if u.starts_with("//") { format!("https:{u}") } else { u.to_owned() });
-    Some((name, avatar))
+    let channel_id = find_first_uc_browse_id(
+        &v["actions"][0]["openPopupAction"]["popup"]["multiPageMenuRenderer"],
+    )
+    .or_else(|| find_first_uc_browse_id(&v));
+    Some((name, avatar, channel_id))
 }
 
 pub async fn fetch_next_json(
@@ -5564,6 +6084,7 @@ fn parse_shorts_entry(
             watched_percent: None,
             resume_secs: None,
             playlist_browse_id: None,
+            mix_playlist_id: None,
             playlist_set_video_id: None,
             is_new,
             is_members_only,
@@ -5608,6 +6129,7 @@ fn parse_shorts_entry(
             watched_percent: None,
             resume_secs: None,
             playlist_browse_id: None,
+            mix_playlist_id: None,
             playlist_set_video_id: None,
             is_new,
             is_members_only,
@@ -5722,6 +6244,7 @@ pub async fn fetch_shorts_sequence(
                 watched_percent: None,
                 resume_secs: None,
                 playlist_browse_id: None,
+                mix_playlist_id: None,
                 playlist_set_video_id: None,
                 is_new: false,
                 is_members_only: false,
@@ -5850,6 +6373,60 @@ fn parse_search_playlist_renderer(pr: &Value) -> Option<VideoItem> {
         watched_percent: None,
         resume_secs: None,
         playlist_browse_id: Some(bid),
+        mix_playlist_id: None,
+        playlist_set_video_id: None,
+        is_new: false,
+        is_members_only: false,
+    })
+}
+
+fn parse_radio_renderer(rr: &Value) -> Option<VideoItem> {
+    let pid = rr["playlistId"]
+        .as_str()
+        .or_else(|| rr["navigationEndpoint"]["watchEndpoint"]["playlistId"].as_str())?
+        .to_owned();
+    let title = text(&rr["title"])?;
+    let seed_vid = rr["navigationEndpoint"]["watchEndpoint"]["videoId"]
+        .as_str()
+        .or_else(|| rr["videos"][0]["childVideoRenderer"]["videoId"].as_str())
+        .filter(|s| s.len() == 11)
+        .map(str::to_owned);
+    let channel = text(&rr["longBylineText"])
+        .or_else(|| text(&rr["shortBylineText"]))
+        .or_else(|| text(&rr["secondaryTitle"]))
+        .unwrap_or_else(|| "YouTube Mix".to_owned());
+    let views_text = text(&rr["videoCountText"])
+        .or_else(|| text(&rr["videoCountShortText"]))
+        .unwrap_or_else(|| "Mix".to_owned());
+    let thumb = find_first_thumb_url(&rr["thumbnail"])
+        .or_else(|| {
+            rr["thumbnail"]["thumbnails"]
+                .as_array()
+                .and_then(|a| a.last())
+                .and_then(|t| t["url"].as_str())
+                .map(normalize_url)
+        })
+        .unwrap_or_else(|| {
+            seed_vid
+                .as_deref()
+                .map(|v| format!("https://i.ytimg.com/vi/{v}/hqdefault.jpg"))
+                .unwrap_or_default()
+        });
+    Some(VideoItem {
+        id: seed_vid.unwrap_or_else(|| pid.clone()),
+        title,
+        channel,
+        channel_id: None,
+        channel_avatar_url: None,
+        views_text,
+        published_text: String::new(),
+        duration_text: "Mix".to_owned(),
+        thumbnail_url: thumb,
+        is_live: false,
+        watched_percent: None,
+        resume_secs: None,
+        playlist_browse_id: None,
+        mix_playlist_id: Some(pid),
         playlist_set_video_id: None,
         is_new: false,
         is_members_only: false,
@@ -5868,6 +6445,19 @@ fn collect_videos(v: &Value, out: &mut Vec<VideoItem>, seen: &mut HashSet<String
                         out.push(item);
                     }
                 }
+            } else if let Some(rr) = map
+                .get("compactRadioRenderer")
+                .or_else(|| map.get("radioRenderer"))
+            {
+                if let Some(item) = parse_radio_renderer(rr) {
+                    let key = format!(
+                        "mix:{}",
+                        item.mix_playlist_id.as_deref().unwrap_or(&item.id)
+                    );
+                    if seen.insert(key) {
+                        out.push(item);
+                    }
+                }
             } else if let Some(pr) = map.get("playlistRenderer") {
                 if let Some(item) = parse_search_playlist_renderer(pr) {
                     if seen.insert(item.id.clone()) {
@@ -5882,7 +6472,12 @@ fn collect_videos(v: &Value, out: &mut Vec<VideoItem>, seen: &mut HashSet<String
                 }
             } else if let Some(lm) = map.get("lockupViewModel") {
                 if let Some(item) = parse_lockup_view_model(lm) {
-                    if seen.insert(item.id.clone()) {
+                    let key = if let Some(pid) = &item.mix_playlist_id {
+                        format!("mix:{pid}")
+                    } else {
+                        item.id.clone()
+                    };
+                    if seen.insert(key) {
                         out.push(item);
                     }
                 }
@@ -5976,6 +6571,7 @@ fn parse_video_renderer(vr: &Value) -> Option<VideoItem> {
         watched_percent,
         resume_secs,
         playlist_browse_id: None,
+        mix_playlist_id: None,
         playlist_set_video_id: None,
         is_new,
         is_members_only,
@@ -6027,6 +6623,7 @@ fn parse_playlist_video_renderer(pvr: &Value) -> Option<VideoItem> {
         watched_percent,
         resume_secs,
         playlist_browse_id: None,
+        mix_playlist_id: None,
         playlist_set_video_id,
         is_new,
         is_members_only,
@@ -6035,6 +6632,59 @@ fn parse_playlist_video_renderer(pvr: &Value) -> Option<VideoItem> {
 
 fn parse_lockup_view_model(lm: &Value) -> Option<VideoItem> {
     let ctype = lm["contentType"].as_str().unwrap_or_default();
+    let mix_ep = &lm["rendererContext"]["commandContext"]["onTap"]["innertubeCommand"]
+        ["watchEndpoint"];
+    let ep_pid = mix_ep["playlistId"].as_str();
+    let cid = lm["contentId"].as_str().unwrap_or_default();
+    let is_mix = ctype.contains("MIX")
+        || cid.starts_with("RD")
+        || ep_pid.is_some_and(|p| p.starts_with("RD"));
+    if is_mix {
+        let pid = ep_pid
+            .filter(|s| !s.is_empty())
+            .or_else(|| (!cid.is_empty()).then_some(cid))?;
+        let seed_vid = mix_ep["videoId"].as_str().filter(|s| s.len() == 11);
+        let meta = &lm["metadata"]["lockupMetadataViewModel"];
+        let title = meta["title"]["content"].as_str()?.to_owned();
+        let subtitle: String = meta["metadata"]["contentMetadataViewModel"]["metadataRows"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .and_then(|r| r["metadataParts"].as_array())
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|p| p["text"]["content"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            })
+            .unwrap_or_default();
+        let thumb = lm["contentImage"]["collectionThumbnailViewModel"]["primaryThumbnail"]
+            ["thumbnailViewModel"]["image"]["sources"]
+            .as_array()
+            .or_else(|| lm["contentImage"]["thumbnailViewModel"]["image"]["sources"].as_array())
+            .and_then(|a| a.last())
+            .and_then(|s| s["url"].as_str())
+            .map(normalize_url)
+            .unwrap_or_else(|| {
+                seed_vid
+                    .map(|v| format!("https://i.ytimg.com/vi/{v}/hqdefault.jpg"))
+                    .unwrap_or_default()
+            });
+        return Some(VideoItem {
+            id: seed_vid.unwrap_or(pid).to_owned(),
+            title,
+            channel: if subtitle.is_empty() {
+                "YouTube Mix".to_owned()
+            } else {
+                subtitle
+            },
+            views_text: "Mix".to_owned(),
+            duration_text: "Mix".to_owned(),
+            thumbnail_url: thumb,
+            mix_playlist_id: Some(pid.to_owned()),
+            ..Default::default()
+        });
+    }
     if !ctype.is_empty() && !ctype.contains("VIDEO") && !ctype.contains("SHORT") {
         return None;
     }
@@ -6149,6 +6799,7 @@ fn parse_lockup_view_model(lm: &Value) -> Option<VideoItem> {
         watched_percent,
         resume_secs,
         playlist_browse_id: None,
+        mix_playlist_id: None,
         playlist_set_video_id: None,
         is_new,
         is_members_only,
@@ -7348,6 +7999,7 @@ mod tests {
                 watched_percent: None,
                 resume_secs: None,
                 playlist_browse_id: None,
+                mix_playlist_id: None,
                 playlist_set_video_id: None,
                 is_new: true,
                 is_members_only: false,
@@ -7366,6 +8018,7 @@ mod tests {
                 watched_percent: None,
                 resume_secs: None,
                 playlist_browse_id: None,
+                mix_playlist_id: None,
                 playlist_set_video_id: None,
                 is_new: false,
                 is_members_only: false,
@@ -7386,6 +8039,7 @@ mod tests {
                 watched_percent: None,
                 resume_secs: None,
                 playlist_browse_id: None,
+                mix_playlist_id: None,
                 playlist_set_video_id: None,
                 is_new: false,
                 is_members_only: false,
@@ -7404,6 +8058,7 @@ mod tests {
                 watched_percent: None,
                 resume_secs: None,
                 playlist_browse_id: None,
+                mix_playlist_id: None,
                 playlist_set_video_id: None,
                 is_new: true,
                 is_members_only: false,
@@ -7526,5 +8181,233 @@ mod tests {
             fallback_videos_tab_params(&already_videos, DEFAULT_CHANNEL_VIDEOS_PARAMS),
             None
         );
+    }
+
+    #[test]
+    fn parses_mix_cards_mix_queue_and_community_posts() {
+        let mix_feed = json!({
+            "items": [
+                {
+                    "compactRadioRenderer": {
+                        "playlistId": "RDdQw4w9WgXcQ",
+                        "title": { "simpleText": "Mix - City Pop" },
+                        "longBylineText": { "simpleText": "Tatsuro Yamashita and more" },
+                        "navigationEndpoint": {
+                            "watchEndpoint": { "videoId": "dQw4w9WgXcQ", "playlistId": "RDdQw4w9WgXcQ" }
+                        }
+                    }
+                },
+                {
+                    "lockupViewModel": {
+                        "contentId": "RDMM_LOCKUP1",
+                        "contentType": "LOCKUP_CONTENT_TYPE_PLAYLIST",
+                        "rendererContext": {
+                            "commandContext": {
+                                "onTap": {
+                                    "innertubeCommand": {
+                                        "watchEndpoint": {
+                                            "videoId": "abc12345678",
+                                            "playlistId": "RDMM_LOCKUP1"
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "metadata": {
+                            "lockupMetadataViewModel": {
+                                "title": { "content": "My Supermix" },
+                                "metadata": {
+                                    "contentMetadataViewModel": {
+                                        "metadataRows": [
+                                            { "metadataParts": [ { "text": { "content": "YouTube" } } ] }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+        let mut parsed = Vec::new();
+        let mut seen = HashSet::new();
+        collect_videos(&mix_feed, &mut parsed, &mut seen);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].mix_playlist_id.as_deref(), Some("RDdQw4w9WgXcQ"));
+        assert_eq!(parsed[0].id, "dQw4w9WgXcQ");
+        assert_eq!(parsed[0].duration_text, "Mix");
+        assert_eq!(parsed[1].mix_playlist_id.as_deref(), Some("RDMM_LOCKUP1"));
+        assert_eq!(parsed[1].id, "abc12345678");
+
+        let next_mix = json!({
+            "contents": {
+                "twoColumnWatchNextResults": {
+                    "playlist": {
+                        "playlist": {
+                            "title": "Mix - City Pop",
+                            "contents": [
+                                {
+                                    "playlistPanelVideoRenderer": {
+                                        "videoId": "dQw4w9WgXcQ",
+                                        "title": { "simpleText": "Current Track" }
+                                    }
+                                },
+                                {
+                                    "playlistPanelVideoRenderer": {
+                                        "videoId": "track2_0001",
+                                        "title": { "simpleText": "Next Track" },
+                                        "shortBylineText": { "simpleText": "Artist B" },
+                                        "lengthText": { "simpleText": "4:12" }
+                                    }
+                                }
+                            ],
+                            "continuations": [
+                                { "nextContinuationData": { "continuation": "MIX_CONT_2" } }
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+        let (mtitle, mtracks, mcont) = parse_mix_queue_response(&next_mix, Some("dQw4w9WgXcQ"));
+        assert_eq!(mtitle, "Mix - City Pop");
+        assert_eq!(mtracks.len(), 1);
+        assert_eq!(mtracks[0].id, "track2_0001");
+        assert_eq!(mtracks[0].duration_text, "4:12");
+        assert_eq!(mcont.as_deref(), Some("MIX_CONT_2"));
+
+        assert_eq!(
+            extract_mix_list_id("https://www.youtube.com/watch?v=abc12345678&list=RDabc12345678"),
+            Some(("RDabc12345678".to_owned(), Some("abc12345678".to_owned())))
+        );
+
+        let comm = json!({
+            "contents": {
+                "twoColumnBrowseResultsRenderer": {
+                    "tabs": [
+                        {
+                            "tabRenderer": {
+                                "title": "Posts",
+                                "selected": true,
+                                "content": {
+                                    "backstagePostThreadRenderer": {
+                                        "post": {
+                                            "backstagePostRenderer": {
+                                                "postId": "UgxPost1",
+                                                "publishedTimeText": { "runs": [{ "text": "2 hours ago" }] },
+                                                "contentText": { "runs": [{ "text": "Which topic next?" }] },
+                                                "voteCount": { "simpleText": "1.2K" },
+                                                "backstageAttachment": {
+                                                    "pollRenderer": {
+                                                        "totalVotes": { "simpleText": "500 votes" },
+                                                        "choices": [
+                                                            {
+                                                                "text": { "runs": [{ "text": "Rust Async" }] },
+                                                                "selected": true,
+                                                                "voteRatioIfSelected": 0.72,
+                                                                "votePercentageIfSelected": { "simpleText": "72%" }
+                                                            },
+                                                            {
+                                                                "text": { "runs": [{ "text": "OpenGL Shaders" }] },
+                                                                "selected": false,
+                                                                "voteRatioIfNotSelected": 0.28,
+                                                                "votePercentageIfNotSelected": { "simpleText": "28%" }
+                                                            }
+                                                        ]
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let ctabs = parse_channel_tabs(&comm);
+        assert_eq!(ctabs.len(), 1);
+        assert_eq!(ctabs[0].title, "Posts");
+        let posts = collect_community_posts(&comm, "Channel X", None);
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].id, "UgxPost1");
+        assert_eq!(posts[0].poll_choices.len(), 2);
+        assert_eq!(posts[0].poll_choices[0].vote_ratio, Some(0.72));
+        assert_eq!(posts[0].poll_total_votes, "500 votes");
+
+        let bare_post_browse = json!({
+            "contents": {
+                "twoColumnBrowseResultsRenderer": {
+                    "tabs": [{
+                        "tabRenderer": {
+                            "selected": true,
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [
+                                        {
+                                            "itemSectionRenderer": {
+                                                "contents": [{ "backstagePostThreadRenderer": {} }]
+                                            }
+                                        },
+                                        {
+                                            "itemSectionRenderer": {
+                                                "contents": [{
+                                                    "continuationItemRenderer": {
+                                                        "continuationEndpoint": {
+                                                            "continuationCommand": {
+                                                                "token": "POST_COMMENT_CONT_1"
+                                                            }
+                                                        }
+                                                    }
+                                                }]
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }]
+                }
+            }
+        });
+        assert_eq!(
+            find_comment_continuation_in_browse(&bare_post_browse).as_deref(),
+            Some("POST_COMMENT_CONT_1")
+        );
+
+        let reply_post = json!({
+            "backstagePostRenderer": {
+                "postId": "UgxPost2",
+                "publishedTimeText": {
+                    "runs": [{
+                        "text": "1 day ago",
+                        "navigationEndpoint": {
+                            "browseEndpoint": {
+                                "browseId": "FEpost_detail",
+                                "params": "EggPost2Param"
+                            }
+                        }
+                    }]
+                },
+                "actionButtons": {
+                    "commentActionButtonsRenderer": {
+                        "replyButton": {
+                            "buttonRenderer": {
+                                "text": { "simpleText": "3" },
+                                "navigationEndpoint": {
+                                    "continuationCommand": { "token": "DIRECT_POST_TOK" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let parsed_posts = collect_community_posts(&reply_post, "Channel Y", None);
+        assert_eq!(parsed_posts.len(), 1);
+        assert_eq!(parsed_posts[0].comments_token.as_deref(), Some("DIRECT_POST_TOK"));
+        assert_eq!(parsed_posts[0].comments_browse_id.as_deref(), Some("FEpost_detail"));
+        assert_eq!(parsed_posts[0].comments_browse_params.as_deref(), Some("EggPost2Param"));
     }
 }

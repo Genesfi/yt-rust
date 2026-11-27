@@ -718,7 +718,22 @@ impl YtApp {
 
         let mut grid_action: Option<super::cards::GridAction> = None;
         let mut clicked_channel_chip: Option<usize> = None;
+        let mut open_post_video: Option<VideoItem> = None;
+        let mut vote_poll: Option<(String, usize, Option<String>)> = None;
+        let mut like_post: Option<(String, String, bool)> = None;
+        let mut toggle_post_comments: Option<crate::model::CommunityPost> = None;
         let mut measured_header_h = sticky.header_h;
+        let active_is_posts = search_active.is_empty()
+            && (!self.channel_posts.is_empty()
+                || info.tabs.iter().any(|t| {
+                    (t.title.eq_ignore_ascii_case("Posts")
+                        || t.title.eq_ignore_ascii_case("Community"))
+                        && match (&self.channel_tab_params, &t.params) {
+                            (Some(cur), Some(p)) => cur == p,
+                            (None, _) => t.selected,
+                            _ => false,
+                        }
+                }));
 
         let active_scroll_y = sticky.pending_scroll_y.unwrap_or(sticky.scroll_y);
         let clip_tab_bottom_y = (page_rect.top()
@@ -726,13 +741,16 @@ impl YtApp {
             + sticky.tab_bar_h)
             .min(page_rect.bottom());
 
-        let mut sa = ScrollArea::vertical().id_salt(("channel_page_scroll", cid_key.as_str()));
+        let mut sa = ScrollArea::vertical()
+            .id_salt(("channel_page_scroll", cid_key.as_str()))
+            .auto_shrink([false, false]);
         if let Some(target_y) = sticky.pending_scroll_y.take() {
             sa = sa.vertical_scroll_offset(target_y);
         }
         let scroll_out = sa.show(ui, |ui| {
             let page_clip = ui.clip_rect().intersect(page_rect);
             ui.set_clip_rect(page_clip);
+            ui.set_min_width(ui.available_width());
             let content_top = ui.cursor().top();
             let hdr_resp = ui.vertical(|ui| {
                 if let Some(banner) = &info.banner_url {
@@ -879,13 +897,30 @@ impl YtApp {
                 ui.add_space(12.0);
             }
 
-            grid_action = super::cards::draw_video_grid_body(
-                ui,
-                &heading,
-                &items,
-                loading,
-                cont.is_some(),
-            );
+            if active_is_posts {
+                let posts = self.channel_posts.clone();
+                let load_more_posts = self.draw_channel_posts_feed(
+                    ui,
+                    &posts,
+                    loading,
+                    cont.is_some(),
+                    &mut open_post_video,
+                    &mut vote_poll,
+                    &mut like_post,
+                    &mut toggle_post_comments,
+                );
+                if load_more_posts {
+                    grid_action = Some(super::cards::GridAction::LoadMore);
+                }
+            } else {
+                grid_action = super::cards::draw_video_grid_body(
+                    ui,
+                    &heading,
+                    &items,
+                    loading,
+                    cont.is_some(),
+                );
+            }
         });
 
         let cur_scroll_y = scroll_out.state.clamped_offset().y;
@@ -932,13 +967,13 @@ impl YtApp {
 
         // Sticky tabs + channel search bar: slides up with the header until pinned at page top.
         let tab_top_y = page_rect.top() + (measured_header_h - cur_scroll_y).max(0.0);
-        let tab_content_right = scroll_out.inner_rect.right().min(page_rect.right());
+        let tab_content_right = (scroll_out.inner_rect.right() - 12.0).min(page_rect.right());
         let tab_inner_rect = Rect::from_min_max(
             pos2(page_rect.left(), tab_top_y),
-            pos2(tab_content_right, tab_top_y + sticky.tab_bar_h + 24.0),
+            pos2(tab_content_right.max(page_rect.left() + 200.0), tab_top_y + sticky.tab_bar_h + 24.0),
         );
         let full_left = page_rect.left() - 12.0;
-        let full_right = page_rect.right() + 18.0;
+        let full_right = page_rect.right() + 6.0;
 
         let sticky_bg = if cur_scroll_y <= 0.5 && theme::is_translucent() {
             Color32::TRANSPARENT
@@ -1012,6 +1047,10 @@ impl YtApp {
                                     self.channel_tab_params = tab.params.clone();
                                     self.channel_chips.clear();
                                     self.channel_items.clear();
+                                    self.channel_posts.clear();
+                                    self.expanded_post_id = None;
+                                    self.post_comments.clear();
+                                    self.post_comments_next_token = None;
                                     self.channel_continuation = None;
                                     self.channel_loading = true;
                                     if cur_scroll_y > measured_header_h {
@@ -1077,6 +1116,7 @@ impl YtApp {
             if let Some(cid) = self.channel_id.clone() {
                 self.channel_chips.clear();
                 self.channel_items.clear();
+                self.channel_posts.clear();
                 self.channel_continuation = None;
                 self.channel_loading = true;
                 if cur_scroll_y > measured_header_h {
@@ -1148,6 +1188,57 @@ impl YtApp {
 
         let is_shorts_tab =
             search_active.is_empty() && active_tab_title.eq_ignore_ascii_case("Shorts");
+        if let Some(vid) = open_post_video {
+            self.open_video(vid);
+            return;
+        }
+        if let Some((post_id, choice_idx, action_params)) = vote_poll {
+            if let Some(p) = self.channel_posts.iter_mut().find(|p| p.id == post_id) {
+                for (i, ch) in p.poll_choices.iter_mut().enumerate() {
+                    ch.selected = i == choice_idx;
+                }
+            }
+            let _ = self.backend.tx.send(Request::VoteCommunityPoll {
+                post_id,
+                choice_idx,
+                action_params,
+            });
+        }
+        if let Some((post_id, act, liked)) = like_post {
+            if let Some(p) = self.channel_posts.iter_mut().find(|p| p.id == post_id) {
+                p.is_liked = liked;
+            }
+            let _ = self.backend.tx.send(Request::LikeCommunityPost {
+                post_id,
+                action_params: act,
+                liked,
+            });
+        }
+        if let Some(post) = toggle_post_comments {
+            if self.expanded_post_id.as_deref() == Some(post.id.as_str()) {
+                self.expanded_post_id = None;
+                self.post_comments.clear();
+                self.post_comments_next_token = None;
+                self.post_comments_loading = false;
+                self.post_comment_create_params = None;
+                self.post_reply_target_id = None;
+            } else {
+                self.expanded_post_id = Some(post.id.clone());
+                self.post_comments.clear();
+                self.post_comments_next_token = None;
+                self.post_comments_loading = true;
+                self.post_comment_create_params = None;
+                self.post_comment_draft.clear();
+                self.post_reply_target_id = None;
+                let _ = self.backend.tx.send(Request::LoadPostComments {
+                    post_id: post.id,
+                    browse_id: post.comments_browse_id,
+                    params: post.comments_browse_params,
+                    continuation: post.comments_token,
+                    append: false,
+                });
+            }
+        }
         if let Some(act) = grid_action {
             if is_shorts_tab {
                 if let super::cards::GridAction::Open(ref it) = act {
@@ -2058,11 +2149,13 @@ impl YtApp {
         let show_auth = settings_match(
             words,
             group,
-            "Google account sign in sign out YouTube feed subscriptions",
+            "Google account sign in sign out YouTube feed subscriptions channel",
         );
         let show_sync =
             self.signed_in && settings_match(words, group, "Sync watch history playback progress");
-        if !show_auth && !show_sync {
+        let show_topbar_name = self.signed_in
+            && settings_match(words, group, "Show account name topbar header pill hide");
+        if !show_auth && !show_sync && !show_topbar_name {
             return false;
         }
         settings_group_frame(ui, group, None, |ui| {
@@ -2074,11 +2167,17 @@ impl YtApp {
                         .as_deref()
                         .unwrap_or("Google Account")
                         .to_owned();
+                    let own_cid = self.account_channel_id.clone();
                     settings_row(
                         ui,
                         &name,
                         Some("Signed in with Google. Home feed, subscriptions, playlists and likes come from this account."),
                         |ui| {
+                            if let Some(cid) = own_cid {
+                                if settings_pill_btn(ui, "View channel", Some(icon::USER)).clicked() {
+                                    self.open_channel(cid, name.clone());
+                                }
+                            }
                             if settings_pill_btn(ui, "Sign out", Some(icon::LOG_OUT)).clicked() {
                                 let _ = self.backend.tx.send(Request::SignOut);
                             }
@@ -2096,6 +2195,24 @@ impl YtApp {
                         },
                     );
                 }
+            }
+            if show_topbar_name {
+                if any {
+                    settings_divider(ui);
+                }
+                any = true;
+                settings_row(
+                    ui,
+                    "Show account name in top bar",
+                    Some("Display your profile name next to the avatar pill in the top bar."),
+                    |ui| {
+                        settings_toggle(
+                            ui,
+                            &mut self.show_topbar_account_name,
+                            "show_topbar_account_name",
+                        );
+                    },
+                );
             }
             if show_sync {
                 if any {
@@ -3937,6 +4054,385 @@ pub(super) fn filter_videos_by_query(items: &[VideoItem], query: &str) -> Vec<Vi
         .collect()
 }
 
+impl YtApp {
+    #[allow(clippy::too_many_arguments)]
+    fn draw_channel_posts_feed(
+        &mut self,
+        ui: &mut egui::Ui,
+        posts: &[crate::model::CommunityPost],
+        loading: bool,
+        has_more: bool,
+        open_video: &mut Option<VideoItem>,
+        vote_poll: &mut Option<(String, usize, Option<String>)>,
+        like_post: &mut Option<(String, String, bool)>,
+        toggle_comments: &mut Option<crate::model::CommunityPost>,
+    ) -> bool {
+        let mut load_more = false;
+        if posts.is_empty() && !loading {
+            ui.label(
+                RichText::new("No community posts found on this channel.")
+                    .font(theme::regular(13.5))
+                    .color(theme::TEXT_DIM),
+            );
+            return false;
+        }
+
+        let avail_w = ui.available_width().max(260.0);
+        let col_w = avail_w.min(720.0);
+        let side_pad = ((avail_w - col_w) * 0.5).max(0.0);
+
+        ui.horizontal_top(|ui| {
+            ui.add_space(side_pad);
+            ui.vertical(|ui| {
+                ui.set_width(col_w);
+                for post in posts {
+                    let is_expanded = self.expanded_post_id.as_deref() == Some(post.id.as_str());
+                    Frame::new()
+                        .fill(theme::SURFACE)
+                        .stroke(Stroke::new(1.0, theme::card_stroke()))
+                        .corner_radius(12)
+                        .inner_margin(Margin::same(14))
+                        .show(ui, |ui| {
+                            let inner_w = (col_w - 28.0).max(220.0);
+                            ui.set_width(inner_w);
+                            ui.horizontal(|ui| {
+                                draw_avatar(
+                                    ui,
+                                    post.author_avatar_url.as_deref(),
+                                    &post.author,
+                                    32.0,
+                                );
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new(&post.author)
+                                        .font(theme::semibold(13.5))
+                                        .color(Color32::WHITE),
+                                );
+                                if !post.published_text.is_empty() {
+                                    ui.label(
+                                        RichText::new(&post.published_text)
+                                            .font(theme::regular(12.0))
+                                            .color(theme::TEXT_DIM),
+                                    );
+                                }
+                                if post.is_members_only {
+                                    super::cards::draw_members_badge(ui);
+                                }
+                            });
+
+                            if !post.content.is_empty() {
+                                ui.add_space(8.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&post.content)
+                                            .font(theme::regular(13.5))
+                                            .color(theme::TEXT),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+
+                            if !post.images.is_empty() {
+                                ui.add_space(10.0);
+                                if post.images.len() == 1 {
+                                    let img_w = inner_w.min(560.0);
+                                    let img_h = (img_w * 0.62).clamp(160.0, 340.0);
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        Vec2::new(img_w, img_h),
+                                        Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(rect, 10.0, Color32::BLACK);
+                                    theme::paint_image_cover_rounded(
+                                        ui,
+                                        &post.images[0],
+                                        rect,
+                                        10,
+                                    );
+                                } else {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing = Vec2::splat(8.0);
+                                        for url in post.images.iter().take(4) {
+                                            let (rect, _) = ui.allocate_exact_size(
+                                                Vec2::new(160.0, 160.0),
+                                                Sense::hover(),
+                                            );
+                                            ui.painter().rect_filled(rect, 10.0, Color32::BLACK);
+                                            theme::paint_image_cover_rounded(ui, url, rect, 10);
+                                        }
+                                    });
+                                }
+                            }
+
+                            if let Some(vid) = &post.attached_video {
+                                ui.add_space(10.0);
+                                let (vrect, vresp) = ui.allocate_exact_size(
+                                    Vec2::new(inner_w, 100.0),
+                                    Sense::click(),
+                                );
+                                if vresp.hovered() {
+                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                }
+                                ui.painter().rect_filled(
+                                    vrect,
+                                    10.0,
+                                    if vresp.hovered() {
+                                        theme::CHIP_HOVER
+                                    } else {
+                                        theme::CHIP
+                                    },
+                                );
+                                let mut vchild = ui.new_child(
+                                    egui::UiBuilder::new().max_rect(vrect.shrink(6.0)),
+                                );
+                                vchild.horizontal(|ui| {
+                                    draw_thumbnail(
+                                        ui,
+                                        &vid.thumbnail_url,
+                                        &vid.duration_text,
+                                        Vec2::new(156.0, 88.0),
+                                        8.0,
+                                        vid.watched_percent,
+                                    );
+                                    ui.add_space(10.0);
+                                    ui.vertical(|ui| {
+                                        ui.set_max_width((inner_w - 190.0).max(120.0));
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&vid.title)
+                                                    .font(theme::semibold(13.0))
+                                                    .color(Color32::WHITE),
+                                            )
+                                            .wrap(),
+                                        );
+                                        if !vid.channel.is_empty() {
+                                            ui.label(
+                                                RichText::new(&vid.channel)
+                                                    .font(theme::regular(12.0))
+                                                    .color(theme::TEXT_DIM),
+                                            );
+                                        }
+                                        let meta =
+                                            [vid.views_text.as_str(), vid.published_text.as_str()]
+                                                .into_iter()
+                                                .filter(|s| !s.is_empty())
+                                                .collect::<Vec<_>>()
+                                                .join(" · ");
+                                        if !meta.is_empty() {
+                                            ui.label(
+                                                RichText::new(meta)
+                                                    .font(theme::regular(11.5))
+                                                    .color(theme::TEXT_DIM),
+                                            );
+                                        }
+                                    });
+                                });
+                                if vresp.clicked() {
+                                    *open_video = Some(vid.clone());
+                                }
+                            }
+
+                            if !post.poll_choices.is_empty() {
+                                ui.add_space(10.0);
+                                let any_selected = post.poll_choices.iter().any(|c| c.selected);
+                                let poll_w = inner_w.min(540.0);
+                                for (ci, ch) in post.poll_choices.iter().enumerate() {
+                                    let (prect, presp) = ui.allocate_exact_size(
+                                        Vec2::new(poll_w, 34.0),
+                                        Sense::click(),
+                                    );
+                                    if presp.hovered() {
+                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                    }
+                                    let bg = if ch.selected {
+                                        theme::YT_BLUE.gamma_multiply(0.18)
+                                    } else if presp.hovered() {
+                                        theme::CHIP_HOVER
+                                    } else {
+                                        theme::CHIP
+                                    };
+                                    let border = if ch.selected {
+                                        theme::YT_BLUE
+                                    } else {
+                                        theme::BORDER
+                                    };
+                                    ui.painter().rect(
+                                        prect,
+                                        8.0,
+                                        bg,
+                                        Stroke::new(1.0, border),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    if any_selected || ch.vote_ratio.is_some() {
+                                        if let Some(ratio) = ch.vote_ratio {
+                                            let fill_w = (prect.width() * ratio).max(0.0);
+                                            let fill_rect = Rect::from_min_size(
+                                                prect.min,
+                                                Vec2::new(fill_w, prect.height()),
+                                            );
+                                            ui.painter().rect_filled(
+                                                fill_rect,
+                                                8.0,
+                                                theme::YT_BLUE.gamma_multiply(if ch.selected {
+                                                    0.34
+                                                } else {
+                                                    0.16
+                                                }),
+                                            );
+                                        }
+                                    }
+                                    let label = if ch.selected {
+                                        format!("{}  {}", icon::CHECK, ch.text)
+                                    } else {
+                                        ch.text.clone()
+                                    };
+                                    ui.painter().text(
+                                        pos2(prect.left() + 12.0, prect.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        label,
+                                        theme::medium(12.5),
+                                        Color32::WHITE,
+                                    );
+                                    if !ch.num_votes_text.is_empty() {
+                                        ui.painter().text(
+                                            pos2(prect.right() - 12.0, prect.center().y),
+                                            egui::Align2::RIGHT_CENTER,
+                                            &ch.num_votes_text,
+                                            theme::semibold(12.0),
+                                            if ch.selected {
+                                                theme::YT_BLUE
+                                            } else {
+                                                theme::TEXT_DIM
+                                            },
+                                        );
+                                    }
+                                    if presp.clicked() {
+                                        *vote_poll =
+                                            Some((post.id.clone(), ci, ch.vote_params.clone()));
+                                    }
+                                    ui.add_space(4.0);
+                                }
+                                if !post.poll_total_votes.is_empty() {
+                                    ui.label(
+                                        RichText::new(&post.poll_total_votes)
+                                            .font(theme::regular(11.5))
+                                            .color(theme::TEXT_DIM),
+                                    );
+                                }
+                            }
+
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 10.0;
+                                let can_like = self.signed_in
+                                    && if post.is_liked {
+                                        post.unlike_params.is_some()
+                                    } else {
+                                        post.like_params.is_some()
+                                    };
+                                let like_col = if post.is_liked {
+                                    theme::YT_BLUE
+                                } else {
+                                    theme::TEXT_DIM
+                                };
+                                let (lrect, lresp) = ui.allocate_exact_size(
+                                    Vec2::new(26.0, 26.0),
+                                    if can_like {
+                                        Sense::click()
+                                    } else {
+                                        Sense::hover()
+                                    },
+                                );
+                                if can_like && lresp.hovered() {
+                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                }
+                                theme::draw_thumbs_up(
+                                    ui.painter(),
+                                    lrect.center(),
+                                    14.0,
+                                    like_col,
+                                    post.is_liked,
+                                );
+                                if can_like && lresp.on_hover_text("Like post").clicked() {
+                                    if let Some(act) = if post.is_liked {
+                                        post.unlike_params.clone()
+                                    } else {
+                                        post.like_params.clone()
+                                    } {
+                                        *like_post = Some((post.id.clone(), act, !post.is_liked));
+                                    }
+                                }
+                                if !post.likes_text.is_empty() {
+                                    ui.label(
+                                        RichText::new(&post.likes_text)
+                                            .font(theme::regular(12.5))
+                                            .color(like_col),
+                                    );
+                                }
+
+                                let c_lbl = if post.comments_text.is_empty() {
+                                    if is_expanded {
+                                        "Hide comments".to_owned()
+                                    } else {
+                                        "Comments".to_owned()
+                                    }
+                                } else {
+                                    format!("Comments ({})", post.comments_text)
+                                };
+                                let fill = if is_expanded {
+                                    theme::YT_BLUE.gamma_multiply(0.22)
+                                } else {
+                                    theme::CHIP
+                                };
+                                let text_col = if is_expanded {
+                                    theme::YT_BLUE
+                                } else {
+                                    theme::TEXT
+                                };
+                                let (crect, cresp) =
+                                    ui.allocate_exact_size(Vec2::new(136.0, 28.0), Sense::click());
+                                if cresp.hovered() {
+                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                }
+                                ui.painter().rect_filled(crect, 14.0, fill);
+                                theme::draw_comment_icon(
+                                    ui.painter(),
+                                    pos2(crect.left() + 18.0, crect.center().y),
+                                    13.5,
+                                    text_col,
+                                );
+                                ui.painter().text(
+                                    pos2(crect.left() + 34.0, crect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    &c_lbl,
+                                    theme::medium(12.0),
+                                    text_col,
+                                );
+                                if cresp.clicked() {
+                                    *toggle_comments = Some(post.clone());
+                                }
+                            });
+
+                            if is_expanded {
+                                ui.add_space(10.0);
+                                ui.separator();
+                                ui.add_space(8.0);
+                                self.draw_post_comments_section(ui, &post.id);
+                            }
+                        });
+                    ui.add_space(12.0);
+                }
+
+                if loading {
+                    ui.spinner();
+                } else if has_more && settings_pill_btn(ui, "Load more posts", None).clicked() {
+                    load_more = true;
+                }
+            });
+        });
+        load_more
+    }
+}
+
 fn settings_match(words: &[String], group: &str, text: &str) -> bool {
     if words.is_empty() {
         return true;
@@ -4104,6 +4600,7 @@ mod settings_tests {
             watched_percent: None,
             resume_secs: None,
             playlist_browse_id: None,
+            mix_playlist_id: None,
             playlist_set_video_id: None,
             is_new: false,
             is_members_only: false,

@@ -433,28 +433,73 @@ impl YtApp {
                                 .unwrap_or("Account")
                                 .to_owned();
                             let avatar = self.account_avatar.clone();
-                            ui.horizontal(|ui| {
-                                draw_avatar(ui, avatar.as_deref(), &label, 26.0);
-                                ui.menu_button(
-                                    RichText::new(&label).font(theme::medium(13.0)),
-                                    |ui| {
+                            let own_cid = self.account_channel_id.clone();
+                            let draw_account_menu =
+                                |ui: &mut egui::Ui, app: &mut YtApp| {
+                                    ui.label(
+                                        RichText::new(&label)
+                                            .font(theme::semibold(13.0))
+                                            .color(Color32::WHITE),
+                                    );
+                                    ui.separator();
+                                    if let Some(cid) = own_cid.clone() {
                                         if ui
-                                            .button(format!("{}  Settings", icon::SETTINGS))
+                                            .button(format!("{}  View your channel", icon::USER))
                                             .clicked()
                                         {
                                             ui.close();
-                                            self.page = Page::Settings;
+                                            app.open_channel(cid, label.clone());
                                         }
-                                        if ui
-                                            .button(format!("{}  Sign out", icon::LOG_OUT))
-                                            .clicked()
-                                        {
-                                            ui.close();
-                                            let _ = self.backend.tx.send(Request::SignOut);
-                                        }
-                                    },
-                                );
-                            });
+                                    }
+                                    let name_toggle = if app.show_topbar_account_name {
+                                        "Hide name in top bar"
+                                    } else {
+                                        "Show name in top bar"
+                                    };
+                                    if ui
+                                        .button(format!("{}  {name_toggle}", icon::CIRCLE_USER))
+                                        .clicked()
+                                    {
+                                        app.show_topbar_account_name =
+                                            !app.show_topbar_account_name;
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .button(format!("{}  Settings", icon::SETTINGS))
+                                        .clicked()
+                                    {
+                                        ui.close();
+                                        app.page = Page::Settings;
+                                    }
+                                    if ui
+                                        .button(format!("{}  Sign out", icon::LOG_OUT))
+                                        .clicked()
+                                    {
+                                        ui.close();
+                                        let _ = app.backend.tx.send(Request::SignOut);
+                                    }
+                                };
+                            if self.show_topbar_account_name {
+                                ui.horizontal(|ui| {
+                                    draw_avatar(ui, avatar.as_deref(), &label, 26.0);
+                                    ui.menu_button(
+                                        RichText::new(&label).font(theme::medium(13.0)),
+                                        |ui| draw_account_menu(ui, self),
+                                    );
+                                });
+                            } else {
+                                let av_resp = ui
+                                    .horizontal(|ui| {
+                                        draw_avatar(ui, avatar.as_deref(), &label, 28.0);
+                                    })
+                                    .response
+                                    .interact(Sense::click())
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .on_hover_text(format!("{label} — Account menu"));
+                                egui::Popup::menu(&av_resp).show(|ui| {
+                                    draw_account_menu(ui, self);
+                                });
+                            }
 
                             ui.add_space(4.0);
                             let (brect, bresp) =
