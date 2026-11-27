@@ -403,6 +403,98 @@ pub struct CaptionTrack {
     pub is_auto: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct TranscriptCue {
+    pub start_secs: f64,
+    pub end_secs: f64,
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum EqPreset {
+    #[default]
+    Flat,
+    VoiceClarity,
+    BassBoost,
+    Music,
+}
+
+impl EqPreset {
+    pub const ALL: [Self; 4] = [Self::Flat, Self::VoiceClarity, Self::BassBoost, Self::Music];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Flat => "Flat",
+            Self::VoiceClarity => "Voice Clarity",
+            Self::BassBoost => "Bass Boost",
+            Self::Music => "Music",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::VoiceClarity => "voice",
+            Self::BassBoost => "bass",
+            Self::Music => "music",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|p| p.key() == s.trim())
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SubtitleColorPreset {
+    #[default]
+    White,
+    Yellow,
+    Cyan,
+    Green,
+}
+
+impl SubtitleColorPreset {
+    pub const ALL: [Self; 4] = [Self::White, Self::Yellow, Self::Cyan, Self::Green];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::White => "White",
+            Self::Yellow => "Yellow",
+            Self::Cyan => "Cyan",
+            Self::Green => "Mint Green",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::White => "white",
+            Self::Yellow => "yellow",
+            Self::Cyan => "cyan",
+            Self::Green => "green",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|c| c.key() == s.trim())
+            .unwrap_or_default()
+    }
+
+    pub fn mpv_hex(self) -> &'static str {
+        match self {
+            Self::White => "#FFFFFFFF",
+            Self::Yellow => "#FFFFE14D",
+            Self::Cyan => "#FF78E6FF",
+            Self::Green => "#FF86F0A8",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Chapter {
     pub start_secs: f64,
@@ -546,6 +638,8 @@ pub struct WatchData {
     pub audio_tracks: Vec<AudioTrack>,
     pub hls_url: Option<String>,
     pub captions: Vec<CaptionTrack>,
+    pub translation_languages: Vec<(String, String)>,
+    pub transcript_params: Option<String>,
     pub chapters: Vec<Chapter>,
     pub storyboard: Option<StoryboardSpec>,
     pub comments_token: Option<String>,
@@ -795,17 +889,24 @@ pub enum AmbientMode {
     #[default]
     SoftBlur,
     TiledBlur,
+    VideoAmbilight,
     Off,
 }
 
 impl AmbientMode {
-    pub const ALL: [Self; 3] = [Self::SoftBlur, Self::TiledBlur, Self::Off];
+    pub const ALL: [Self; 4] = [
+        Self::SoftBlur,
+        Self::TiledBlur,
+        Self::VideoAmbilight,
+        Self::Off,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Off => "Off",
             Self::SoftBlur => "Soft Blur",
             Self::TiledBlur => "Tiled Repeat",
+            Self::VideoAmbilight => "Video Ambilight (Live)",
         }
     }
 
@@ -814,6 +915,7 @@ impl AmbientMode {
             Self::Off => "off",
             Self::SoftBlur => "soft",
             Self::TiledBlur => "tiled",
+            Self::VideoAmbilight => "video_ambilight",
         }
     }
 
@@ -822,6 +924,62 @@ impl AmbientMode {
             .into_iter()
             .find(|m| m.key() == s.trim())
             .unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SpectrumTheme {
+    #[default]
+    WaveBars,
+    SynthHorizon,
+    AuroraRibbon,
+    NeonBars,
+    RadialHalo,
+    DotMatrix,
+}
+
+impl SpectrumTheme {
+    pub const ALL: [Self; 6] = [
+        Self::WaveBars,
+        Self::SynthHorizon,
+        Self::AuroraRibbon,
+        Self::NeonBars,
+        Self::RadialHalo,
+        Self::DotMatrix,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WaveBars => "Wave Bars",
+            Self::SynthHorizon => "Horizon Wave",
+            Self::AuroraRibbon => "Aurora Wave",
+            Self::NeonBars => "Neon Bars",
+            Self::RadialHalo => "Radial Ring",
+            Self::DotMatrix => "Retro LED",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::WaveBars => "wave_bars",
+            Self::SynthHorizon => "synth_horizon",
+            Self::AuroraRibbon => "aurora_ribbon",
+            Self::NeonBars => "neon_bars",
+            Self::RadialHalo => "radial_halo",
+            Self::DotMatrix => "dot_matrix",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|t| t.key() == s.trim())
+            .unwrap_or_default()
+    }
+
+    pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|&t| t == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
     }
 }
 
@@ -932,6 +1090,8 @@ impl KeyBinding {
             "up" | "arrowup" => "Up".to_owned(),
             "down" | "arrowdown" => "Down".to_owned(),
             "enter" | "return" => "Enter".to_owned(),
+            "," | "comma" => ",".to_owned(),
+            "." | "period" => ".".to_owned(),
             other if other.len() == 1 => other.to_ascii_uppercase(),
             other => {
                 let mut ch = other.chars();
@@ -955,6 +1115,8 @@ impl KeyBinding {
             "Up" => Some(egui::Key::ArrowUp),
             "Down" => Some(egui::Key::ArrowDown),
             "Enter" => Some(egui::Key::Enter),
+            "," | "Comma" => Some(egui::Key::Comma),
+            "." | "Period" => Some(egui::Key::Period),
             s => egui::Key::from_name(s),
         }
     }
@@ -966,6 +1128,8 @@ impl KeyBinding {
             egui::Key::ArrowRight => "Right",
             egui::Key::ArrowUp => "Up",
             egui::Key::ArrowDown => "Down",
+            egui::Key::Comma => ",",
+            egui::Key::Period => ".",
             _ => key.name(),
         }
     }
@@ -998,6 +1162,9 @@ pub struct ShortcutConfig {
     pub stats_for_nerds: KeyBinding,
     pub toggle_captions: KeyBinding,
     pub screenshot: KeyBinding,
+    pub frame_back: KeyBinding,
+    pub frame_forward: KeyBinding,
+    pub ab_loop: KeyBinding,
 }
 
 impl Default for ShortcutConfig {
@@ -1017,6 +1184,9 @@ impl Default for ShortcutConfig {
             stats_for_nerds: KeyBinding::ctrl("I"),
             toggle_captions: KeyBinding::simple("C"),
             screenshot: KeyBinding::simple("S"),
+            frame_back: KeyBinding::simple(","),
+            frame_forward: KeyBinding::simple("."),
+            ab_loop: KeyBinding::simple("B"),
         }
     }
 }
@@ -1037,6 +1207,9 @@ pub enum ShortcutSlot {
     StatsForNerds,
     ToggleCaptions,
     Screenshot,
+    FrameBack,
+    FrameForward,
+    AbLoop,
 }
 
 impl ShortcutSlot {
@@ -1055,6 +1228,9 @@ impl ShortcutSlot {
         Self::StatsForNerds,
         Self::ToggleCaptions,
         Self::Screenshot,
+        Self::FrameBack,
+        Self::FrameForward,
+        Self::AbLoop,
     ];
 
     pub fn label(self) -> &'static str {
@@ -1073,6 +1249,9 @@ impl ShortcutSlot {
             Self::StatsForNerds => "Stats for Nerds",
             Self::ToggleCaptions => "Subtitles / Captions",
             Self::Screenshot => "Screenshot (DropBoard / Clipboard)",
+            Self::FrameBack => "Previous Frame (paused)",
+            Self::FrameForward => "Next Frame (paused)",
+            Self::AbLoop => "A-B Loop (Set A -> Set B -> Clear)",
         }
     }
 }
@@ -1094,6 +1273,9 @@ impl ShortcutConfig {
             ShortcutSlot::StatsForNerds => &self.stats_for_nerds,
             ShortcutSlot::ToggleCaptions => &self.toggle_captions,
             ShortcutSlot::Screenshot => &self.screenshot,
+            ShortcutSlot::FrameBack => &self.frame_back,
+            ShortcutSlot::FrameForward => &self.frame_forward,
+            ShortcutSlot::AbLoop => &self.ab_loop,
         }
     }
 
@@ -1113,6 +1295,9 @@ impl ShortcutConfig {
             ShortcutSlot::StatsForNerds => self.stats_for_nerds = binding,
             ShortcutSlot::ToggleCaptions => self.toggle_captions = binding,
             ShortcutSlot::Screenshot => self.screenshot = binding,
+            ShortcutSlot::FrameBack => self.frame_back = binding,
+            ShortcutSlot::FrameForward => self.frame_forward = binding,
+            ShortcutSlot::AbLoop => self.ab_loop = binding,
         }
     }
 }
@@ -1187,9 +1372,35 @@ mod tests {
 
         let mut cfg = ShortcutConfig::default();
         assert_eq!(cfg.get(ShortcutSlot::StatsForNerds).display(), "Ctrl+I");
+        assert_eq!(cfg.get(ShortcutSlot::FrameBack).display(), ",");
+        assert_eq!(cfg.get(ShortcutSlot::FrameForward).display(), ".");
+        assert_eq!(cfg.get(ShortcutSlot::AbLoop).display(), "B");
         cfg.set(ShortcutSlot::Mute, KeyBinding::simple("N"));
         let raw = serde_json::to_string(&cfg).unwrap();
         let back: ShortcutConfig = serde_json::from_str(&raw).unwrap();
         assert_eq!(back, cfg);
+
+        let fb = KeyBinding::parse("comma").unwrap();
+        assert_eq!(fb.egui_key(), Some(egui::Key::Comma));
+        let ff = KeyBinding::parse(".").unwrap();
+        assert_eq!(ff.egui_key(), Some(egui::Key::Period));
+    }
+
+    #[test]
+    fn roundtrips_eq_and_subtitle_color_presets() {
+        use super::{AmbientMode, EqPreset, SpectrumTheme, SubtitleColorPreset};
+        for p in EqPreset::ALL {
+            assert_eq!(EqPreset::from_key(p.key()), p);
+        }
+        for c in SubtitleColorPreset::ALL {
+            assert_eq!(SubtitleColorPreset::from_key(c.key()), c);
+            assert!(c.mpv_hex().starts_with('#'));
+        }
+        for a in AmbientMode::ALL {
+            assert_eq!(AmbientMode::from_key(a.key()), a);
+        }
+        for s in SpectrumTheme::ALL {
+            assert_eq!(SpectrumTheme::from_key(s.key()), s);
+        }
     }
 }

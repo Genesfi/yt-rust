@@ -12,17 +12,18 @@ use std::time::{Duration, Instant};
 use eframe::glow;
 use egui::{Align, Color32, Frame, Key, Layout, Margin, ViewportCommand};
 
+use crate::audio_viz::AudioSpectrumHandle;
 use crate::backend::{Backend, Request, Response};
 use crate::innertube;
 use crate::model::{
-    AmbientMode, ChannelInfo, ChannelNotificationParams, CommentItem, CommunityPost, FeedChip,
-    HoverPreviewQuality, HwdecMode, KeyBinding, LastWatched, LiveChatEmote, LiveChatMessage,
-    NotificationMenuItem, PlaylistOption, PlaylistPrivacy, PlaylistSummary, PoTokenMode,
-    PreferredQuality, SearchChannelResult, SearchFilter, ShortcutConfig, ShortcutSlot,
-    SidebarChannel, SponsorCategory, SponsorSegment, UpNextFilterMode, VideoItem, WatchData,
-    WindowMaterial,
+    AmbientMode, ChannelInfo, ChannelNotificationParams, CommentItem, CommunityPost, EqPreset,
+    FeedChip, HoverPreviewQuality, HwdecMode, KeyBinding, LastWatched, LiveChatEmote,
+    LiveChatMessage, NotificationMenuItem, PlaylistOption, PlaylistPrivacy, PlaylistSummary,
+    PoTokenMode, PreferredQuality, SearchChannelResult, SearchFilter, ShortcutConfig, ShortcutSlot,
+    SidebarChannel, SpectrumTheme, SponsorCategory, SponsorSegment, SubtitleColorPreset,
+    TranscriptCue, UpNextFilterMode, VideoItem, WatchData, WindowMaterial,
 };
-use crate::mpv::{GlProcAddrFn, MpvPlayer, PlaybackState};
+use crate::mpv::{AMB_GRID_H, AMB_GRID_W, GlProcAddrFn, MpvPlayer, PlaybackState};
 use crate::os_media::OsMedia;
 use crate::theme;
 use crate::win_shell::{ShellEvent, WinShell};
@@ -52,6 +53,7 @@ pub(super) enum RightTab {
     UpNext,
     Queue,
     LiveChat,
+    Transcript,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -197,6 +199,19 @@ pub(super) struct PlayerSlot {
     pub selected_format_idx: Option<usize>,
     pub selected_audio_idx: usize,
     pub selected_caption_idx: Option<usize>,
+    pub selected_caption_tlang: Option<String>,
+    pub secondary_caption_idx: Option<usize>,
+    pub secondary_caption_tlang: Option<String>,
+    pub audio_only_mode: bool,
+    pub ab_loop_a: Option<f64>,
+    pub ab_loop_b: Option<f64>,
+    pub transcript: Vec<TranscriptCue>,
+    pub transcript_loading: bool,
+    pub transcript_error: Option<String>,
+    pub transcript_query: String,
+    pub transcript_auto_scroll: bool,
+    pub transcript_last_active_idx: Option<usize>,
+    pub transcript_caption_idx: usize,
     pub used_ytdlp: bool,
     pub sponsor_segments: Vec<SponsorSegment>,
     pub last_skipped_end: f64,
@@ -262,6 +277,19 @@ impl PlayerSlot {
             selected_format_idx: None,
             selected_audio_idx: 0,
             selected_caption_idx: None,
+            selected_caption_tlang: None,
+            secondary_caption_idx: None,
+            secondary_caption_tlang: None,
+            audio_only_mode: false,
+            ab_loop_a: None,
+            ab_loop_b: None,
+            transcript: Vec::new(),
+            transcript_loading: false,
+            transcript_error: None,
+            transcript_query: String::new(),
+            transcript_auto_scroll: true,
+            transcript_last_active_idx: None,
+            transcript_caption_idx: 0,
             used_ytdlp: false,
             sponsor_segments: Vec::new(),
             last_skipped_end: -1.0,
@@ -330,6 +358,18 @@ impl PlayerSlot {
         self.seeking_pos = None;
         self.selected_audio_idx = 0;
         self.selected_caption_idx = None;
+        self.selected_caption_tlang = None;
+        self.secondary_caption_idx = None;
+        self.secondary_caption_tlang = None;
+        self.ab_loop_a = None;
+        self.ab_loop_b = None;
+        self.transcript.clear();
+        self.transcript_loading = false;
+        self.transcript_error = None;
+        self.transcript_query.clear();
+        self.transcript_auto_scroll = true;
+        self.transcript_last_active_idx = None;
+        self.transcript_caption_idx = 0;
         self.player_menu = PlayerMenu::None;
         self.comments.clear();
         self.comments_next_token = None;
@@ -529,6 +569,19 @@ pub struct YtApp {
     pub(super) selected_format_idx: Option<usize>,
     pub(super) selected_audio_idx: usize,
     pub(super) selected_caption_idx: Option<usize>,
+    pub(super) selected_caption_tlang: Option<String>,
+    pub(super) secondary_caption_idx: Option<usize>,
+    pub(super) secondary_caption_tlang: Option<String>,
+    pub(super) audio_only_mode: bool,
+    pub(super) ab_loop_a: Option<f64>,
+    pub(super) ab_loop_b: Option<f64>,
+    pub(super) transcript: Vec<TranscriptCue>,
+    pub(super) transcript_loading: bool,
+    pub(super) transcript_error: Option<String>,
+    pub(super) transcript_query: String,
+    pub(super) transcript_auto_scroll: bool,
+    pub(super) transcript_last_active_idx: Option<usize>,
+    pub(super) transcript_caption_idx: usize,
     pub(super) used_ytdlp: bool,
     pub(super) sponsor_segments: Vec<SponsorSegment>,
     pub(super) last_skipped_end: f64,
@@ -617,6 +670,7 @@ pub struct YtApp {
     pub(super) ryd_enabled: bool,
     pub(super) sync_history: bool,
     pub(super) autoplay_next: bool,
+    pub(super) default_audio_only: bool,
     pub(super) auto_resume_on_start: bool,
     pub(super) theater_mode: bool,
     pub(super) fullscreen: bool,
@@ -627,7 +681,13 @@ pub struct YtApp {
     pub(super) win_pip_saved_page: Page,
     pub(super) always_on_top: bool,
     pub(super) sleep_timer: SleepTimer,
-    pub(super) sleep_timer_input: String,
+    pub(super) sleep_fade_enabled: bool,
+    pub(super) sleep_fade_active: bool,
+    pub(super) sleep_pick_h: u32,
+    pub(super) sleep_pick_m: u32,
+    pub(super) sleep_pick_s: u32,
+    pub(super) sleep_editing_seg: Option<u8>,
+    pub(super) sleep_seg_buf: String,
     pub(super) start_paused: bool,
     pub(super) close_to_tray: bool,
     pub(super) minimize_to_tray: bool,
@@ -635,6 +695,9 @@ pub struct YtApp {
     pub(super) was_minimized: bool,
     pub(super) quitting_from_tray: bool,
     pub(super) ambient_glow: bool,
+    pub(super) audio_spectrum_enabled: bool,
+    pub(super) audio_spectrum_theme: SpectrumTheme,
+    pub(super) audio_spectrum: AudioSpectrumHandle,
     pub(super) po_token_mode: PoTokenMode,
     pub(super) window_material: WindowMaterial,
     pub(super) ambient_mode: AmbientMode,
@@ -643,6 +706,9 @@ pub struct YtApp {
     pub(super) ambient_tex_soft: Option<(String, egui::TextureHandle)>,
     pub(super) ambient_tex_tiled: Option<(String, egui::TextureHandle)>,
     pub(super) ambient_prev_soft: Option<egui::TextureHandle>,
+    pub(super) live_amb_tex: Option<egui::TextureHandle>,
+    pub(super) ambient_palette: [[u8; 3]; 4],
+    pub(super) ambient_prev_palette: [[u8; 3]; 4],
     pub(super) ambient_changed_at: Option<Instant>,
     pub(super) settings_tab: SettingsTab,
     pub(super) settings_query: String,
@@ -651,6 +717,14 @@ pub struct YtApp {
     pub(super) history_filter: HistoryFilter,
     pub(super) sub_font_size: u32,
     pub(super) sub_bg_opacity: f32,
+    pub(super) sub_color: SubtitleColorPreset,
+    pub(super) sec_sub_font_size: u32,
+    pub(super) sec_sub_bg_opacity: f32,
+    pub(super) sec_sub_color: SubtitleColorPreset,
+    pub(super) audio_device: String,
+    pub(super) audio_reload_pending_at: Option<Instant>,
+    pub(super) loudnorm_enabled: bool,
+    pub(super) eq_preset: EqPreset,
     pub(super) shortcuts: ShortcutConfig,
     pub(super) rebinding_shortcut: Option<ShortcutSlot>,
     pub(super) watch_scrolled_into_pip: bool,
@@ -726,6 +800,7 @@ impl YtApp {
         let mut ryd_enabled = false;
         let mut sync_history = true;
         let mut autoplay_next = true;
+        let mut default_audio_only = false;
         let mut auto_resume_on_start = false;
         let mut theater_mode = false;
         let mut up_next_mode = UpNextFilterMode::All;
@@ -733,18 +808,28 @@ impl YtApp {
         let mut close_to_tray = false;
         let mut minimize_to_tray = false;
         let mut ambient_glow = true;
+        let mut audio_spectrum_enabled = true;
+        let mut audio_spectrum_theme = SpectrumTheme::NeonBars;
         let mut po_token_mode = PoTokenMode::Auto;
         let mut window_material = WindowMaterial::None;
         let mut ambient_mode = AmbientMode::SoftBlur;
         let mut ambient_opacity = 0.28f32;
         let mut sub_font_size = 46u32;
         let mut sub_bg_opacity = 0.70f32;
+        let mut sub_color = SubtitleColorPreset::White;
+        let mut sec_sub_font_size = 38u32;
+        let mut sec_sub_bg_opacity = 0.70f32;
+        let mut sec_sub_color = SubtitleColorPreset::Yellow;
+        let mut audio_device = String::from("auto");
+        let mut loudnorm_enabled = false;
+        let mut eq_preset = EqPreset::Flat;
         let mut shortcuts = ShortcutConfig::default();
         let mut preferred_quality = PreferredQuality::P1080;
         let mut hover_preview_quality = HoverPreviewQuality::P480;
         let mut hover_preview_muted = true;
         let mut show_topbar_account_name = false;
         let mut sleep_timer = SleepTimer::Off;
+        let mut sleep_fade_enabled = true;
         let mut hwdec_mode = HwdecMode::AutoCopy;
         let mut download_dir = String::new();
         let mut sidebar_expanded = true;
@@ -778,6 +863,9 @@ impl YtApp {
             }
             if let Some(ap) = storage.get_string("autoplay") {
                 autoplay_next = ap != "0";
+            }
+            if let Some(dao) = storage.get_string("default_audio_only") {
+                default_audio_only = dao == "1";
             }
             if let Some(ar) = storage.get_string("auto_resume_on_start") {
                 auto_resume_on_start = ar == "1";
@@ -815,6 +903,9 @@ impl YtApp {
                     Instant::now(),
                 );
             }
+            if let Some(sf) = storage.get_string("sleep_fade_enabled") {
+                sleep_fade_enabled = sf != "0";
+            }
             if let Some(pt) = storage.get_string("po_token_mode") {
                 po_token_mode = match pt.as_str() {
                     "on" => PoTokenMode::On,
@@ -836,6 +927,41 @@ impl YtApp {
             }
             if let Some(sb) = storage.get_string("sub_bg_opacity").and_then(|s| s.parse().ok()) {
                 sub_bg_opacity = sb;
+            }
+            if let Some(sc) = storage.get_string("sub_color") {
+                sub_color = SubtitleColorPreset::from_key(&sc);
+            }
+            if let Some(sf) = storage
+                .get_string("sec_sub_font_size")
+                .and_then(|s| s.parse().ok())
+            {
+                sec_sub_font_size = sf;
+            }
+            if let Some(sb) = storage
+                .get_string("sec_sub_bg_opacity")
+                .and_then(|s| s.parse().ok())
+            {
+                sec_sub_bg_opacity = sb;
+            }
+            if let Some(sc) = storage.get_string("sec_sub_color") {
+                sec_sub_color = SubtitleColorPreset::from_key(&sc);
+            }
+            if let Some(ad) = storage.get_string("audio_device") {
+                if !ad.trim().is_empty() {
+                    audio_device = ad;
+                }
+            }
+            if let Some(ln) = storage.get_string("loudnorm_enabled") {
+                loudnorm_enabled = ln == "1";
+            }
+            if let Some(eq) = storage.get_string("eq_preset") {
+                eq_preset = EqPreset::from_key(&eq);
+            }
+            if let Some(se) = storage.get_string("audio_spectrum_enabled") {
+                audio_spectrum_enabled = se != "0";
+            }
+            if let Some(st) = storage.get_string("audio_spectrum_theme") {
+                audio_spectrum_theme = SpectrumTheme::from_key(&st);
             }
             if let Some(sc) = storage.get_string("shortcuts") {
                 if let Ok(parsed) = serde_json::from_str::<ShortcutConfig>(&sc) {
@@ -1056,6 +1182,19 @@ impl YtApp {
             selected_format_idx: None,
             selected_audio_idx: 0,
             selected_caption_idx: None,
+            selected_caption_tlang: None,
+            secondary_caption_idx: None,
+            secondary_caption_tlang: None,
+            audio_only_mode: default_audio_only,
+            ab_loop_a: None,
+            ab_loop_b: None,
+            transcript: Vec::new(),
+            transcript_loading: false,
+            transcript_error: None,
+            transcript_query: String::new(),
+            transcript_auto_scroll: true,
+            transcript_last_active_idx: None,
+            transcript_caption_idx: 0,
             used_ytdlp: false,
             sponsor_segments: Vec::new(),
             last_skipped_end: -1.0,
@@ -1143,6 +1282,7 @@ impl YtApp {
             ryd_enabled,
             sync_history,
             autoplay_next,
+            default_audio_only,
             auto_resume_on_start,
             theater_mode,
             fullscreen: false,
@@ -1153,7 +1293,13 @@ impl YtApp {
             win_pip_saved_page: Page::Home,
             always_on_top,
             sleep_timer,
-            sleep_timer_input: String::new(),
+            sleep_fade_enabled,
+            sleep_fade_active: false,
+            sleep_pick_h: 0,
+            sleep_pick_m: 30,
+            sleep_pick_s: 0,
+            sleep_editing_seg: None,
+            sleep_seg_buf: String::new(),
             start_paused: false,
             close_to_tray,
             minimize_to_tray,
@@ -1161,6 +1307,9 @@ impl YtApp {
             was_minimized: false,
             quitting_from_tray: false,
             ambient_glow,
+            audio_spectrum_enabled,
+            audio_spectrum_theme,
+            audio_spectrum: AudioSpectrumHandle::start(),
             po_token_mode,
             window_material,
             ambient_mode,
@@ -1169,6 +1318,9 @@ impl YtApp {
             ambient_tex_soft: None,
             ambient_tex_tiled: None,
             ambient_prev_soft: None,
+            live_amb_tex: None,
+            ambient_palette: [[96, 128, 210], [180, 92, 130], [72, 118, 178], [148, 86, 148]],
+            ambient_prev_palette: [[96, 128, 210], [180, 92, 130], [72, 118, 178], [148, 86, 148]],
             ambient_changed_at: None,
             settings_tab: SettingsTab::Account,
             settings_query: String::new(),
@@ -1177,6 +1329,14 @@ impl YtApp {
             history_filter: HistoryFilter::All,
             sub_font_size,
             sub_bg_opacity,
+            sub_color,
+            sec_sub_font_size,
+            sec_sub_bg_opacity,
+            sec_sub_color,
+            audio_device,
+            audio_reload_pending_at: None,
+            loudnorm_enabled,
+            eq_preset,
             shortcuts,
             rebinding_shortcut: None,
             watch_scrolled_into_pip: false,
@@ -1216,7 +1376,7 @@ impl YtApp {
                 .send_viewport_cmd(ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
         }
         if let Some(mpv) = &app.mpv {
-            mpv.set_subtitle_style(app.sub_font_size, app.sub_bg_opacity);
+            app.configure_mpv_player(mpv);
         }
         app.last_nav = app.current_nav_entry();
         app
@@ -1332,6 +1492,8 @@ impl YtApp {
                         audio_tracks: Vec::new(),
                         hls_url: None,
                         captions: Vec::new(),
+                        translation_languages: Vec::new(),
+                        transcript_params: None,
                         chapters: Vec::new(),
                         storyboard: None,
                         comments_token: None,
@@ -1655,6 +1817,37 @@ impl YtApp {
         std::mem::swap(
             &mut self.selected_caption_idx,
             &mut slot.selected_caption_idx,
+        );
+        std::mem::swap(
+            &mut self.selected_caption_tlang,
+            &mut slot.selected_caption_tlang,
+        );
+        std::mem::swap(
+            &mut self.secondary_caption_idx,
+            &mut slot.secondary_caption_idx,
+        );
+        std::mem::swap(
+            &mut self.secondary_caption_tlang,
+            &mut slot.secondary_caption_tlang,
+        );
+        std::mem::swap(&mut self.audio_only_mode, &mut slot.audio_only_mode);
+        std::mem::swap(&mut self.ab_loop_a, &mut slot.ab_loop_a);
+        std::mem::swap(&mut self.ab_loop_b, &mut slot.ab_loop_b);
+        std::mem::swap(&mut self.transcript, &mut slot.transcript);
+        std::mem::swap(&mut self.transcript_loading, &mut slot.transcript_loading);
+        std::mem::swap(&mut self.transcript_error, &mut slot.transcript_error);
+        std::mem::swap(&mut self.transcript_query, &mut slot.transcript_query);
+        std::mem::swap(
+            &mut self.transcript_auto_scroll,
+            &mut slot.transcript_auto_scroll,
+        );
+        std::mem::swap(
+            &mut self.transcript_last_active_idx,
+            &mut slot.transcript_last_active_idx,
+        );
+        std::mem::swap(
+            &mut self.transcript_caption_idx,
+            &mut slot.transcript_caption_idx,
         );
         std::mem::swap(&mut self.used_ytdlp, &mut slot.used_ytdlp);
         std::mem::swap(&mut self.sponsor_segments, &mut slot.sponsor_segments);
@@ -2182,12 +2375,38 @@ impl YtApp {
         self.watch_loading = false;
         self.selected_audio_idx = 0;
         self.selected_caption_idx = None;
+        self.selected_caption_tlang = None;
+        self.secondary_caption_idx = None;
+        self.secondary_caption_tlang = None;
+        if is_shorts {
+            self.audio_only_mode = false;
+        } else {
+            self.audio_only_mode |= self.default_audio_only;
+        }
+        self.ab_loop_a = None;
+        self.ab_loop_b = None;
+        self.transcript.clear();
+        self.transcript_loading = false;
+        self.transcript_error = None;
+        self.transcript_query.clear();
+        self.transcript_auto_scroll = true;
+        self.transcript_last_active_idx = None;
+        self.transcript_caption_idx = 0;
         self.used_ytdlp = used_ytdlp;
 
         // Play Shorts directly at the resolved quality (avoid jarring 2x-3x reload stutters).
-        let is_hls_master = data.hls_url.as_deref() == Some(selected_video_url.as_str());
-        let initial_video_url = selected_video_url;
-        let initial_audio_url = selected_audio_url;
+        let keep_audio = !is_shorts && self.audio_only_mode;
+        let is_hls_master =
+            !keep_audio && data.hls_url.as_deref() == Some(selected_video_url.as_str());
+        let (initial_video_url, initial_audio_url) = if keep_audio {
+            if let Some(aud) = self.selected_audio_stream(&data) {
+                (aud, None)
+            } else {
+                (selected_video_url, selected_audio_url)
+            }
+        } else {
+            (selected_video_url, selected_audio_url)
+        };
         let initial_format_idx = selected_format_idx;
         self.selected_format_idx = initial_format_idx;
         self.abr_initial_format_idx = initial_format_idx;
@@ -2252,7 +2471,16 @@ impl YtApp {
         self.pending_hls_target_height = target_fmt.map(|f| f.height);
         let suppress_resume_toast = self.start_paused;
         if let Some(mpv) = &self.mpv {
-            mpv.set_cache_pause_wait(if is_shorts { 0.3 } else { 1.5 });
+            self.configure_mpv_player(mpv);
+            mpv.set_live_stream_tuning(data.is_live);
+            mpv.set_ab_loop(None, None);
+            mpv.set_cache_pause_wait(if is_shorts {
+                0.3
+            } else if data.is_live {
+                0.35
+            } else {
+                1.5
+            });
             mpv.set_hls_bitrate(target_fmt.map(|f| f.bitrate));
             let mpv_start = if data.is_live {
                 None
@@ -2264,6 +2492,7 @@ impl YtApp {
                 initial_audio_url.as_deref(),
                 mpv_start,
             );
+            mpv.set_video_enabled(!keep_audio);
             mpv.set_speed(self.speed);
             mpv.set_loop_file(is_shorts);
             if self.start_paused || (is_shorts && (self.page != Page::Shorts || self.shorts_grid_view)) {
@@ -2408,6 +2637,18 @@ impl YtApp {
         self.selected_format_idx = None;
         self.selected_audio_idx = 0;
         self.selected_caption_idx = None;
+        self.selected_caption_tlang = None;
+        self.secondary_caption_idx = None;
+        self.secondary_caption_tlang = None;
+        self.ab_loop_a = None;
+        self.ab_loop_b = None;
+        self.transcript.clear();
+        self.transcript_loading = false;
+        self.transcript_error = None;
+        self.transcript_query.clear();
+        self.transcript_auto_scroll = true;
+        self.transcript_last_active_idx = None;
+        self.transcript_caption_idx = 0;
         self.used_ytdlp = false;
         self.player_menu = PlayerMenu::None;
         self.last_pointer_move = Instant::now();
@@ -2461,6 +2702,8 @@ impl YtApp {
             audio_tracks: Vec::new(),
             hls_url: None,
             captions: Vec::new(),
+            translation_languages: Vec::new(),
+            transcript_params: None,
             chapters: Vec::new(),
             storyboard: None,
             comments_token: None,
@@ -2472,6 +2715,8 @@ impl YtApp {
             resume_secs: None,
         });
         if let Some(mpv) = &self.mpv {
+            self.configure_mpv_player(mpv);
+            mpv.set_ab_loop(None, None);
             mpv.load_stream(&path_str, None, None);
             mpv.set_speed(self.speed);
         }
@@ -2508,6 +2753,18 @@ impl YtApp {
         self.seeking_pos = None;
         self.selected_audio_idx = 0;
         self.selected_caption_idx = None;
+        self.selected_caption_tlang = None;
+        self.secondary_caption_idx = None;
+        self.secondary_caption_tlang = None;
+        self.ab_loop_a = None;
+        self.ab_loop_b = None;
+        self.transcript.clear();
+        self.transcript_loading = false;
+        self.transcript_error = None;
+        self.transcript_query.clear();
+        self.transcript_auto_scroll = true;
+        self.transcript_last_active_idx = None;
+        self.transcript_caption_idx = 0;
         self.player_menu = PlayerMenu::None;
         self.last_pointer_move = Instant::now();
         self.comments.clear();
@@ -2652,6 +2909,7 @@ impl YtApp {
         let target_bps = fmt.bitrate;
 
         if is_manual {
+            self.audio_only_mode = false;
             self.abr_initial_format_idx = Some(idx);
             self.abr_target_height = Some(target_h);
             self.abr_downgraded = false;
@@ -2687,6 +2945,8 @@ impl YtApp {
                     let pos = self.playback.time_pos.max(0.0);
                     mpv.set_hls_bitrate((target_bps > 0).then_some(target_bps));
                     mpv.load_stream(hls, None, (!w.is_live).then_some(pos));
+                    mpv.set_ab_loop(self.ab_loop_a, self.ab_loop_b);
+                    self.apply_active_subtitles();
                     self.pending_hls_target_height = Some(target_h);
                     self.selected_format_idx = Some(idx);
                     if notify_toast {
@@ -2711,6 +2971,8 @@ impl YtApp {
                 audio.as_deref(),
                 (!w.is_live).then_some(pos),
             );
+            mpv.set_ab_loop(self.ab_loop_a, self.ab_loop_b);
+            self.apply_active_subtitles();
         }
         self.playing_hls_master = false;
         self.pending_hls_target_height = None;
@@ -2729,6 +2991,7 @@ impl YtApp {
         let Some(w) = &self.watch else { return };
         let Some(hls) = w.hls_url.as_deref() else { return };
         if is_manual {
+            self.audio_only_mode = false;
             self.abr_initial_format_idx = None;
             self.abr_target_height = None;
             self.abr_downgraded = false;
@@ -2744,6 +3007,8 @@ impl YtApp {
             } else {
                 let pos = self.playback.time_pos.max(0.0);
                 mpv.load_stream(hls, None, (!w.is_live).then_some(pos));
+                mpv.set_ab_loop(self.ab_loop_a, self.ab_loop_b);
+                self.apply_active_subtitles();
                 self.playing_hls_master = true;
                 self.active_stream_urls = (hls.to_owned(), None);
             }
@@ -2769,13 +3034,23 @@ impl YtApp {
         let Some(tr) = w.audio_tracks.get(idx) else { return };
         let label = tr.label.clone();
         self.selected_audio_idx = idx;
-        if let Some(fmt_idx) = self.selected_format_idx {
+        let audio = self.backend.proxy_url(&tr.url, tr.content_length);
+        let pos = self.playback.time_pos.max(0.0);
+        if self.audio_only_mode {
+            if let Some(mpv) = &self.mpv {
+                mpv.load_stream(&audio, None, (!w.is_live).then_some(pos));
+                mpv.set_video_enabled(false);
+                mpv.set_ab_loop(self.ab_loop_a, self.ab_loop_b);
+                self.apply_active_subtitles();
+            }
+            self.active_stream_urls = (audio, None);
+        } else if let Some(fmt_idx) = self.selected_format_idx {
             if let Some(fmt) = w.video_formats.get(fmt_idx) {
                 let video_url = self.backend.proxy_url(&fmt.url, fmt.content_length);
-                let audio = self.backend.proxy_url(&tr.url, tr.content_length);
-                let pos = self.playback.time_pos.max(0.0);
                 if let Some(mpv) = &self.mpv {
                     mpv.load_stream(&video_url, Some(&audio), (!w.is_live).then_some(pos));
+                    mpv.set_ab_loop(self.ab_loop_a, self.ab_loop_b);
+                    self.apply_active_subtitles();
                 }
                 self.active_stream_urls = (video_url, Some(audio));
             }
@@ -3748,26 +4023,39 @@ impl YtApp {
                 } => {
                     self.with_matching_slot(&video_id, |app, _is_shorts| {
                         app.stream_recovering = None;
+                        let mut recovered_is_live = false;
                         if let Some(w) = app.watch.as_mut() {
                             w.video_formats = video_formats;
                             w.audio_url = audio_url;
                             w.audio_content_length = audio_content_length;
                             w.audio_tracks = audio_tracks;
                             w.hls_url = hls_url;
+                            recovered_is_live = w.is_live;
+                        }
+                        if app.watch.is_some() {
                             app.selected_format_idx = selected_format_idx;
                             app.selected_audio_idx = selected_audio_idx;
                             app.used_ytdlp = used_ytdlp;
                             app.last_error = None;
-                            let start_at = (!w.is_live).then_some(resume_secs.max(0.0));
+                            let start_at = (!recovered_is_live).then_some(resume_secs.max(0.0));
+                            let (vid_url, aud_url) = if app.audio_only_mode {
+                                if let Some(a) = app.watch.as_ref().and_then(|w| app.selected_audio_stream(w)) {
+                                    (a, None)
+                                } else {
+                                    (selected_video_url.clone(), selected_audio_url.clone())
+                                }
+                            } else {
+                                (selected_video_url.clone(), selected_audio_url.clone())
+                            };
                             if let Some(mpv) = &app.mpv {
-                                mpv.load_stream(
-                                    &selected_video_url,
-                                    selected_audio_url.as_deref(),
-                                    start_at,
-                                );
+                                app.configure_mpv_player(mpv);
+                                mpv.load_stream(&vid_url, aud_url.as_deref(), start_at);
+                                mpv.set_video_enabled(!app.audio_only_mode);
                                 mpv.set_speed(app.speed);
+                                mpv.set_ab_loop(app.ab_loop_a, app.ab_loop_b);
+                                app.apply_active_subtitles();
                             }
-                            app.active_stream_urls = (selected_video_url, selected_audio_url);
+                            app.active_stream_urls = (vid_url, aud_url);
                             app.watch_started_at = Some(Instant::now());
                             app.buffering_since = None;
                             app.stable_playback_since = None;
@@ -4353,10 +4641,7 @@ impl YtApp {
                                     Ok(player) => {
                                         player.set_volume(self.volume);
                                         player.set_hwdec(self.hwdec_mode);
-                                        player.set_subtitle_style(
-                                            self.sub_font_size,
-                                            self.sub_bg_opacity,
-                                        );
+                                        self.configure_mpv_player(&player);
                                         self.mpv = Some(player);
                                         self.toast(format!("libmpv ready ({})", path.display()));
                                     }
@@ -4375,6 +4660,7 @@ impl YtApp {
                     tiled_width,
                     tiled_height,
                     tiled_rgba,
+                    palette,
                 } => {
                     if self.ambient_requested_key.as_deref() == Some(key.as_str()) {
                         let soft_img = egui::ColorImage::from_rgba_unmultiplied(
@@ -4404,6 +4690,8 @@ impl YtApp {
                         if let Some((_, old)) = self.ambient_tex_soft.take() {
                             self.ambient_prev_soft = Some(old);
                         }
+                        self.ambient_prev_palette = self.ambient_palette;
+                        self.ambient_palette = palette;
                         self.ambient_tex_soft = Some((key.clone(), soft));
                         self.ambient_tex_tiled = Some((key, tiled));
                         self.ambient_changed_at = Some(Instant::now());
@@ -4425,6 +4713,18 @@ impl YtApp {
                         self.dropboard_online = false;
                         self.toast("Screenshot copied to clipboard");
                     }
+                }
+                Response::TranscriptLoaded {
+                    video_id,
+                    cues,
+                    error,
+                } => {
+                    self.with_matching_slot(&video_id, |app, _is_shorts| {
+                        app.transcript_loading = false;
+                        app.transcript_error = error;
+                        app.transcript = cues;
+                        app.transcript_last_active_idx = None;
+                    });
                 }
                 Response::RelatedChipLoaded {
                     video_id,
@@ -4539,6 +4839,7 @@ impl YtApp {
         let mut step_short_delta: isize = 0;
         let mut reload_home = false;
         let mut exit_pip = false;
+        let mut cycle_ab_loop = false;
         let mut set_fullscreen: Option<bool> = None;
         ctx.input(|i| {
             if i.key_pressed(Key::Escape) {
@@ -4677,19 +4978,33 @@ impl YtApp {
             if self.shortcuts.toggle_captions.matches(i) {
                 if let Some(w) = &self.watch {
                     if !w.captions.is_empty() {
-                        let next = if self.selected_caption_idx.is_some() {
+                        self.selected_caption_idx = if self.selected_caption_idx.is_some() {
                             None
                         } else {
                             Some(0)
                         };
-                        self.selected_caption_idx = next;
-                        let url = next.and_then(|idx| w.captions.get(idx)).map(|c| c.vtt_url.as_str());
-                        if let Some(m) = &self.mpv {
-                            m.set_subtitle(url);
-                        }
+                        self.apply_active_subtitles();
                         wake_controls = true;
                     }
                 }
+            }
+            if self.shortcuts.frame_back.matches(i) {
+                if let Some(m) = &self.mpv {
+                    m.frame_back_step();
+                    hud_msg = Some((HudIcon::SeekBack, "-1 frame"));
+                    wake_controls = true;
+                }
+            }
+            if self.shortcuts.frame_forward.matches(i) {
+                if let Some(m) = &self.mpv {
+                    m.frame_step();
+                    hud_msg = Some((HudIcon::SeekForward, "+1 frame"));
+                    wake_controls = true;
+                }
+            }
+            if self.shortcuts.ab_loop.matches(i) {
+                cycle_ab_loop = true;
+                wake_controls = true;
             }
             if self.shortcuts.volume_up.matches(i) {
                 self.volume = (self.volume + 5.0).min(100.0);
@@ -4720,6 +5035,9 @@ impl YtApp {
         }
         if take_screenshot {
             self.capture_current_page_screenshot();
+        }
+        if cycle_ab_loop {
+            self.cycle_ab_loop();
         }
         if let Some((ico, msg)) = hud_msg {
             self.trigger_hud(ico, msg);
@@ -4773,6 +5091,279 @@ impl YtApp {
                 self.toast(format!("Screenshot failed: {e:#}"));
             }
         }
+    }
+
+    pub(super) fn save_video_snapshot_file(&mut self) {
+        let Some(mpv) = &self.mpv else {
+            self.toast("No active video player");
+            return;
+        };
+        let dir = self.effective_download_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.toast(format!("Snapshot failed: {e}"));
+            return;
+        }
+        let base_title = self
+            .watch
+            .as_ref()
+            .map(|w| w.title.as_str())
+            .unwrap_or("youtube_snapshot");
+        let clean = sanitize_filename(base_title);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let out_path = dir.join(format!("{clean}_{stamp}.png"));
+        match mpv.capture_frame_png(&self.backend.data_dir) {
+            Ok(png_bytes) => match std::fs::write(&out_path, &png_bytes) {
+                Ok(()) => self.toast(format!(
+                    "Saved snapshot: {}",
+                    out_path.file_name().and_then(|s| s.to_str()).unwrap_or("snapshot.png")
+                )),
+                Err(e) => self.toast(format!("Snapshot save failed: {e}")),
+            },
+            Err(e) => self.toast(format!("Snapshot failed: {e:#}")),
+        }
+    }
+
+    pub(super) fn configure_mpv_player(&self, mpv: &MpvPlayer) {
+        mpv.set_dual_subtitle_style(
+            self.sub_font_size,
+            self.sub_bg_opacity,
+            self.sub_color,
+            self.sec_sub_font_size,
+            self.sec_sub_bg_opacity,
+            self.sec_sub_color,
+        );
+        mpv.set_audio_filters(self.loudnorm_enabled, self.eq_preset);
+        if self.audio_device != "auto" {
+            mpv.reload_audio_device(&self.audio_device);
+        }
+    }
+
+    pub(super) fn apply_audio_filters_all(&self) {
+        for mpv in [
+            self.mpv.as_ref(),
+            self.bg_player_tab.as_ref().and_then(|b| b.mpv.as_ref()),
+            self.shorts_slot.mpv.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            mpv.set_audio_filters(self.loudnorm_enabled, self.eq_preset);
+        }
+    }
+
+    pub(super) fn reload_audio_devices_all(&self) {
+        for mpv in [
+            self.mpv.as_ref(),
+            self.bg_player_tab.as_ref().and_then(|b| b.mpv.as_ref()),
+            self.shorts_slot.mpv.as_ref(),
+            self.hover_preview_mpv.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            mpv.reload_audio_device(&self.audio_device);
+        }
+    }
+
+    pub(super) fn apply_subtitle_style_all(&self) {
+        for mpv in [
+            self.mpv.as_ref(),
+            self.bg_player_tab.as_ref().and_then(|b| b.mpv.as_ref()),
+            self.shorts_slot.mpv.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            mpv.set_dual_subtitle_style(
+                self.sub_font_size,
+                self.sub_bg_opacity,
+                self.sub_color,
+                self.sec_sub_font_size,
+                self.sec_sub_bg_opacity,
+                self.sec_sub_color,
+            );
+        }
+    }
+
+    pub(super) fn resolve_caption_url(
+        &self,
+        caption_idx: Option<usize>,
+        tlang: Option<&str>,
+    ) -> Option<String> {
+        let w = self.watch.as_ref()?;
+        let idx = caption_idx?;
+        let track = w.captions.get(idx)?;
+        Some(match tlang.filter(|s| !s.is_empty()) {
+            Some(lang) => innertube::translated_vtt_url(&track.vtt_url, lang),
+            None => track.vtt_url.clone(),
+        })
+    }
+
+    pub(super) fn apply_active_subtitles(&self) {
+        let primary = self.resolve_caption_url(
+            self.selected_caption_idx,
+            self.selected_caption_tlang.as_deref(),
+        );
+        let secondary = self.resolve_caption_url(
+            self.secondary_caption_idx,
+            self.secondary_caption_tlang.as_deref(),
+        );
+        if let Some(mpv) = &self.mpv {
+            mpv.set_dual_subtitles(primary.as_deref(), secondary.as_deref());
+        }
+    }
+
+    pub(super) fn toggle_audio_only_mode(&mut self) {
+        let Some(w) = self.watch.clone() else {
+            return;
+        };
+        if w.id.starts_with("local:") {
+            self.audio_only_mode = !self.audio_only_mode;
+            if let Some(mpv) = &self.mpv {
+                mpv.set_video_enabled(!self.audio_only_mode);
+            }
+            self.toast(if self.audio_only_mode {
+                "Audio-Only mode: On"
+            } else {
+                "Audio-Only mode: Off"
+            });
+            return;
+        }
+        let next = !self.audio_only_mode;
+        self.audio_only_mode = next;
+        let pos = self.playback.time_pos.max(0.0);
+        let start_at = (!w.is_live).then_some(pos);
+        if next {
+            if let Some(audio) = self.selected_audio_stream(&w) {
+                if let Some(mpv) = &self.mpv {
+                    mpv.set_hls_bitrate(None);
+                    mpv.load_stream(&audio, None, start_at);
+                    mpv.set_video_enabled(false);
+                    mpv.set_speed(self.speed);
+                    mpv.set_ab_loop(self.ab_loop_a, self.ab_loop_b);
+                    self.apply_active_subtitles();
+                }
+                self.playing_hls_master = false;
+                self.active_stream_urls = (audio, None);
+            } else if let Some(mpv) = &self.mpv {
+                mpv.set_video_enabled(false);
+            }
+            self.toast("Audio-Only mode: On (low bandwidth)");
+        } else {
+            if let Some(mpv) = &self.mpv {
+                mpv.set_video_enabled(true);
+            }
+            if let Some(idx) = self.selected_format_idx {
+                self.switch_quality_inner(idx, false, true);
+            } else if w.hls_url.is_some() {
+                self.switch_quality_auto_inner(false, true);
+            } else if !w.video_formats.is_empty() {
+                self.switch_quality_inner(0, false, true);
+            }
+            self.toast("Video mode restored");
+        }
+    }
+
+    pub(super) fn set_ab_loop_a(&mut self, pos: f64) {
+        let dur = self
+            .playback
+            .duration
+            .max(self.watch.as_ref().map_or(0.0, |w| w.duration_secs));
+        let a = if dur > 0.0 { pos.clamp(0.0, dur) } else { pos.max(0.0) };
+        self.ab_loop_a = Some(a);
+        if let Some(b) = self.ab_loop_b {
+            if b <= a + 0.1 {
+                self.ab_loop_b = None;
+            }
+        }
+        if let Some(mpv) = &self.mpv {
+            mpv.set_ab_loop(self.ab_loop_a, self.ab_loop_b);
+        }
+        self.toast(format!("Loop A set at {}", format_duration(a)));
+    }
+
+    pub(super) fn set_ab_loop_b(&mut self, pos: f64) {
+        let dur = self
+            .playback
+            .duration
+            .max(self.watch.as_ref().map_or(0.0, |w| w.duration_secs));
+        let b = if dur > 0.0 { pos.clamp(0.0, dur) } else { pos.max(0.0) };
+        let Some(a) = self.ab_loop_a else {
+            self.set_ab_loop_a(b);
+            return;
+        };
+        if b <= a + 0.15 {
+            self.toast("Loop B must be after Loop A");
+            return;
+        }
+        self.ab_loop_b = Some(b);
+        if let Some(mpv) = &self.mpv {
+            mpv.set_ab_loop(Some(a), Some(b));
+        }
+        self.toast(format!(
+            "A-B loop: {} -> {}",
+            format_duration(a),
+            format_duration(b)
+        ));
+    }
+
+    pub(super) fn clear_ab_loop(&mut self) {
+        self.ab_loop_a = None;
+        self.ab_loop_b = None;
+        if let Some(mpv) = &self.mpv {
+            mpv.set_ab_loop(None, None);
+        }
+        self.toast("A-B loop cleared");
+    }
+
+    pub(super) fn cycle_ab_loop(&mut self) {
+        let pos = self.playback.time_pos.max(0.0);
+        match (self.ab_loop_a, self.ab_loop_b) {
+            (None, _) => self.set_ab_loop_a(pos),
+            (Some(_), None) => self.set_ab_loop_b(pos),
+            (Some(_), Some(_)) => self.clear_ab_loop(),
+        }
+    }
+
+    pub(super) fn request_transcript(&mut self, caption_idx: Option<usize>) {
+        let Some(w) = &self.watch else {
+            return;
+        };
+        if w.id.starts_with("local:") {
+            self.transcript.clear();
+            self.transcript_error = Some("Transcript is unavailable for local files".to_owned());
+            return;
+        }
+        let chosen_idx = caption_idx
+            .filter(|&i| i < w.captions.len())
+            .unwrap_or_else(|| {
+                self.selected_caption_idx
+                    .filter(|&i| i < w.captions.len())
+                    .unwrap_or(0)
+            });
+        self.transcript_caption_idx = chosen_idx;
+        let use_inner = caption_idx.is_none() && w.transcript_params.is_some();
+        let params = if use_inner {
+            w.transcript_params.clone()
+        } else {
+            None
+        };
+        let fallback_vtt = w.captions.get(chosen_idx).map(|c| c.vtt_url.clone());
+        if params.is_none() && fallback_vtt.is_none() {
+            self.transcript.clear();
+            self.transcript_error = Some("No transcript or captions found for this video".to_owned());
+            return;
+        }
+        self.transcript_loading = true;
+        self.transcript_error = None;
+        self.transcript_last_active_idx = None;
+        let _ = self.backend.tx.send(Request::LoadTranscript {
+            video_id: w.id.clone(),
+            transcript_params: params,
+            fallback_vtt_url: fallback_vtt,
+        });
     }
 
     pub(super) fn select_up_next_chip(
@@ -4918,6 +5509,28 @@ impl YtApp {
         }
     }
 
+    fn apply_sleep_fade_volume(&self, gain: f64) {
+        let vol = (self.volume * gain.clamp(0.0, 1.0)).clamp(0.0, 100.0);
+        if let Some(mpv) = &self.mpv {
+            mpv.set_volume(vol);
+        }
+        if let Some(bg) = &self.bg_player_tab {
+            if let Some(mpv) = &bg.mpv {
+                mpv.set_volume(vol);
+            }
+        }
+        if let Some(mpv) = &self.shorts_slot.mpv {
+            mpv.set_volume(vol);
+        }
+    }
+
+    pub(super) fn restore_sleep_volume(&mut self) {
+        if self.sleep_fade_active {
+            self.sleep_fade_active = false;
+            self.apply_sleep_fade_volume(1.0);
+        }
+    }
+
     fn pause_all_for_sleep(&mut self, msg: &str) {
         if let Some(mpv) = &self.mpv {
             mpv.set_paused(true);
@@ -4931,6 +5544,8 @@ impl YtApp {
             mpv.set_paused(true);
         }
         self.sleep_timer = SleepTimer::Off;
+        self.sleep_fade_active = false;
+        self.apply_sleep_fade_volume(1.0);
         self.toast(msg);
         self.trigger_hud(HudIcon::Pause, "Sleep timer");
     }
@@ -5067,11 +5682,33 @@ impl YtApp {
                 ShellEvent::Prev => self.play_previous_video(),
                 ShellEvent::Next => self.play_next_video(),
                 ShellEvent::ToggleAlwaysOnTop => self.set_always_on_top(ctx, !self.always_on_top),
+                ShellEvent::AudioOutputChanged => {
+                    self.audio_reload_pending_at = Some(Instant::now() + Duration::from_millis(120));
+                    self.audio_spectrum.notify_device_changed();
+                }
                 ShellEvent::Quit => {
                     self.quitting_from_tray = true;
                     ctx.send_viewport_cmd(ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
+            }
+        }
+
+        let spec_active = self.page == Page::Watch
+            && self.audio_only_mode
+            && self.audio_spectrum_enabled
+            && self.watch.is_some()
+            && !self.playback.paused;
+        self.audio_spectrum.set_active(spec_active);
+
+        if let Some(due) = self.audio_reload_pending_at {
+            if Instant::now() >= due {
+                self.audio_reload_pending_at = None;
+                if self.audio_device == "auto" {
+                    self.reload_audio_devices_all();
+                }
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(60));
             }
         }
 
@@ -5490,11 +6127,44 @@ impl YtApp {
     }
 
     fn poll_playback_and_sponsorblock(&mut self, ctx: &egui::Context) {
-        if let SleepTimer::Until(deadline) = self.sleep_timer {
-            if Instant::now() >= deadline {
-                self.pause_all_for_sleep("Sleep timer ended — playback paused");
-            } else {
-                ctx.request_repaint_after(Duration::from_millis(500));
+        match self.sleep_timer {
+            SleepTimer::Until(deadline) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    self.pause_all_for_sleep("Sleep timer ended — playback paused");
+                } else {
+                    let rem = deadline.saturating_duration_since(now).as_secs_f64();
+                    if self.sleep_fade_enabled && rem <= 10.0 {
+                        self.sleep_fade_active = true;
+                        self.apply_sleep_fade_volume(sleep_fade_gain(rem, 10.0));
+                        ctx.request_repaint_after(Duration::from_millis(80));
+                    } else {
+                        self.restore_sleep_volume();
+                        ctx.request_repaint_after(Duration::from_millis(500));
+                    }
+                }
+            }
+            SleepTimer::EndOfVideo => {
+                let is_live = self.watch.as_ref().is_some_and(|w| w.is_live);
+                let dur = self.playback.duration;
+                let pos = self.playback.time_pos;
+                if self.sleep_fade_enabled
+                    && !is_live
+                    && !self.playback.paused
+                    && dur > 15.0
+                    && pos > 1.0
+                    && (dur - pos) > 0.0
+                    && (dur - pos) <= 8.0
+                {
+                    self.sleep_fade_active = true;
+                    self.apply_sleep_fade_volume(sleep_fade_gain(dur - pos, 8.0));
+                    ctx.request_repaint_after(Duration::from_millis(80));
+                } else {
+                    self.restore_sleep_volume();
+                }
+            }
+            SleepTimer::Off => {
+                self.restore_sleep_volume();
             }
         }
         if self.page != Page::Shorts || self.shorts_grid_view {
@@ -5638,6 +6308,15 @@ impl YtApp {
         }
 
         let is_live = self.watch.as_ref().is_some_and(|w| w.is_live);
+        if cfg!(windows)
+            && !self.watch_loading
+            && !self.playback.paused
+            && !self.playback.idle
+            && self.playback.current_ao == "null"
+            && self.audio_reload_pending_at.is_none()
+        {
+            self.audio_reload_pending_at = Some(Instant::now() + Duration::from_millis(250));
+        }
         let sleep_eof_triggered = if !is_live
             && self.sleep_timer == SleepTimer::EndOfVideo
             && self.playback.eof
@@ -5732,11 +6411,40 @@ impl YtApp {
             }
         }
 
+        let live_snap = if self.ambient_mode == AmbientMode::VideoAmbilight
+            && !self.fullscreen
+            && self.page == Page::Watch
+            && self.watch.is_some()
+            && !self.audio_only_mode
+        {
+            self.mpv.as_ref().and_then(|m| m.live_ambient_snapshot())
+        } else {
+            None
+        };
+        if let Some(snap) = &live_snap {
+            let mut rgb = Vec::with_capacity(AMB_GRID_W * AMB_GRID_H * 3);
+            for px in snap.grid {
+                rgb.extend_from_slice(&px);
+            }
+            let img = egui::ColorImage::from_rgb([AMB_GRID_W, AMB_GRID_H], &rgb);
+            match &mut self.live_amb_tex {
+                Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
+                None => {
+                    self.live_amb_tex = Some(ctx.load_texture(
+                        "live_video_ambilight",
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+            }
+        }
+
         let acrylic = cfg!(windows)
             && self.window_material != WindowMaterial::None
             && !self.fullscreen
             && crate::win_shell::windows_backdrop_supported();
-        let ambient = wants_ambient && self.ambient_tex_soft.is_some();
+        let ambient =
+            wants_ambient && (self.ambient_tex_soft.is_some() || live_snap.is_some());
         theme::set_backdrop_flags(acrylic, ambient);
 
         if !acrylic && !ambient {
@@ -5755,14 +6463,51 @@ impl YtApp {
             let strength = self.ambient_opacity.clamp(0.05, 0.70);
             let fade = self
                 .ambient_changed_at
-                .map_or(1.0, |at| (at.elapsed().as_secs_f32() / 0.7).clamp(0.0, 1.0));
+                .map_or(1.0, |at| (at.elapsed().as_secs_f32() / 0.8).clamp(0.0, 1.0));
+            let t = ctx.input(|i| i.time) as f32;
+            let animated_watch = self.page == Page::Watch && self.ambient_glow && !self.playback.paused;
             if fade < 1.0 {
                 ctx.request_repaint_after(Duration::from_millis(33));
             } else {
                 self.ambient_prev_soft = None;
+                if matches!(
+                    self.ambient_mode,
+                    AmbientMode::SoftBlur | AmbientMode::VideoAmbilight
+                ) {
+                    ctx.request_repaint_after(Duration::from_millis(if animated_watch { 33 } else { 90 }));
+                }
             }
-            let full_uv = egui::Rect::from_min_max(egui::pos2(0.06, 0.06), egui::pos2(0.94, 0.94));
+            let drift_u = (t * 0.16).sin() * 0.025;
+            let drift_v = (t * 0.12).cos() * 0.025;
+            let full_uv = egui::Rect::from_min_max(
+                egui::pos2(0.08 + drift_u, 0.08 + drift_v),
+                egui::pos2(0.92 + drift_u, 0.92 + drift_v),
+            );
+            let pulse = 0.92 + 0.08 * (t * 0.45).sin();
             match self.ambient_mode {
+                AmbientMode::VideoAmbilight => {
+                    if live_snap.is_some() {
+                        if let Some(tex) = &self.live_amb_tex {
+                            let uv = egui::Rect::from_min_max(
+                                egui::pos2(0.04, 0.04),
+                                egui::pos2(0.96, 0.96),
+                            );
+                            painter.image(
+                                tex.id(),
+                                screen,
+                                uv,
+                                Color32::WHITE.gamma_multiply((strength * 0.92).clamp(0.08, 0.78)),
+                            );
+                        }
+                    } else if let Some((_, tex)) = &self.ambient_tex_soft {
+                        painter.image(
+                            tex.id(),
+                            screen,
+                            full_uv,
+                            Color32::WHITE.gamma_multiply(strength * 0.72 * pulse * fade),
+                        );
+                    }
+                }
                 AmbientMode::SoftBlur => {
                     if let Some(prev) = &self.ambient_prev_soft {
                         if fade < 1.0 {
@@ -5770,7 +6515,7 @@ impl YtApp {
                                 prev.id(),
                                 screen,
                                 full_uv,
-                                Color32::WHITE.gamma_multiply(strength * (1.0 - fade)),
+                                Color32::WHITE.gamma_multiply(strength * 0.72 * pulse * (1.0 - fade)),
                             );
                         }
                     }
@@ -5779,7 +6524,7 @@ impl YtApp {
                             tex.id(),
                             screen,
                             full_uv,
-                            Color32::WHITE.gamma_multiply(strength * fade),
+                            Color32::WHITE.gamma_multiply(strength * 0.72 * pulse * fade),
                         );
                     }
                 }
@@ -5796,7 +6541,7 @@ impl YtApp {
                             tex.id(),
                             screen,
                             tiled_uv,
-                            Color32::WHITE.gamma_multiply(strength * 0.92 * fade),
+                            Color32::WHITE.gamma_multiply(strength * 0.86 * fade),
                         );
                     }
                 }
@@ -5804,23 +6549,54 @@ impl YtApp {
             }
             let mut scrim = egui::Mesh::default();
             let top_col = if acrylic {
-                Color32::from_black_alpha(20)
-            } else {
                 Color32::from_black_alpha(36)
+            } else {
+                Color32::from_rgba_unmultiplied(15, 15, 15, 68)
+            };
+            let mid_col = if acrylic {
+                Color32::from_black_alpha(64)
+            } else {
+                Color32::from_rgba_unmultiplied(15, 15, 15, 150)
             };
             let bot_col = if acrylic {
-                Color32::from_black_alpha(72)
+                Color32::from_black_alpha(110)
             } else {
-                Color32::from_black_alpha(128)
+                Color32::from_rgba_unmultiplied(15, 15, 15, 228)
             };
+            let mid_y = screen.top() + screen.height() * 0.48;
             scrim.colored_vertex(screen.left_top(), top_col);
             scrim.colored_vertex(screen.right_top(), top_col);
+            scrim.colored_vertex(egui::pos2(screen.left(), mid_y), mid_col);
+            scrim.colored_vertex(egui::pos2(screen.right(), mid_y), mid_col);
             scrim.colored_vertex(screen.left_bottom(), bot_col);
             scrim.colored_vertex(screen.right_bottom(), bot_col);
             scrim.add_triangle(0, 1, 2);
             scrim.add_triangle(1, 3, 2);
+            scrim.add_triangle(2, 3, 4);
+            scrim.add_triangle(3, 5, 4);
             painter.add(egui::Shape::mesh(scrim));
         }
+    }
+}
+
+pub(super) fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+                || c.is_control()
+            {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.');
+    if trimmed.is_empty() {
+        "youtube_export".to_owned()
+    } else {
+        trimmed.chars().take(80).collect()
     }
 }
 
@@ -5865,6 +6641,10 @@ impl eframe::App for YtApp {
             if self.autoplay_next { "1" } else { "0" }.into(),
         );
         storage.set_string(
+            "default_audio_only",
+            if self.default_audio_only { "1" } else { "0" }.into(),
+        );
+        storage.set_string(
             "auto_resume_on_start",
             if self.auto_resume_on_start { "1" } else { "0" }.into(),
         );
@@ -5890,6 +6670,14 @@ impl eframe::App for YtApp {
             if self.ambient_glow { "1" } else { "0" }.into(),
         );
         storage.set_string(
+            "audio_spectrum_enabled",
+            if self.audio_spectrum_enabled { "1" } else { "0" }.into(),
+        );
+        storage.set_string(
+            "audio_spectrum_theme",
+            self.audio_spectrum_theme.key().into(),
+        );
+        storage.set_string(
             "show_topbar_account_name",
             if self.show_topbar_account_name { "1" } else { "0" }.into(),
         );
@@ -5904,6 +6692,16 @@ impl eframe::App for YtApp {
         storage.set_string("ambient_opacity", format!("{:.2}", self.ambient_opacity));
         storage.set_string("sub_font_size", self.sub_font_size.to_string());
         storage.set_string("sub_bg_opacity", format!("{:.2}", self.sub_bg_opacity));
+        storage.set_string("sub_color", self.sub_color.key().into());
+        storage.set_string("sec_sub_font_size", self.sec_sub_font_size.to_string());
+        storage.set_string("sec_sub_bg_opacity", format!("{:.2}", self.sec_sub_bg_opacity));
+        storage.set_string("sec_sub_color", self.sec_sub_color.key().into());
+        storage.set_string("audio_device", self.audio_device.clone());
+        storage.set_string(
+            "loudnorm_enabled",
+            if self.loudnorm_enabled { "1" } else { "0" }.into(),
+        );
+        storage.set_string("eq_preset", self.eq_preset.key().into());
         if let Ok(sc) = serde_json::to_string(&self.shortcuts) {
             storage.set_string("shortcuts", sc);
         }
@@ -5953,6 +6751,10 @@ impl eframe::App for YtApp {
             encode_sleep_timer(&self.sleep_timer, Instant::now(), unix_now_secs());
         storage.set_string("sleep_timer_mode", st_mode.into());
         storage.set_string("sleep_timer_until_unix", st_until);
+        storage.set_string(
+            "sleep_fade_enabled",
+            if self.sleep_fade_enabled { "1" } else { "0" }.into(),
+        );
     }
 
     fn on_exit(&mut self, gl: Option<&glow::Context>) {
@@ -6416,6 +7218,7 @@ pub(super) fn restore_sleep_timer(
     }
 }
 
+#[cfg(test)]
 pub(super) fn parse_sleep_timer_input(raw: &str) -> Option<Duration> {
     let s = raw.trim().to_ascii_lowercase();
     if s.is_empty() {
@@ -6636,7 +7439,7 @@ mod ui_tests {
     use super::{
         AbrFallbackAction, SleepTimer, encode_sleep_timer, parse_sleep_timer_input,
         pick_abr_fallback_action, pick_abr_recovery_idx, restore_sleep_timer,
-        should_upgrade_to_target, shuffle_vec,
+        should_upgrade_to_target, shuffle_vec, sleep_fade_gain,
     };
     use crate::model::VideoFormat;
     use std::collections::HashSet;
@@ -6755,4 +7558,21 @@ mod ui_tests {
             SleepTimer::EndOfVideo
         );
     }
+
+    #[test]
+    fn computes_smooth_sleep_fade_gain() {
+        assert!((sleep_fade_gain(10.0, 10.0) - 1.0).abs() < 1e-6);
+        assert!((sleep_fade_gain(0.0, 10.0) - 0.0).abs() < 1e-6);
+        let mid = sleep_fade_gain(5.0, 10.0);
+        assert!((mid - 0.5).abs() < 1e-6);
+        assert!(sleep_fade_gain(2.0, 10.0) < mid);
+    }
+}
+
+pub(super) fn sleep_fade_gain(rem_secs: f64, window_secs: f64) -> f64 {
+    if window_secs <= 0.0 {
+        return 1.0;
+    }
+    let t = (rem_secs / window_secs).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }

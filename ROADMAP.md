@@ -71,10 +71,10 @@ Phases 1–7 are complete (`42/42` unit tests passing via `cargo test --locked`,
 - [x] **Channel Community Posts**: Parse and render Channel **Posts** (`Community` tab — text posts, polls with vote results, and attached images/video previews).
 
 ### Phase 9 — Advanced Player, Transcript & Audio/Visual Tools
-- [ ] **Interactive Video Transcript Panel**: Fetch YouTube timed transcript (`get_transcript`), provide a searchable auto-scrolling drawer synced with current playback time, click-to-seek lines, and one-click `.txt` / `.srt` export.
-- [ ] **Dual Subtitles & Auto-Translate**: Display simultaneous primary + secondary subtitles (including YouTube `tlang=` auto-translated `.vtt` tracks) with independent font scale and color contrast options.
-- [ ] **Audio-Only Mode, Volume Normalization & Equalizer**: Toggle active tab into low-bandwidth audio-only stream (`vid=no`), enable `libmpv` `loudnorm` loudness equalization, and add multi-band EQ presets (`Flat`, `Voice Clarity`, `Bass Boost`, `Music`).
-- [ ] **Theater Mode, Frame Step, A-B Loop & Frame Snapshot**: Full-width Theater watch toggle (`T`), frame-by-frame stepping (`,` / `.` while paused), seekbar **A-B loop** markers for replaying sections, and lossless frame screenshot capture.
+- [x] **Interactive Video Transcript Panel**: Fetch YouTube timed transcript (`get_transcript`), provide a searchable auto-scrolling drawer synced with current playback time, click-to-seek lines, and one-click `.txt` / `.srt` export.
+- [x] **Dual Subtitles & Auto-Translate**: Display simultaneous primary + secondary subtitles (including YouTube `tlang=` auto-translated `.vtt` tracks) with independent font scale and color contrast options.
+- [x] **Audio-Only Mode, Volume Normalization & Equalizer**: Toggle active tab into low-bandwidth audio-only stream (`vid=no`), enable `libmpv` `loudnorm` loudness equalization, and add multi-band EQ presets (`Flat`, `Voice Clarity`, `Bass Boost`, `Music`).
+- [x] **Theater Mode, Frame Step, A-B Loop & Frame Snapshot**: Full-width Theater watch toggle (`T`), frame-by-frame stepping (`,` / `.` while paused), seekbar **A-B loop** markers for replaying sections, and lossless frame screenshot capture.
 
 ### Phase 10 — Batch Downloads, Packaging & Cross-Platform
 - [ ] **Download Queue & Batch Playlist Downloads**: Multi-item `yt-dlp` download queue with pause/cancel/retry controls, full-playlist batch downloads, and `--embed-subs` / `--embed-thumbnail` toggles.

@@ -2239,19 +2239,42 @@ impl YtApp {
         words: &[String],
     ) -> bool {
         let m_quality = settings_match(words, group, "Preferred max quality resolution 4k 1080p 720p");
+        let m_audio_dev = settings_match(
+            words,
+            group,
+            "Audio output device speaker headphone wasapi default switch",
+        );
+        let m_loudnorm = settings_match(
+            words,
+            group,
+            "Volume loudness normalization loudnorm equalizer eq bass voice music",
+        );
         let m_hover = settings_match(
             words,
             group,
             "Hover video preview inline beranda home thumbnail 360p 480p 720p mute",
         );
         let m_autoplay = settings_match(words, group, "Autoplay next Up Next video");
+        let m_audio_default = settings_match(
+            words,
+            group,
+            "Audio-only mode default spectrum startup background",
+        );
         let m_resume = settings_match(words, group, "Auto-resume last watched video tabs startup");
         let m_pot = settings_match(
             words,
             group,
             "BotGuard PO Token auto on off yt-dlp blocked 403 webview",
         );
-        if !m_quality && !m_hover && !m_autoplay && !m_resume && !m_pot {
+        if !m_quality
+            && !m_audio_dev
+            && !m_loudnorm
+            && !m_hover
+            && !m_autoplay
+            && !m_audio_default
+            && !m_resume
+            && !m_pot
+        {
             return false;
         }
         settings_group_frame(ui, group, None, |ui| {
@@ -2317,6 +2340,28 @@ impl YtApp {
                     },
                 );
             }
+            if m_audio_default {
+                if count > 0 {
+                    settings_divider(ui);
+                }
+                count += 1;
+                let prev_dao = self.default_audio_only;
+                settings_row(
+                    ui,
+                    "Start playback in Audio-Only mode",
+                    Some("Automatically start and keep normal videos in Audio-Only mode with the spectrum visualizer."),
+                    |ui| {
+                        settings_toggle(ui, &mut self.default_audio_only, "default_audio_only");
+                    },
+                );
+                if self.default_audio_only != prev_dao && self.default_audio_only && !self.audio_only_mode {
+                    if self.watch.is_some() {
+                        self.toggle_audio_only_mode();
+                    } else {
+                        self.audio_only_mode = true;
+                    }
+                }
+            }
             if m_resume {
                 if count > 0 {
                     settings_divider(ui);
@@ -2367,6 +2412,110 @@ impl YtApp {
                     self.toast(format!("BotGuard PO Token: {}", self.po_token_mode.label()));
                 }
             }
+            if m_audio_dev {
+                if count > 0 {
+                    settings_divider(ui);
+                }
+                count += 1;
+                let devices = self
+                    .mpv
+                    .as_ref()
+                    .map(|m| m.audio_devices())
+                    .unwrap_or_default();
+                let current_label = devices
+                    .iter()
+                    .find(|(name, _)| name == &self.audio_device)
+                    .map(|(_, desc)| desc.clone())
+                    .unwrap_or_else(|| {
+                        if self.audio_device == "auto" {
+                            "System Default (Auto)".to_owned()
+                        } else {
+                            self.audio_device.clone()
+                        }
+                    });
+                let prev_dev = self.audio_device.clone();
+                settings_row(
+                    ui,
+                    "Audio output device",
+                    Some("Follows Windows default output automatically when set to System Default (Auto)."),
+                    |ui| {
+                        egui::ComboBox::from_id_salt("settings_audio_device")
+                            .width(230.0)
+                            .selected_text(current_label)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.audio_device,
+                                    "auto".to_owned(),
+                                    "System Default (Auto)",
+                                );
+                                for (name, desc) in &devices {
+                                    if name == "auto" {
+                                        continue;
+                                    }
+                                    ui.selectable_value(
+                                        &mut self.audio_device,
+                                        name.clone(),
+                                        desc,
+                                    );
+                                }
+                            });
+                        if settings_pill_btn(ui, "Reload", None)
+                            .on_hover_text("Rebind audio output to current Windows device")
+                            .clicked()
+                        {
+                            self.reload_audio_devices_all();
+                            self.toast("Audio output reloaded");
+                        }
+                    },
+                );
+                if self.audio_device != prev_dev {
+                    self.reload_audio_devices_all();
+                    self.toast("Audio output updated");
+                }
+            }
+            if m_loudnorm {
+                if count > 0 {
+                    settings_divider(ui);
+                }
+                let prev_ln = self.loudnorm_enabled;
+                let prev_eq = self.eq_preset;
+                settings_row(
+                    ui,
+                    "Loudness normalization (loudnorm)",
+                    Some("Balance quiet speech and loud videos using libmpv EBU R128 loudness normalization."),
+                    |ui| {
+                        settings_toggle(ui, &mut self.loudnorm_enabled, "loudnorm_enabled");
+                    },
+                );
+                settings_divider(ui);
+                settings_row(
+                    ui,
+                    "Equalizer preset",
+                    Some("Multi-band audio EQ applied live across playback tabs."),
+                    |ui| {
+                        egui::ComboBox::from_id_salt("settings_eq_preset")
+                            .width(170.0)
+                            .selected_text(self.eq_preset.label())
+                            .show_ui(ui, |ui| {
+                                for preset in crate::model::EqPreset::ALL {
+                                    ui.selectable_value(
+                                        &mut self.eq_preset,
+                                        preset,
+                                        preset.label(),
+                                    );
+                                }
+                            });
+                    },
+                );
+                if self.loudnorm_enabled != prev_ln || self.eq_preset != prev_eq {
+                    self.apply_audio_filters_all();
+                    self.toast(format!(
+                        "Audio: {} · Loudnorm {}",
+                        self.eq_preset.label(),
+                        if self.loudnorm_enabled { "On" } else { "Off" }
+                    ));
+                }
+            }
         });
         true
     }
@@ -2383,14 +2532,19 @@ impl YtApp {
         let m_amb = settings_match(
             words,
             group,
-            "Ambient mode background video blur soft tiled repeat wallpaper",
+            "Ambient mode background video ambilight live blur soft tiled repeat wallpaper",
         );
         let m_amb_op = self.ambient_mode != AmbientMode::Off
             && settings_match(words, group, "Ambient background strength opacity intensity");
         let m_glow = settings_match(
             words,
             group,
-            "Ambient cinema glow behind video player watch",
+            "Player ambient light cinema glow behind video watch",
+        );
+        let m_spec = settings_match(
+            words,
+            group,
+            "Audio-only spectrum visualizer theme bars neon wave led audio",
         );
         let m_sub_sz = settings_match(words, group, "Caption font size subtitles");
         let m_sub_op = settings_match(words, group, "Caption background opacity subtitles");
@@ -2402,6 +2556,7 @@ impl YtApp {
             && !m_amb
             && !m_amb_op
             && !m_glow
+            && !m_spec
             && !m_sub_sz
             && !m_sub_op
             && !m_aot
@@ -2443,7 +2598,7 @@ impl YtApp {
                 settings_row(
                     ui,
                     "Ambient background",
-                    Some("Softly blurred or tiled video artwork behind pages, similar to ytm-rs."),
+                    Some("Video Ambilight syncs live to playing video frames; Soft Blur & Tiled use smooth artwork."),
                     |ui| {
                         egui::ComboBox::from_id_salt("settings_ambient_mode")
                             .width(155.0)
@@ -2488,12 +2643,49 @@ impl YtApp {
                 count += 1;
                 settings_row(
                     ui,
-                    "Player ambient cinema glow",
-                    Some("Soft glowing halo behind the active video surface on the Watch page."),
+                    "Player ambient light",
+                    Some("Soft animated YouTube-style ambient light bleeding smoothly behind the video player."),
                     |ui| {
                         settings_toggle(ui, &mut self.ambient_glow, "ambient_glow");
                     },
                 );
+            }
+            if m_spec {
+                if count > 0 {
+                    settings_divider(ui);
+                }
+                count += 1;
+                settings_row(
+                    ui,
+                    "Audio-only spectrum visualizer",
+                    Some("Real-time audio spectrum visualizer over the dimmed thumbnail in Audio-Only mode."),
+                    |ui| {
+                        settings_toggle(ui, &mut self.audio_spectrum_enabled, "audio_spectrum_enabled");
+                    },
+                );
+                if self.audio_spectrum_enabled {
+                    settings_divider(ui);
+                    count += 1;
+                    settings_row(
+                        ui,
+                        "Audio spectrum theme",
+                        Some("Visual style of the reactive spectrum in Audio-Only mode."),
+                        |ui| {
+                            egui::ComboBox::from_id_salt("settings_spectrum_theme")
+                                .width(155.0)
+                                .selected_text(self.audio_spectrum_theme.label())
+                                .show_ui(ui, |ui| {
+                                    for th in crate::model::SpectrumTheme::ALL {
+                                        ui.selectable_value(
+                                            &mut self.audio_spectrum_theme,
+                                            th,
+                                            th.label(),
+                                        );
+                                    }
+                                });
+                        },
+                    );
+                }
             }
             let mut sub_changed = false;
             if m_sub_sz {
@@ -2535,11 +2727,61 @@ impl YtApp {
                         sub_changed = true;
                     }
                 });
+                settings_divider(ui);
+                let prev_c1 = self.sub_color;
+                settings_row(ui, "Primary caption color", None, |ui| {
+                    egui::ComboBox::from_id_salt("settings_sub_color")
+                        .width(140.0)
+                        .selected_text(self.sub_color.label())
+                        .show_ui(ui, |ui| {
+                            for c in crate::model::SubtitleColorPreset::ALL {
+                                ui.selectable_value(&mut self.sub_color, c, c.label());
+                            }
+                        });
+                });
+                if self.sub_color != prev_c1 {
+                    sub_changed = true;
+                }
+                settings_divider(ui);
+                settings_row(ui, "Secondary caption font size (dual subs)", None, |ui| {
+                    ui.label(
+                        RichText::new(format!("{} px", self.sec_sub_font_size))
+                            .font(theme::medium(12.5))
+                            .color(theme::TEXT_DIM),
+                    );
+                    if ui
+                        .add(egui::Slider::new(&mut self.sec_sub_font_size, 20..=72).show_value(false))
+                        .changed()
+                    {
+                        sub_changed = true;
+                    }
+                });
+                settings_divider(ui);
+                let prev_c2 = self.sec_sub_color;
+                settings_row(ui, "Secondary caption color & backdrop", None, |ui| {
+                    let mut sec_pct = (self.sec_sub_bg_opacity * 100.0).round() as u32;
+                    if ui
+                        .add(egui::Slider::new(&mut sec_pct, 0..=100).show_value(false))
+                        .changed()
+                    {
+                        self.sec_sub_bg_opacity = sec_pct as f32 / 100.0;
+                        sub_changed = true;
+                    }
+                    egui::ComboBox::from_id_salt("settings_sec_sub_color")
+                        .width(130.0)
+                        .selected_text(self.sec_sub_color.label())
+                        .show_ui(ui, |ui| {
+                            for c in crate::model::SubtitleColorPreset::ALL {
+                                ui.selectable_value(&mut self.sec_sub_color, c, c.label());
+                            }
+                        });
+                });
+                if self.sec_sub_color != prev_c2 {
+                    sub_changed = true;
+                }
             }
             if sub_changed {
-                if let Some(mpv) = &self.mpv {
-                    mpv.set_subtitle_style(self.sub_font_size, self.sub_bg_opacity);
-                }
+                self.apply_subtitle_style_all();
             }
             if m_aot {
                 if count > 0 {

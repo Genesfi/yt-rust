@@ -10,6 +10,7 @@ pub enum ShellEvent {
     Prev,
     Next,
     ToggleAlwaysOnTop,
+    AudioOutputChanged,
     Quit,
 }
 
@@ -82,16 +83,50 @@ mod imp {
     const THBF_ENABLED: i32 = 0x0000_0000;
 
     const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    const COINIT_MULTITHREADED: u32 = 0x0;
     const CLSCTX_INPROC_SERVER: u32 = 0x1;
+    const CLSCTX_ALL: u32 = 0x17;
+    const S_OK: Hresult = 0;
+    const E_NOINTERFACE: Hresult = 0x8000_4002_u32 as i32;
+    const E_POINTER: Hresult = 0x8000_4003_u32 as i32;
+    const E_RENDER: u32 = 0;
+    const E_CONSOLE: u32 = 0;
+    const E_MULTIMEDIA: u32 = 1;
+    const INFINITE: u32 = 0xFFFF_FFFF;
 
     #[repr(C)]
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
     struct Guid {
         data1: u32,
         data2: u16,
         data3: u16,
         data4: [u8; 8],
     }
+
+    const IID_IUNKNOWN: Guid = Guid {
+        data1: 0x0000_0000,
+        data2: 0x0000,
+        data3: 0x0000,
+        data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+    };
+    const CLSID_MMDEVICE_ENUMERATOR: Guid = Guid {
+        data1: 0xBCDE_0395,
+        data2: 0xE52F,
+        data3: 0x467C,
+        data4: [0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E],
+    };
+    const IID_IMMDEVICE_ENUMERATOR: Guid = Guid {
+        data1: 0xA956_64D2,
+        data2: 0x9614,
+        data3: 0x4F35,
+        data4: [0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6],
+    };
+    const IID_IMMNOTIFICATION_CLIENT: Guid = Guid {
+        data1: 0x7991_EEC9,
+        data2: 0x7E89,
+        data3: 0x4D85,
+        data4: [0x83, 0x90, 0x6C, 0x70, 0x3C, 0xEC, 0x60, 0xC0],
+    };
 
     const CLSID_TASKBAR_LIST: Guid = Guid {
         data1: 0x56FD_F344,
@@ -271,6 +306,15 @@ mod imp {
         fn GlobalLock(hmem: *mut c_void) -> *mut u8;
         fn GlobalUnlock(hmem: *mut c_void) -> i32;
         fn GlobalFree(hmem: *mut c_void) -> *mut c_void;
+        fn CreateEventW(
+            attrs: *mut c_void,
+            manual_reset: i32,
+            initial_state: i32,
+            name: *const u16,
+        ) -> *mut c_void;
+        fn SetEvent(handle: *mut c_void) -> i32;
+        fn WaitForSingleObject(handle: *mut c_void, millis: u32) -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
     }
 
     #[link(name = "user32")]
@@ -301,6 +345,7 @@ mod imp {
     #[link(name = "ole32")]
     unsafe extern "system" {
         fn CoInitializeEx(reserved: *mut c_void, coinit: u32) -> Hresult;
+        fn CoUninitialize();
         fn CoCreateInstance(
             rclsid: *const Guid,
             outer: *mut c_void,
@@ -308,6 +353,209 @@ mod imp {
             riid: *const Guid,
             ppv: *mut *mut c_void,
         ) -> Hresult;
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct PropertyKey {
+        fmtid: Guid,
+        pid: u32,
+    }
+
+    #[repr(C)]
+    struct IMMDeviceEnumeratorVtbl {
+        query_interface: usize,
+        add_ref: usize,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        enum_audio_endpoints: usize,
+        get_default_audio_endpoint: usize,
+        get_device: usize,
+        register_endpoint_notification_callback:
+            unsafe extern "system" fn(*mut c_void, *mut c_void) -> Hresult,
+        unregister_endpoint_notification_callback:
+            unsafe extern "system" fn(*mut c_void, *mut c_void) -> Hresult,
+    }
+
+    #[repr(C)]
+    struct IMMNotificationClientVtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> Hresult,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        on_device_state_changed:
+            unsafe extern "system" fn(*mut c_void, *const u16, u32) -> Hresult,
+        on_device_added: unsafe extern "system" fn(*mut c_void, *const u16) -> Hresult,
+        on_device_removed: unsafe extern "system" fn(*mut c_void, *const u16) -> Hresult,
+        on_default_device_changed:
+            unsafe extern "system" fn(*mut c_void, u32, u32, *const u16) -> Hresult,
+        on_property_value_changed:
+            unsafe extern "system" fn(*mut c_void, *const u16, PropertyKey) -> Hresult,
+    }
+
+    #[repr(C)]
+    struct AudioNotifyClient {
+        vtbl: *const IMMNotificationClientVtbl,
+        ref_count: std::sync::atomic::AtomicU32,
+        tx: Sender<ShellEvent>,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    }
+
+    static AUDIO_NOTIFY_VTBL: IMMNotificationClientVtbl = IMMNotificationClientVtbl {
+        query_interface: audio_qi,
+        add_ref: audio_add_ref,
+        release: audio_release,
+        on_device_state_changed: audio_on_state_changed,
+        on_device_added: audio_on_added,
+        on_device_removed: audio_on_removed,
+        on_default_device_changed: audio_on_default_changed,
+        on_property_value_changed: audio_on_prop_changed,
+    };
+
+    unsafe extern "system" fn audio_qi(
+        this: *mut c_void,
+        riid: *const Guid,
+        ppv: *mut *mut c_void,
+    ) -> Hresult {
+        if ppv.is_null() {
+            return E_POINTER;
+        }
+        unsafe {
+            *ppv = std::ptr::null_mut();
+            if riid.is_null() {
+                return E_NOINTERFACE;
+            }
+            let id = *riid;
+            if id == IID_IUNKNOWN || id == IID_IMMNOTIFICATION_CLIENT {
+                *ppv = this;
+                audio_add_ref(this);
+                return S_OK;
+            }
+        }
+        E_NOINTERFACE
+    }
+
+    unsafe extern "system" fn audio_add_ref(this: *mut c_void) -> u32 {
+        let obj = unsafe { &*(this as *const AudioNotifyClient) };
+        obj.ref_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    unsafe extern "system" fn audio_release(this: *mut c_void) -> u32 {
+        let obj = unsafe { &*(this as *const AudioNotifyClient) };
+        let prev = obj.ref_count.fetch_sub(1, Ordering::Release);
+        if prev == 1 {
+            std::sync::atomic::fence(Ordering::Acquire);
+            unsafe {
+                drop(Box::from_raw(this as *mut AudioNotifyClient));
+            }
+        }
+        prev.saturating_sub(1)
+    }
+
+    fn emit_audio_output_changed(this: *mut c_void) {
+        if this.is_null() {
+            return;
+        }
+        let obj = unsafe { &*(this as *const AudioNotifyClient) };
+        let _ = obj.tx.send(ShellEvent::AudioOutputChanged);
+        (obj.wake)();
+    }
+
+    unsafe extern "system" fn audio_on_state_changed(
+        this: *mut c_void,
+        _pwstr_device_id: *const u16,
+        _dw_new_state: u32,
+    ) -> Hresult {
+        emit_audio_output_changed(this);
+        S_OK
+    }
+
+    unsafe extern "system" fn audio_on_added(
+        this: *mut c_void,
+        _pwstr_device_id: *const u16,
+    ) -> Hresult {
+        emit_audio_output_changed(this);
+        S_OK
+    }
+
+    unsafe extern "system" fn audio_on_removed(
+        this: *mut c_void,
+        _pwstr_device_id: *const u16,
+    ) -> Hresult {
+        emit_audio_output_changed(this);
+        S_OK
+    }
+
+    unsafe extern "system" fn audio_on_default_changed(
+        this: *mut c_void,
+        flow: u32,
+        role: u32,
+        _pwstr_default_device_id: *const u16,
+    ) -> Hresult {
+        if flow == E_RENDER && (role == E_CONSOLE || role == E_MULTIMEDIA) {
+            emit_audio_output_changed(this);
+        }
+        S_OK
+    }
+
+    unsafe extern "system" fn audio_on_prop_changed(
+        _this: *mut c_void,
+        _pwstr_device_id: *const u16,
+        _key: PropertyKey,
+    ) -> Hresult {
+        S_OK
+    }
+
+    fn spawn_audio_device_watcher(
+        tx: Sender<ShellEvent>,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> usize {
+        let stop_ev = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+        if stop_ev.is_null() {
+            return 0;
+        }
+        let ev_addr = stop_ev as usize;
+        let _ = std::thread::Builder::new()
+            .name("yt-rust-audio-watch".into())
+            .spawn(move || unsafe {
+                let hr_init = CoInitializeEx(std::ptr::null_mut(), COINIT_MULTITHREADED);
+                let mut enumerator: *mut c_void = std::ptr::null_mut();
+                let hr = CoCreateInstance(
+                    &CLSID_MMDEVICE_ENUMERATOR,
+                    std::ptr::null_mut(),
+                    CLSCTX_ALL,
+                    &IID_IMMDEVICE_ENUMERATOR,
+                    &mut enumerator,
+                );
+                if hr >= 0 && !enumerator.is_null() {
+                    let client_ptr = Box::into_raw(Box::new(AudioNotifyClient {
+                        vtbl: &AUDIO_NOTIFY_VTBL,
+                        ref_count: std::sync::atomic::AtomicU32::new(1),
+                        tx,
+                        wake,
+                    })) as *mut c_void;
+                    let vtbl = &*(*(enumerator as *const *const IMMDeviceEnumeratorVtbl));
+                    let reg_hr = (vtbl.register_endpoint_notification_callback)(
+                        enumerator,
+                        client_ptr,
+                    );
+                    if reg_hr >= 0 {
+                        WaitForSingleObject(ev_addr as *mut c_void, INFINITE);
+                        let _ = (vtbl.unregister_endpoint_notification_callback)(
+                            enumerator,
+                            client_ptr,
+                        );
+                    }
+                    audio_release(client_ptr);
+                    (vtbl.release)(enumerator);
+                } else {
+                    WaitForSingleObject(ev_addr as *mut c_void, INFINITE);
+                }
+                CloseHandle(ev_addr as *mut c_void);
+                if hr_init >= 0 {
+                    CoUninitialize();
+                }
+            });
+        ev_addr
     }
 
     #[link(name = "dwmapi")]
@@ -752,6 +1000,7 @@ mod imp {
     pub struct WinShell {
         app_hwnd: Hwnd,
         tray_hwnd: Arc<std::sync::atomic::AtomicUsize>,
+        audio_watch_stop_ev: usize,
         shared: Arc<SharedTrayState>,
         rx: Receiver<ShellEvent>,
         taskbar: *mut c_void,
@@ -845,6 +1094,8 @@ mod imp {
                     }
                 });
 
+            let audio_watch_stop_ev = spawn_audio_device_watcher(tx.clone(), wake.clone());
+
             // Taskbar button hook + COM ITaskbarList3 setup on UI thread
             let msg_name = wide_z("TaskbarButtonCreated");
             let tb_msg = unsafe { RegisterWindowMessageW(msg_name.as_ptr()) };
@@ -889,6 +1140,7 @@ mod imp {
             let mut shell = Self {
                 app_hwnd,
                 tray_hwnd,
+                audio_watch_stop_ev,
                 shared,
                 rx,
                 taskbar,
@@ -1090,6 +1342,11 @@ mod imp {
 
     impl Drop for WinShell {
         fn drop(&mut self) {
+            if self.audio_watch_stop_ev != 0 {
+                unsafe {
+                    SetEvent(self.audio_watch_stop_ev as *mut c_void);
+                }
+            }
             let hwnd_val = self.tray_hwnd.load(Ordering::Acquire);
             if hwnd_val != 0 {
                 unsafe {

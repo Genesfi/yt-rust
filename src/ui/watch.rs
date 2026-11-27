@@ -5,8 +5,12 @@ use egui::{
     ScrollArea, Sense, Stroke, Vec2, ViewportCommand, pos2, vec2,
 };
 
+use crate::audio_viz::NUM_BANDS;
 use crate::backend::Request;
-use crate::model::{LiveChatKind, LiveChatRun, SponsorCategory, VideoItem, WatchData};
+use crate::model::{
+    LiveChatKind, LiveChatRun, SpectrumTheme, SponsorCategory, VideoItem, WatchData,
+};
+use crate::mpv::{AMB_GRID_H, AMB_GRID_W, LiveAmbientSnapshot};
 use crate::theme::{self, icon};
 
 use super::cards::{
@@ -15,7 +19,6 @@ use super::cards::{
 };
 use super::{
     HudIcon, Page, PlayerMenu, PlayerSlot, RightTab, SleepTimer, YtApp, format_duration,
-    parse_sleep_timer_input,
 };
 
 impl YtApp {
@@ -32,25 +35,32 @@ impl YtApp {
         if wide {
             let total_w = ui.available_width();
             let right_w = (total_w * 0.29).clamp(300.0, 390.0);
-            let left_w = (total_w - right_w - 18.0).max(460.0);
+            let left_w = (total_w - right_w - 14.0).max(460.0);
             ui.horizontal_top(|ui| {
                 ui.allocate_ui_with_layout(
                     Vec2::new(left_w, ui.available_height()),
                     Layout::top_down(Align::LEFT),
                     |ui| {
+                        let mut st = egui::style::ScrollStyle::floating();
+                        st.bar_width = 5.0;
+                        st.bar_inner_margin = 2.0;
+                        st.bar_outer_margin = 1.0;
+                        ui.spacing_mut().scroll = st;
                         let mut sa = ScrollArea::vertical().id_salt("watch_left_scroll");
                         if self.scroll_watch_to_top {
                             sa = sa.vertical_scroll_offset(0.0);
                             self.scroll_watch_to_top = false;
                             self.watch_scrolled_into_pip = false;
                         }
+                        let content_w = (left_w - 14.0).max(420.0);
                         let mut last_video_h = 360.0_f32;
                         let scroll_out = sa.show(ui, |ui| {
+                            ui.set_max_width(content_w);
                             let video_h =
-                                (left_w * 9.0 / 16.0).min(ctx.content_rect().height() * 0.74);
+                                (content_w * 9.0 / 16.0).min(ctx.content_rect().height() * 0.74);
                             last_video_h = video_h;
                             if self.watch_scrolled_into_pip && self.watch.is_some() {
-                                if draw_pip_dock_placeholder(ui, Vec2::new(left_w, video_h)) {
+                                if draw_pip_dock_placeholder(ui, Vec2::new(content_w, video_h)) {
                                     self.watch_scrolled_into_pip = false;
                                     self.scroll_watch_to_top = true;
                                 }
@@ -58,7 +68,7 @@ impl YtApp {
                                 self.draw_video_surface(
                                     ui,
                                     ctx,
-                                    Vec2::new(left_w, video_h),
+                                    Vec2::new(content_w, video_h),
                                     false,
                                     false,
                                 );
@@ -82,7 +92,7 @@ impl YtApp {
                         }
                     },
                 );
-                ui.add_space(16.0);
+                ui.add_space(10.0);
                 ui.allocate_ui_with_layout(
                     Vec2::new(right_w, ui.available_height()),
                     Layout::top_down(Align::LEFT),
@@ -100,20 +110,21 @@ impl YtApp {
             }
             let mut last_video_h = 360.0_f32;
             let scroll_out = sa.show(ui, |ui| {
-                let w = ui.available_width();
+                let content_w = (ui.available_width() - 16.0).max(320.0);
+                ui.set_max_width(content_w);
                 let video_h = if self.theater_mode {
                     (ctx.content_rect().height() * 0.76).max(340.0)
                 } else {
-                    (w * 9.0 / 16.0).min(580.0)
+                    (content_w * 9.0 / 16.0).min(580.0)
                 };
                 last_video_h = video_h;
                 if self.watch_scrolled_into_pip && self.watch.is_some() {
-                    if draw_pip_dock_placeholder(ui, Vec2::new(w, video_h)) {
+                    if draw_pip_dock_placeholder(ui, Vec2::new(content_w, video_h)) {
                         self.watch_scrolled_into_pip = false;
                         self.scroll_watch_to_top = true;
                     }
                 } else {
-                    self.draw_video_surface(ui, ctx, Vec2::new(w, video_h), false, false);
+                    self.draw_video_surface(ui, ctx, Vec2::new(content_w, video_h), false, false);
                 }
                 ui.add_space(12.0);
                 self.draw_watch_metadata(ui);
@@ -831,23 +842,47 @@ impl YtApp {
             12.0
         };
         let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+        let use_video_ambilight = self.ambient_mode == crate::model::AmbientMode::VideoAmbilight
+            && self.ambient_glow
+            && !is_fullscreen
+            && !is_shorts
+            && !is_sliding_short
+            && !self.audio_only_mode
+            && self.watch.is_some();
+        if let Some(mpv) = &self.mpv {
+            mpv.set_ambient_capture(use_video_ambilight);
+        }
         if !is_fullscreen && self.ambient_glow && self.watch.is_some() && !is_sliding_short {
-            // Soft feathered multi-ring cinema bloom behind the active video surface
-            for step in (1..=6).rev() {
-                let frac = step as f32 / 6.0;
-                let expand = step as f32 * 6.5;
-                let glow_rect = rect.expand2(vec2(expand * 1.15, expand));
-                let a = ((1.0 - frac * 0.72) * 14.0).round() as u8;
-                let tint = if step % 2 == 0 {
-                    Color32::from_rgba_unmultiplied(88, 128, 220, a)
-                } else {
-                    Color32::from_rgba_unmultiplied(185, 78, 110, a)
-                };
-                ui.painter().rect_filled(glow_rect, radius + expand * 0.45, tint);
+            let live_snap = if use_video_ambilight {
+                self.mpv.as_ref().and_then(|m| m.live_ambient_snapshot())
+            } else {
+                None
+            };
+            if let Some(snap) = &live_snap {
+                paint_video_ambilight_glow(
+                    ui.painter(),
+                    ctx,
+                    rect,
+                    snap,
+                    self.ambient_opacity,
+                    self.playback.paused,
+                );
+            } else {
+                paint_smooth_ambient_glow(
+                    ui.painter(),
+                    ctx,
+                    rect,
+                    self.ambient_palette,
+                    self.ambient_prev_palette,
+                    self.ambient_changed_at,
+                    self.ambient_opacity,
+                    self.playback.paused,
+                );
             }
         }
         ui.painter().rect_filled(rect, radius, Color32::BLACK);
 
+        let mut audio_overlay_hit = false;
         if let Some(mpv) = &self.mpv {
             if is_shorts && (is_sliding_short || self.watch.is_none() || self.playback.video_h == 0)
             {
@@ -860,8 +895,133 @@ impl YtApp {
                     theme::paint_image_cover_rounded(ui, &thumb, rect, radius.round() as u8);
                 }
             }
-            if self.watch.is_some() && !is_sliding_short {
+            if self.watch.is_some() && !is_sliding_short && !self.audio_only_mode {
                 ui.painter().add(mpv.paint_callback_rounded(rect, radius, radius));
+            }
+            if !is_shorts && self.audio_only_mode {
+                if let Some(w) = self.watch.clone() {
+                    if !w.id.starts_with("local:") {
+                        let thumb_url = format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", w.id);
+                        theme::paint_image_cover_rounded(ui, &thumb_url, rect, radius.round() as u8);
+                    }
+                    ui.painter().rect_filled(
+                        rect,
+                        radius,
+                        Color32::from_rgba_unmultiplied(8, 10, 14, 184),
+                    );
+                    if self.audio_spectrum_enabled {
+                        let (bands, wave) = self.audio_spectrum.snapshot(self.playback.paused);
+                        if !self.playback.paused
+                            || bands.iter().any(|&b| b > 0.01)
+                            || wave.iter().any(|&v| v > 0.01)
+                        {
+                            ctx.request_repaint_after(Duration::from_millis(16));
+                        }
+                        paint_audio_spectrum(
+                            ui,
+                            ctx,
+                            rect,
+                            radius,
+                            &bands,
+                            &wave,
+                            self.audio_spectrum_theme,
+                            self.ambient_palette,
+                        );
+                    }
+                    // Compact floating top bar so center artwork + visualizer stay unobstructed
+                    let bar_rect = Rect::from_min_max(
+                        pos2(rect.left() + 12.0, rect.top() + 12.0),
+                        pos2((rect.right() - 12.0).max(rect.left() + 200.0), rect.top() + 44.0),
+                    );
+                    if ctx
+                        .input(|i| i.pointer.hover_pos())
+                        .is_some_and(|p| bar_rect.contains(p))
+                    {
+                        audio_overlay_hit = true;
+                    }
+                    let mut top_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(bar_rect)
+                            .layout(Layout::left_to_right(Align::Center)),
+                    );
+                    top_ui.set_clip_rect(top_ui.clip_rect().intersect(rect));
+                    let codec_lbl = if self.playback.audio_codec.is_empty() {
+                        "Audio Only".to_owned()
+                    } else {
+                        format!("Audio · {}", self.playback.audio_codec)
+                    };
+                    let info_pill = Frame::new()
+                        .fill(Color32::from_rgba_unmultiplied(16, 18, 24, 195))
+                        .stroke(Stroke::new(1.0, Color32::from_white_alpha(26)))
+                        .corner_radius(14)
+                        .inner_margin(Margin::symmetric(10, 5))
+                        .show(&mut top_ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                theme::draw_icon(ui, icon::HEADPHONES, 13.0, theme::YT_BLUE);
+                                ui.label(
+                                    RichText::new(codec_lbl)
+                                        .font(theme::semibold(11.5))
+                                        .color(Color32::WHITE),
+                                );
+                            });
+                        });
+                    if info_pill.response.hovered() {
+                        top_ui.ctx().set_cursor_icon(CursorIcon::Default);
+                    }
+
+                    top_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let restore_btn = ui.add_sized(
+                            vec2(92.0, 28.0),
+                            egui::Button::new(
+                                RichText::new("Video Mode")
+                                    .font(theme::semibold(11.0))
+                                    .color(Color32::from_rgb(15, 15, 15)),
+                            )
+                            .fill(Color32::from_rgb(241, 241, 241))
+                            .corner_radius(14),
+                        );
+                        if restore_btn.hovered() {
+                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                        }
+                        if restore_btn.clicked() {
+                            self.toggle_audio_only_mode();
+                            audio_overlay_hit = true;
+                        }
+                        if self.audio_spectrum_enabled
+                            && popover_pill_button(
+                                ui,
+                                vec2(96.0, 28.0),
+                                self.audio_spectrum_theme.label(),
+                                false,
+                                false,
+                            )
+                        {
+                            self.audio_spectrum_theme = self.audio_spectrum_theme.next();
+                            self.toast(format!(
+                                "Spectrum theme: {}",
+                                self.audio_spectrum_theme.label()
+                            ));
+                            audio_overlay_hit = true;
+                        }
+                        let spec_lbl = if self.audio_spectrum_enabled {
+                            "Wave: On"
+                        } else {
+                            "Wave: Off"
+                        };
+                        if popover_pill_button(
+                            ui,
+                            vec2(76.0, 28.0),
+                            spec_lbl,
+                            self.audio_spectrum_enabled,
+                            false,
+                        ) {
+                            self.audio_spectrum_enabled = !self.audio_spectrum_enabled;
+                            audio_overlay_hit = true;
+                        }
+                    });
+                }
             }
         } else if (self.watch_loading || crate::mpv::find_libmpv(&self.backend.data_dir).is_some())
             && self.mpv_error.is_none()
@@ -970,6 +1130,7 @@ impl YtApp {
 
         // Buffering spinner (stop showing once mpv enters idle/aborted state)
         let is_initial_wait = self.watch.is_some()
+            && !self.audio_only_mode
             && self.playback.video_h == 0
             && !self.playback.paused
             && !self.playback.idle;
@@ -1034,7 +1195,7 @@ impl YtApp {
         }
 
         // Overlaid bottom gradient + YouTube controls + Shorts bottom-left channel/title overlay
-        let mut clicked_overlay = false;
+        let mut clicked_overlay = audio_overlay_hit;
         let mut toggled_menu = false;
         if is_shorts {
             let base_scrim_h = 148.0_f32.min(rect.height() * 0.45);
@@ -1369,6 +1530,38 @@ impl YtApp {
                                 Stroke::new(2.0, Color32::from_black_alpha((200.0 * alpha) as u8)),
                             );
                         }
+                    }
+                }
+            }
+
+            // A-B Loop span & markers along seekbar
+            if !is_live && dur > 0.0 && (self.ab_loop_a.is_some() || self.ab_loop_b.is_some()) {
+                let loop_col = Color32::from_rgb(76, 217, 175).gamma_multiply(alpha);
+                if let (Some(a), Some(b)) = (self.ab_loop_a, self.ab_loop_b) {
+                    let x0 = track.left() + (a / dur).clamp(0.0, 1.0) as f32 * track.width();
+                    let x1 = track.left() + (b / dur).clamp(0.0, 1.0) as f32 * track.width();
+                    if x1 > x0 {
+                        cui.painter().rect_filled(
+                            Rect::from_min_max(pos2(x0, track.top()), pos2(x1, track.bottom())),
+                            h * 0.5,
+                            loop_col,
+                        );
+                    }
+                }
+                for (lbl, t_opt) in [("A", self.ab_loop_a), ("B", self.ab_loop_b)] {
+                    if let Some(t) = t_opt {
+                        let mx = track.left() + (t / dur).clamp(0.0, 1.0) as f32 * track.width();
+                        cui.painter().line_segment(
+                            [pos2(mx, track.top() - 4.0), pos2(mx, track.bottom() + 3.0)],
+                            Stroke::new(2.0, loop_col),
+                        );
+                        cui.painter().text(
+                            pos2(mx, track.top() - 10.0),
+                            Align2::CENTER_CENTER,
+                            lbl,
+                            theme::bold(9.5),
+                            loop_col,
+                        );
                     }
                 }
             }
@@ -1930,7 +2123,7 @@ impl YtApp {
                     theme::bold(8.5),
                     white,
                 );
-                if self.selected_caption_idx.is_some() {
+                if self.selected_caption_idx.is_some() || self.secondary_caption_idx.is_some() {
                     ui.painter().line_segment(
                         [
                             pos2(box_r.left() + 2.0, box_r.bottom() + 2.5),
@@ -2016,7 +2209,8 @@ impl YtApp {
             return false;
         }
         let mut interacted = false;
-        let menu_w = 282.0_f32.min((video_rect.width() - 24.0).max(210.0));
+        let menu_w = 352.0_f32.min((video_rect.width() - 24.0).max(260.0));
+        let max_pop_h = (video_rect.height() - 96.0).clamp(200.0, 560.0);
         let anchor_bottom_right = pos2(
             (video_rect.right() - 14.0).max(video_rect.left() + menu_w + 8.0),
             (video_rect.bottom() - 68.0).max(video_rect.top() + 80.0),
@@ -2057,34 +2251,35 @@ impl YtApp {
                                 });
                                 ui.add_space(6.0);
 
-                                // Playback speed pills
+                                // Playback speed pills: single symmetric 7-pill row
                                 ui.label(
                                     RichText::new("Playback speed")
                                         .font(theme::medium(11.5))
                                         .color(theme::TEXT_DIM),
                                 );
                                 ui.add_space(5.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing = vec2(5.0, 5.0);
-                                    for s in [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0] {
+                                let speeds = [0.5_f64, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+                                let gap = 4.0_f32;
+                                let pill_w = (inner_w - gap * (speeds.len() as f32 - 1.0))
+                                    / speeds.len() as f32;
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = gap;
+                                    for s in speeds {
                                         let active = (self.speed - s).abs() < 0.01;
-                                        let btn = egui::Button::new(
-                                            RichText::new(format!("{s}x"))
-                                                .font(theme::medium(11.5))
-                                                .color(if active {
-                                                    Color32::from_rgb(15, 15, 15)
-                                                } else {
-                                                    theme::TEXT
-                                                }),
-                                        )
-                                        .min_size(vec2(38.0, 26.0))
-                                        .fill(if active {
-                                            Color32::from_rgb(241, 241, 241)
+                                        let label = if (s - 1.0).abs() < 0.01 {
+                                            "1x".to_owned()
+                                        } else if (s - 2.0).abs() < 0.01 {
+                                            "2x".to_owned()
                                         } else {
-                                            theme::CHIP
-                                        })
-                                        .corner_radius(7);
-                                        if ui.add(btn).clicked() {
+                                            format!("{s}x")
+                                        };
+                                        if popover_pill_button(
+                                            ui,
+                                            vec2(pill_w, 26.0),
+                                            &label,
+                                            active,
+                                            false,
+                                        ) {
                                             self.speed = s;
                                             if let Some(mpv) = &self.mpv {
                                                 mpv.set_speed(s);
@@ -2111,7 +2306,7 @@ impl YtApp {
                                         ui.add_space(4.0);
                                         ScrollArea::vertical()
                                             .id_salt("popover_quality_scroll")
-                                            .max_height(145.0)
+                                            .max_height(136.0)
                                             .show(ui, |ui| {
                                                 if w.hls_url.is_some()
                                                     && popover_option_row(
@@ -2166,34 +2361,160 @@ impl YtApp {
 
                                 ui.add_space(6.0);
                                 ui.separator();
+                                ui.add_space(5.0);
+                                ui.label(
+                                    RichText::new("Audio & Equalizer")
+                                        .font(theme::medium(11.5))
+                                        .color(theme::TEXT_DIM),
+                                );
                                 ui.add_space(4.0);
-                                let sleep_row_label = match self.sleep_timer_remaining_label() {
-                                    Some(rem) => format!("Sleep timer · {rem}"),
-                                    None => "Sleep timer · Off".to_owned(),
-                                };
-                                if popover_option_row(
+                                if popover_toggle_row(
                                     ui,
-                                    &sleep_row_label,
-                                    self.sleep_timer != SleepTimer::Off,
+                                    "Audio-only mode (low bandwidth)",
+                                    self.audio_only_mode,
                                 ) {
-                                    self.player_menu = PlayerMenu::SleepTimer;
+                                    self.toggle_audio_only_mode();
                                     interacted = true;
                                 }
-                                if popover_option_row(
+                                if popover_toggle_row(
                                     ui,
-                                    "Ambient cinema glow",
+                                    "Loudness normalization",
+                                    self.loudnorm_enabled,
+                                ) {
+                                    self.loudnorm_enabled = !self.loudnorm_enabled;
+                                    self.apply_audio_filters_all();
+                                    self.toast(if self.loudnorm_enabled {
+                                        "Loudness normalization: On"
+                                    } else {
+                                        "Loudness normalization: Off"
+                                    });
+                                    interacted = true;
+                                }
+                                ui.add_space(5.0);
+                                let eq_gap = 6.0_f32;
+                                let eq_w = (inner_w - eq_gap) * 0.5;
+                                for row in crate::model::EqPreset::ALL.chunks(2) {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = eq_gap;
+                                        for &preset in row {
+                                            let active = self.eq_preset == preset;
+                                            if popover_pill_button(
+                                                ui,
+                                                vec2(eq_w, 27.0),
+                                                preset.label(),
+                                                active,
+                                                false,
+                                            ) {
+                                                self.eq_preset = preset;
+                                                self.apply_audio_filters_all();
+                                                self.toast(format!("Equalizer: {}", preset.label()));
+                                                interacted = true;
+                                            }
+                                        }
+                                    });
+                                    ui.add_space(4.0);
+                                }
+
+                                ui.add_space(3.0);
+                                ui.separator();
+                                ui.add_space(5.0);
+                                let ab_desc = match (self.ab_loop_a, self.ab_loop_b) {
+                                    (Some(a), Some(b)) => format!(
+                                        "A-B Loop ({} -> {})",
+                                        format_duration(a),
+                                        format_duration(b)
+                                    ),
+                                    (Some(a), None) => format!("A-B Loop (A: {})", format_duration(a)),
+                                    _ => format!("A-B Loop & Frame Step ({})", self.shortcuts.ab_loop.display()),
+                                };
+                                ui.label(
+                                    RichText::new(ab_desc)
+                                        .font(theme::medium(11.5))
+                                        .color(theme::TEXT_DIM),
+                                );
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 5.0;
+                                    if popover_pill_button(ui, vec2(56.0, 26.0), "Set A", false, false)
+                                    {
+                                        self.set_ab_loop_a(self.playback.time_pos);
+                                        interacted = true;
+                                    }
+                                    if popover_pill_button(ui, vec2(56.0, 26.0), "Set B", false, false)
+                                    {
+                                        self.set_ab_loop_b(self.playback.time_pos);
+                                        interacted = true;
+                                    }
+                                    if (self.ab_loop_a.is_some() || self.ab_loop_b.is_some())
+                                        && popover_pill_button(
+                                            ui,
+                                            vec2(48.0, 26.0),
+                                            "Clear",
+                                            false,
+                                            true,
+                                        )
+                                    {
+                                        self.clear_ab_loop();
+                                        interacted = true;
+                                    }
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if ui
+                                            .add_sized(
+                                                vec2(38.0, 26.0),
+                                                egui::Button::new(RichText::new("+1f").font(theme::medium(11.0)))
+                                                    .fill(theme::CHIP)
+                                                    .corner_radius(7),
+                                            )
+                                            .on_hover_text(format!(
+                                                "Next frame ({})",
+                                                self.shortcuts.frame_forward.display()
+                                            ))
+                                            .clicked()
+                                        {
+                                            if let Some(m) = &self.mpv {
+                                                m.frame_step();
+                                                self.trigger_hud(HudIcon::SeekForward, "+1 frame");
+                                            }
+                                            interacted = true;
+                                        }
+                                        if ui
+                                            .add_sized(
+                                                vec2(38.0, 26.0),
+                                                egui::Button::new(RichText::new("-1f").font(theme::medium(11.0)))
+                                                    .fill(theme::CHIP)
+                                                    .corner_radius(7),
+                                            )
+                                            .on_hover_text(format!(
+                                                "Previous frame ({})",
+                                                self.shortcuts.frame_back.display()
+                                            ))
+                                            .clicked()
+                                        {
+                                            if let Some(m) = &self.mpv {
+                                                m.frame_back_step();
+                                                self.trigger_hud(HudIcon::SeekBack, "-1 frame");
+                                            }
+                                            interacted = true;
+                                        }
+                                    });
+                                });
+
+                                ui.add_space(6.0);
+                                ui.separator();
+                                ui.add_space(4.0);
+                                if popover_toggle_row(
+                                    ui,
+                                    "Ambient light behind player",
                                     self.ambient_glow,
                                 ) {
                                     self.ambient_glow = !self.ambient_glow;
                                     interacted = true;
                                 }
-                                let stats_label = format!(
-                                    "Stats for Nerds ({})",
-                                    self.shortcuts.stats_for_nerds.display()
-                                );
-                                if popover_option_row(
+                                let stats_key = self.shortcuts.stats_for_nerds.display();
+                                if popover_nav_row(
                                     ui,
-                                    &stats_label,
+                                    "Stats for Nerds",
+                                    &stats_key,
                                     self.show_stats_for_nerds,
                                 ) {
                                     self.show_stats_for_nerds = !self.show_stats_for_nerds;
@@ -2204,7 +2525,7 @@ impl YtApp {
                             PlayerMenu::Captions => {
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        RichText::new("Subtitles / CC")
+                                        RichText::new("Dual Subtitles / Auto-Translate")
                                             .font(theme::semibold(13.5))
                                             .color(Color32::WHITE),
                                     );
@@ -2215,18 +2536,26 @@ impl YtApp {
                                     });
                                 });
                                 ui.add_space(6.0);
-                                let mut picked_cap: Option<Option<usize>> = None;
-                                if let Some(w) = &self.watch {
-                                    ScrollArea::vertical()
-                                        .id_salt("popover_cc_scroll")
-                                        .max_height(190.0)
-                                        .show(ui, |ui| {
+                                ScrollArea::vertical()
+                                    .id_salt("popover_cc_scroll_outer")
+                                    .max_height(max_pop_h)
+                                    .show(ui, |ui| {
+                                        let mut subs_changed = false;
+                                        if let Some(w) = self.watch.clone() {
+                                            ui.label(
+                                                RichText::new("Primary subtitle (bottom)")
+                                                    .font(theme::medium(11.5))
+                                                    .color(theme::TEXT_DIM),
+                                            );
+                                            ui.add_space(3.0);
                                             if popover_option_row(
                                                 ui,
                                                 "Off",
                                                 self.selected_caption_idx.is_none(),
                                             ) {
-                                                picked_cap = Some(None);
+                                                self.selected_caption_idx = None;
+                                                subs_changed = true;
+                                                interacted = true;
                                             }
                                             for (i, c) in w.captions.iter().enumerate() {
                                                 let suffix = if c.is_auto { " (auto)" } else { "" };
@@ -2240,63 +2569,197 @@ impl YtApp {
                                                     &format!("{}{lang}{suffix}", c.name),
                                                     self.selected_caption_idx == Some(i),
                                                 ) {
-                                                    picked_cap = Some(Some(i));
+                                                    self.selected_caption_idx = Some(i);
+                                                    subs_changed = true;
+                                                    interacted = true;
+                                                }
+                                            }
+
+                                            if self.selected_caption_idx.is_some() {
+                                                ui.add_space(4.0);
+                                                ui.label(
+                                                    RichText::new("Primary auto-translate (tlang=)")
+                                                        .font(theme::medium(11.0))
+                                                        .color(theme::TEXT_DIM),
+                                                );
+                                                ui.add_space(3.0);
+                                                let langs = build_tlang_options(&w.translation_languages);
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                                                    let orig_active = self.selected_caption_tlang.is_none();
+                                                    if tlang_chip(ui, "Original", orig_active) {
+                                                        self.selected_caption_tlang = None;
+                                                        subs_changed = true;
+                                                        interacted = true;
+                                                    }
+                                                    for (code, label) in &langs {
+                                                        let act = self.selected_caption_tlang.as_deref()
+                                                            == Some(code.as_str());
+                                                        if tlang_chip(ui, label, act) {
+                                                            self.selected_caption_tlang = Some(code.clone());
+                                                            subs_changed = true;
+                                                            interacted = true;
+                                                        }
+                                                    }
+                                                });
+                                            }
+
+                                            ui.add_space(8.0);
+                                            ui.separator();
+                                            ui.add_space(6.0);
+                                            ui.label(
+                                                RichText::new("Secondary subtitle (top / dual)")
+                                                    .font(theme::medium(11.5))
+                                                    .color(theme::TEXT_DIM),
+                                            );
+                                            ui.add_space(3.0);
+                                            if popover_option_row(
+                                                ui,
+                                                "Off",
+                                                self.secondary_caption_idx.is_none(),
+                                            ) {
+                                                self.secondary_caption_idx = None;
+                                                subs_changed = true;
+                                                interacted = true;
+                                            }
+                                            for (i, c) in w.captions.iter().enumerate() {
+                                                let suffix = if c.is_auto { " (auto)" } else { "" };
+                                                let lang = if c.language_code.is_empty() {
+                                                    String::new()
+                                                } else {
+                                                    format!(" [{}]", c.language_code.to_uppercase())
+                                                };
+                                                if popover_option_row(
+                                                    ui,
+                                                    &format!("{}{lang}{suffix}", c.name),
+                                                    self.secondary_caption_idx == Some(i),
+                                                ) {
+                                                    self.secondary_caption_idx = Some(i);
+                                                    subs_changed = true;
+                                                    interacted = true;
+                                                }
+                                            }
+                                            if self.secondary_caption_idx.is_some() {
+                                                ui.add_space(4.0);
+                                                ui.label(
+                                                    RichText::new("Secondary auto-translate (tlang=)")
+                                                        .font(theme::medium(11.0))
+                                                        .color(theme::TEXT_DIM),
+                                                );
+                                                ui.add_space(3.0);
+                                                let langs = build_tlang_options(&w.translation_languages);
+                                                ui.horizontal_wrapped(|ui| {
+                                                    ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                                                    let orig_active = self.secondary_caption_tlang.is_none();
+                                                    if tlang_chip(ui, "Original", orig_active) {
+                                                        self.secondary_caption_tlang = None;
+                                                        subs_changed = true;
+                                                        interacted = true;
+                                                    }
+                                                    for (code, label) in &langs {
+                                                        let act = self.secondary_caption_tlang.as_deref()
+                                                            == Some(code.as_str());
+                                                        if tlang_chip(ui, label, act) {
+                                                            self.secondary_caption_tlang = Some(code.clone());
+                                                            subs_changed = true;
+                                                            interacted = true;
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        }
+                                        if subs_changed {
+                                            self.apply_active_subtitles();
+                                        }
+
+                                        ui.add_space(8.0);
+                                        ui.separator();
+                                        ui.add_space(4.0);
+                                        let mut style_changed = false;
+                                        ui.label(
+                                            RichText::new(format!("Primary size ({}px)", self.sub_font_size))
+                                                .font(theme::medium(11.5))
+                                                .color(theme::TEXT_DIM),
+                                        );
+                                        if ui
+                                            .add(
+                                                egui::Slider::new(&mut self.sub_font_size, 24..=80)
+                                                    .show_value(false),
+                                            )
+                                            .changed()
+                                        {
+                                            style_changed = true;
+                                            interacted = true;
+                                        }
+                                        let mut pct = (self.sub_bg_opacity * 100.0).round() as u32;
+                                        ui.label(
+                                            RichText::new(format!("Primary backdrop ({pct}%)"))
+                                                .font(theme::medium(11.5))
+                                                .color(theme::TEXT_DIM),
+                                        );
+                                        if ui
+                                            .add(egui::Slider::new(&mut pct, 0..=100).show_value(false))
+                                            .changed()
+                                        {
+                                            self.sub_bg_opacity = pct as f32 / 100.0;
+                                            style_changed = true;
+                                            interacted = true;
+                                        }
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                                            for col in crate::model::SubtitleColorPreset::ALL {
+                                                if tlang_chip(ui, col.label(), self.sub_color == col) {
+                                                    self.sub_color = col;
+                                                    style_changed = true;
+                                                    interacted = true;
                                                 }
                                             }
                                         });
-                                    if let Some(choice) = picked_cap {
-                                        self.selected_caption_idx = choice;
-                                        let url = choice
-                                            .and_then(|i| w.captions.get(i))
-                                            .map(|c| c.vtt_url.as_str());
-                                        if let Some(mpv) = &self.mpv {
-                                            mpv.set_subtitle(url);
-                                        }
-                                        self.player_menu = PlayerMenu::None;
-                                        interacted = true;
-                                    }
-                                }
-                                ui.add_space(6.0);
-                                ui.separator();
-                                ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new(format!("Caption size ({}px)", self.sub_font_size))
-                                        .font(theme::medium(11.5))
-                                        .color(theme::TEXT_DIM),
-                                );
-                                let mut style_changed = false;
-                                if ui
-                                    .add(
-                                        egui::Slider::new(&mut self.sub_font_size, 24..=80)
-                                            .show_value(false),
-                                    )
-                                    .changed()
-                                {
-                                    style_changed = true;
-                                    interacted = true;
-                                }
-                                let mut pct = (self.sub_bg_opacity * 100.0).round() as u32;
-                                ui.label(
-                                    RichText::new(format!("Background opacity ({pct}%)"))
-                                        .font(theme::medium(11.5))
-                                        .color(theme::TEXT_DIM),
-                                );
-                                if ui
-                                    .add(egui::Slider::new(&mut pct, 0..=100).show_value(false))
-                                    .changed()
-                                {
-                                    self.sub_bg_opacity = pct as f32 / 100.0;
-                                    style_changed = true;
-                                    interacted = true;
-                                }
-                                if style_changed {
-                                    if let Some(mpv) = &self.mpv {
-                                        mpv.set_subtitle_style(
-                                            self.sub_font_size,
-                                            self.sub_bg_opacity,
+
+                                        ui.add_space(6.0);
+                                        ui.label(
+                                            RichText::new(format!("Secondary size ({}px)", self.sec_sub_font_size))
+                                                .font(theme::medium(11.5))
+                                                .color(theme::TEXT_DIM),
                                         );
-                                    }
-                                }
+                                        if ui
+                                            .add(
+                                                egui::Slider::new(&mut self.sec_sub_font_size, 20..=72)
+                                                    .show_value(false),
+                                            )
+                                            .changed()
+                                        {
+                                            style_changed = true;
+                                            interacted = true;
+                                        }
+                                        let mut sec_pct = (self.sec_sub_bg_opacity * 100.0).round() as u32;
+                                        ui.label(
+                                            RichText::new(format!("Secondary backdrop ({sec_pct}%)"))
+                                                .font(theme::medium(11.5))
+                                                .color(theme::TEXT_DIM),
+                                        );
+                                        if ui
+                                            .add(egui::Slider::new(&mut sec_pct, 0..=100).show_value(false))
+                                            .changed()
+                                        {
+                                            self.sec_sub_bg_opacity = sec_pct as f32 / 100.0;
+                                            style_changed = true;
+                                            interacted = true;
+                                        }
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                                            for col in crate::model::SubtitleColorPreset::ALL {
+                                                if tlang_chip(ui, col.label(), self.sec_sub_color == col) {
+                                                    self.sec_sub_color = col;
+                                                    style_changed = true;
+                                                    interacted = true;
+                                                }
+                                            }
+                                        });
+                                        if style_changed {
+                                            self.apply_subtitle_style_all();
+                                        }
+                                    });
                             }
                             PlayerMenu::SleepTimer => {
                                 ui.horizontal(|ui| {
@@ -2307,6 +2770,7 @@ impl YtApp {
                                     );
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                         if popover_close_btn(ui) {
+                                            self.sleep_editing_seg = None;
                                             self.player_menu = PlayerMenu::None;
                                         }
                                     });
@@ -2314,22 +2778,39 @@ impl YtApp {
                                 if let Some(rem) = self.sleep_timer_remaining_label() {
                                     ui.add_space(6.0);
                                     Frame::new()
-                                        .fill(Color32::from_rgba_unmultiplied(62, 166, 255, 28))
-                                        .stroke(Stroke::new(1.0, theme::YT_BLUE.gamma_multiply(0.5)))
+                                        .fill(Color32::from_rgba_unmultiplied(62, 166, 255, 24))
+                                        .stroke(Stroke::new(1.0, theme::YT_BLUE.gamma_multiply(0.45)))
                                         .corner_radius(8)
-                                        .inner_margin(Margin::symmetric(8, 6))
+                                        .inner_margin(Margin::symmetric(10, 6))
                                         .show(ui, |ui| {
                                             ui.horizontal(|ui| {
+                                                let fade_tag = if self.sleep_fade_active {
+                                                    " (fading)"
+                                                } else {
+                                                    ""
+                                                };
                                                 ui.label(
-                                                    RichText::new(format!("Active: {rem}"))
+                                                    RichText::new(format!("Active · {rem}{fade_tag}"))
                                                         .font(theme::medium(12.0))
                                                         .color(theme::YT_BLUE),
                                                 );
                                                 ui.with_layout(
                                                     Layout::right_to_left(Align::Center),
                                                     |ui| {
-                                                        if ui.small_button("Turn off").clicked() {
+                                                        if ui
+                                                            .add(
+                                                                egui::Button::new(
+                                                                    RichText::new("Turn off")
+                                                                        .font(theme::medium(11.0))
+                                                                        .color(Color32::WHITE),
+                                                                )
+                                                                .fill(Color32::from_white_alpha(26))
+                                                                .corner_radius(6),
+                                                            )
+                                                            .clicked()
+                                                        {
                                                             self.sleep_timer = SleepTimer::Off;
+                                                            self.restore_sleep_volume();
                                                             self.toast("Sleep timer turned off");
                                                             interacted = true;
                                                         }
@@ -2338,114 +2819,325 @@ impl YtApp {
                                             });
                                         });
                                 }
-                                ui.add_space(6.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing = vec2(5.0, 5.0);
-                                    let presets: [(&str, Option<u64>); 7] = [
-                                        ("Off", None),
-                                        ("10 min", Some(10)),
-                                        ("15 min", Some(15)),
-                                        ("20 min", Some(20)),
-                                        ("30 min", Some(30)),
-                                        ("45 min", Some(45)),
-                                        ("60 min", Some(60)),
-                                    ];
-                                    for (lbl, mins_opt) in presets {
-                                        let active = match (mins_opt, &self.sleep_timer) {
-                                            (None, SleepTimer::Off) => true,
-                                            _ => false,
-                                        };
-                                        let btn = egui::Button::new(
-                                            RichText::new(lbl)
-                                                .font(theme::medium(11.5))
-                                                .color(if active {
-                                                    Color32::from_rgb(15, 15, 15)
-                                                } else {
-                                                    theme::TEXT
-                                                }),
-                                        )
-                                        .min_size(vec2(54.0, 26.0))
-                                        .fill(if active {
-                                            Color32::from_rgb(241, 241, 241)
-                                        } else {
-                                            theme::CHIP
-                                        })
-                                        .corner_radius(7);
-                                        if ui.add(btn).clicked() {
-                                            if let Some(m) = mins_opt {
-                                                self.sleep_timer = SleepTimer::Until(
-                                                    Instant::now() + Duration::from_secs(m * 60),
-                                                );
-                                                self.toast(format!("Sleep timer: {m} min"));
-                                            } else {
-                                                self.sleep_timer = SleepTimer::Off;
-                                                self.toast("Sleep timer turned off");
+
+                                ui.add_space(8.0);
+                                let preset_gap = 6.0_f32;
+                                let preset_w = (inner_w - preset_gap * 3.0) / 4.0;
+                                // 0 = Off, >0 = minutes, -1 = End of video
+                                let rows: [[(&str, i32); 4]; 2] = [
+                                    [("Off", 0), ("10 min", 10), ("15 min", 15), ("20 min", 20)],
+                                    [("30 min", 30), ("45 min", 45), ("60 min", 60), ("End of video", -1)],
+                                ];
+                                for row in rows {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = preset_gap;
+                                        for (lbl, mins) in row {
+                                            let active = match mins {
+                                                0 => self.sleep_timer == SleepTimer::Off,
+                                                -1 => self.sleep_timer == SleepTimer::EndOfVideo,
+                                                _ => false,
+                                            };
+                                            if popover_pill_button(
+                                                ui,
+                                                vec2(preset_w, 27.0),
+                                                lbl,
+                                                active,
+                                                false,
+                                            ) {
+                                                self.sleep_editing_seg = None;
+                                                self.restore_sleep_volume();
+                                                match mins {
+                                                    0 => {
+                                                        self.sleep_timer = SleepTimer::Off;
+                                                        self.toast("Sleep timer turned off");
+                                                    }
+                                                    -1 => {
+                                                        self.sleep_timer = SleepTimer::EndOfVideo;
+                                                        self.toast("Sleep timer: End of video");
+                                                    }
+                                                    m => {
+                                                        let m_u = m as u32;
+                                                        self.sleep_pick_h = m_u / 60;
+                                                        self.sleep_pick_m = m_u % 60;
+                                                        self.sleep_pick_s = 0;
+                                                        self.sleep_timer = SleepTimer::Until(
+                                                            Instant::now()
+                                                                + Duration::from_secs(m as u64 * 60),
+                                                        );
+                                                        self.toast(format!("Sleep timer: {m} min"));
+                                                    }
+                                                }
+                                                self.player_menu = PlayerMenu::None;
+                                                interacted = true;
                                             }
-                                            self.player_menu = PlayerMenu::None;
+                                        }
+                                    });
+                                    ui.add_space(5.0);
+                                }
+
+                                ui.add_space(2.0);
+                                ui.separator();
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("Custom timer")
+                                            .font(theme::medium(11.5))
+                                            .color(theme::TEXT_DIM),
+                                    );
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.label(
+                                            RichText::new("Scroll, drag, or click to type")
+                                                .font(theme::regular(10.5))
+                                                .color(theme::TEXT_DIM.gamma_multiply(0.8)),
+                                        );
+                                    });
+                                });
+                                ui.add_space(6.0);
+
+                                let seg_specs: [(&str, u32); 3] = [("hr", 23), ("min", 59), ("sec", 59)];
+                                let mut seg_vals =
+                                    [self.sleep_pick_h, self.sleep_pick_m, self.sleep_pick_s];
+                                let mut nav_move: i32 = 0;
+                                let mut confirm_enter = false;
+                                if let Some(active_seg) = self.sleep_editing_seg {
+                                    ctx.input(|i| {
+                                        for ev in &i.events {
+                                            if let egui::Event::Text(txt) = ev {
+                                                for ch in txt.chars() {
+                                                    if ch.is_ascii_digit() {
+                                                        self.sleep_seg_buf.push(ch);
+                                                        if self.sleep_seg_buf.len() > 2 {
+                                                            let start = self.sleep_seg_buf.len() - 2;
+                                                            self.sleep_seg_buf =
+                                                                self.sleep_seg_buf[start..].to_owned();
+                                                        }
+                                                        if let Ok(v) = self.sleep_seg_buf.parse::<u32>() {
+                                                            seg_vals[active_seg as usize] =
+                                                                v.min(seg_specs[active_seg as usize].1);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if i.key_pressed(egui::Key::Backspace) {
+                                            self.sleep_seg_buf.pop();
+                                            seg_vals[active_seg as usize] =
+                                                self.sleep_seg_buf.parse::<u32>().unwrap_or(0);
+                                        }
+                                        if i.key_pressed(egui::Key::ArrowUp) {
+                                            let max_v = seg_specs[active_seg as usize].1;
+                                            seg_vals[active_seg as usize] =
+                                                step_timer_segment(seg_vals[active_seg as usize], 1, max_v);
+                                        }
+                                        if i.key_pressed(egui::Key::ArrowDown) {
+                                            let max_v = seg_specs[active_seg as usize].1;
+                                            seg_vals[active_seg as usize] =
+                                                step_timer_segment(seg_vals[active_seg as usize], -1, max_v);
+                                        }
+                                        if i.key_pressed(egui::Key::Tab)
+                                            || i.key_pressed(egui::Key::ArrowRight)
+                                        {
+                                            nav_move = 1;
+                                        } else if i.key_pressed(egui::Key::ArrowLeft) {
+                                            nav_move = -1;
+                                        }
+                                        if i.key_pressed(egui::Key::Enter) {
+                                            confirm_enter = true;
+                                        } else if i.key_pressed(egui::Key::Escape) {
+                                            self.sleep_editing_seg = None;
+                                        }
+                                    });
+                                    if nav_move != 0 {
+                                        let next = (active_seg as i32 + nav_move).rem_euclid(3) as u8;
+                                        self.sleep_editing_seg = Some(next);
+                                        self.sleep_seg_buf.clear();
+                                    }
+                                    if confirm_enter {
+                                        self.sleep_editing_seg = None;
+                                        self.sleep_seg_buf.clear();
+                                    }
+                                }
+
+                                // Draw HH : MM : SS columns centered symmetrically across full inner_w
+                                let seg_box_w = 64.0_f32;
+                                let colon_w = 22.0_f32;
+                                let group_w = seg_box_w * 3.0 + colon_w * 2.0;
+                                let side_pad = ((inner_w - group_w) * 0.5).floor().max(0.0);
+
+                                // Up chevron row
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    ui.add_space(side_pad);
+                                    for idx in 0..3 {
+                                        if idx > 0 {
+                                            ui.add_space(colon_w);
+                                        }
+                                        if timer_arrow_button(ui, ("sleep_up", idx), seg_box_w, true) {
+                                            self.sleep_editing_seg = None;
+                                            seg_vals[idx] =
+                                                step_timer_segment(seg_vals[idx], 1, seg_specs[idx].1);
                                             interacted = true;
                                         }
                                     }
+                                    ui.add_space(side_pad);
                                 });
                                 ui.add_space(4.0);
-                                if popover_option_row(
-                                    ui,
-                                    "End of video",
-                                    self.sleep_timer == SleepTimer::EndOfVideo,
-                                ) {
-                                    self.sleep_timer = SleepTimer::EndOfVideo;
+
+                                // Framed digit readout with pill-drag + scroll + click-to-type
+                                Frame::new()
+                                    .fill(Color32::from_rgb(32, 32, 37))
+                                    .stroke(Stroke::new(1.0, Color32::from_white_alpha(24)))
+                                    .corner_radius(10)
+                                    .inner_margin(Margin::symmetric(0, 6))
+                                    .show(ui, |ui| {
+                                        ui.allocate_ui_with_layout(
+                                            vec2(inner_w, 46.0),
+                                            Layout::left_to_right(Align::Center),
+                                            |ui| {
+                                                ui.spacing_mut().item_spacing.x = 0.0;
+                                                ui.add_space(side_pad);
+                                                for idx in 0..3 {
+                                                    if idx > 0 {
+                                                        let (crect, _) = ui.allocate_exact_size(
+                                                            vec2(colon_w, 46.0),
+                                                            Sense::hover(),
+                                                        );
+                                                        ui.painter().text(
+                                                            crect.center() - vec2(0.0, 2.0),
+                                                            Align2::CENTER_CENTER,
+                                                            ":",
+                                                            egui::FontId::proportional(24.0),
+                                                            theme::TEXT_DIM,
+                                                        );
+                                                    }
+                                                    let changed = draw_timer_segment_box(
+                                                        ui,
+                                                        ctx,
+                                                        idx as u8,
+                                                        seg_box_w,
+                                                        &mut seg_vals[idx],
+                                                        seg_specs[idx].1,
+                                                        &mut self.sleep_editing_seg,
+                                                        &mut self.sleep_seg_buf,
+                                                    );
+                                                    if changed {
+                                                        interacted = true;
+                                                    }
+                                                }
+                                                ui.add_space(side_pad);
+                                            },
+                                        );
+                                    });
+
+                                ui.add_space(4.0);
+                                // Down chevron row
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    ui.add_space(side_pad);
+                                    for idx in 0..3 {
+                                        if idx > 0 {
+                                            ui.add_space(colon_w);
+                                        }
+                                        if timer_arrow_button(ui, ("sleep_dn", idx), seg_box_w, false) {
+                                            self.sleep_editing_seg = None;
+                                            seg_vals[idx] =
+                                                step_timer_segment(seg_vals[idx], -1, seg_specs[idx].1);
+                                            interacted = true;
+                                        }
+                                    }
+                                    ui.add_space(side_pad);
+                                });
+                                // Subtle unit labels (hr / min / sec)
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    ui.add_space(side_pad);
+                                    for (idx, (unit, _)) in seg_specs.iter().enumerate() {
+                                        if idx > 0 {
+                                            ui.add_space(colon_w);
+                                        }
+                                        let (lrect, _) =
+                                            ui.allocate_exact_size(vec2(seg_box_w, 14.0), Sense::hover());
+                                        ui.painter().text(
+                                            lrect.center(),
+                                            Align2::CENTER_CENTER,
+                                            *unit,
+                                            theme::regular(10.5),
+                                            theme::TEXT_DIM.gamma_multiply(0.75),
+                                        );
+                                    }
+                                    ui.add_space(side_pad);
+                                });
+
+                                self.sleep_pick_h = seg_vals[0];
+                                self.sleep_pick_m = seg_vals[1];
+                                self.sleep_pick_s = seg_vals[2];
+
+                                ui.add_space(8.0);
+                                let total_secs = segments_to_secs(
+                                    self.sleep_pick_h,
+                                    self.sleep_pick_m,
+                                    self.sleep_pick_s,
+                                );
+                                let start_label = if total_secs == 0 {
+                                    "Set a duration above".to_owned()
+                                } else {
+                                    format!("Start timer · {}", format_duration(total_secs as f64))
+                                };
+                                let (btn_rect, btn_resp) = ui.allocate_exact_size(
+                                    vec2(inner_w, 34.0),
+                                    if total_secs > 0 {
+                                        Sense::click()
+                                    } else {
+                                        Sense::hover()
+                                    },
+                                );
+                                if total_secs > 0 && btn_resp.hovered() {
+                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                }
+                                let btn_fill = if total_secs == 0 {
+                                    theme::CHIP
+                                } else if btn_resp.hovered() {
+                                    Color32::from_rgb(92, 182, 255)
+                                } else {
+                                    theme::YT_BLUE
+                                };
+                                ui.painter().rect_filled(btn_rect, 8.0, btn_fill);
+                                ui.painter().text(
+                                    btn_rect.center(),
+                                    Align2::CENTER_CENTER,
+                                    &start_label,
+                                    theme::semibold(12.5),
+                                    if total_secs > 0 {
+                                        Color32::from_rgb(15, 15, 15)
+                                    } else {
+                                        theme::TEXT_DIM
+                                    },
+                                );
+                                if btn_resp.clicked() && total_secs > 0 {
+                                    self.sleep_editing_seg = None;
+                                    self.restore_sleep_volume();
+                                    self.sleep_timer = SleepTimer::Until(
+                                        Instant::now() + Duration::from_secs(total_secs),
+                                    );
                                     self.player_menu = PlayerMenu::None;
-                                    self.toast("Sleep timer: End of video");
+                                    self.toast(format!(
+                                        "Sleep timer set for {}",
+                                        format_duration(total_secs as f64)
+                                    ));
                                     interacted = true;
                                 }
+
                                 ui.add_space(6.0);
                                 ui.separator();
-                                ui.add_space(6.0);
-                                ui.label(
-                                    RichText::new("Custom timer (e.g. 2h, 1:30, 90, 2 jam)")
-                                        .font(theme::medium(11.5))
-                                        .color(theme::TEXT_DIM),
-                                );
                                 ui.add_space(4.0);
-                                let mut submit_custom = false;
-                                ui.horizontal(|ui| {
-                                    let edit = ui.add_sized(
-                                        [172.0, 28.0],
-                                        egui::TextEdit::singleline(&mut self.sleep_timer_input)
-                                            .hint_text("2h / 90m / 1:30"),
-                                    );
-                                    if edit.has_focus()
-                                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                                    {
-                                        submit_custom = true;
-                                    }
-                                    if ui
-                                        .add_sized(
-                                            [68.0, 28.0],
-                                            egui::Button::new(
-                                                RichText::new("Set")
-                                                    .font(theme::semibold(12.0))
-                                                    .color(Color32::from_rgb(15, 15, 15)),
-                                            )
-                                            .fill(theme::YT_BLUE)
-                                            .corner_radius(7),
-                                        )
-                                        .clicked()
-                                    {
-                                        submit_custom = true;
-                                    }
-                                });
-                                if submit_custom {
-                                    if let Some(dur) = parse_sleep_timer_input(&self.sleep_timer_input)
-                                    {
-                                        self.sleep_timer =
-                                            SleepTimer::Until(Instant::now() + dur);
-                                        self.player_menu = PlayerMenu::None;
-                                        self.toast(format!(
-                                            "Sleep timer set for {}",
-                                            format_duration(dur.as_secs_f64())
-                                        ));
-                                    } else {
-                                        self.toast("Invalid duration (try 2h, 1:30, 90)");
+                                if popover_toggle_row(
+                                    ui,
+                                    "Fade audio gently (last 10s)",
+                                    self.sleep_fade_enabled,
+                                ) {
+                                    self.sleep_fade_enabled = !self.sleep_fade_enabled;
+                                    if !self.sleep_fade_enabled {
+                                        self.restore_sleep_volume();
                                     }
                                     interacted = true;
                                 }
@@ -2455,13 +3147,19 @@ impl YtApp {
                     });
             });
 
-        // Close popover cleanly when clicking anywhere outside it (on release so trigger button toggles cleanly)
+        // Close popover cleanly when clicking outside (ignore drag releases whose press began inside)
+        let started_inside = ctx
+            .input(|i| i.pointer.press_origin())
+            .is_some_and(|o| area_resp.response.rect.contains(o));
         let clicked_outside = !just_toggled
+            && !started_inside
+            && !egui::Popup::is_any_open(ctx)
             && ctx.input(|i| i.pointer.any_released())
             && ctx
                 .input(|i| i.pointer.interact_pos())
                 .is_none_or(|p| !area_resp.response.rect.contains(p));
         if clicked_outside {
+            self.sleep_editing_seg = None;
             self.player_menu = PlayerMenu::None;
             interacted = true;
         }
@@ -3159,6 +3857,28 @@ impl YtApp {
                         ui.close();
                     }
                     if ui
+                        .button(if app.audio_only_mode {
+                            "Restore Video Mode"
+                        } else {
+                            "Audio-Only Mode (Low Bandwidth)"
+                        })
+                        .clicked()
+                    {
+                        app.toggle_audio_only_mode();
+                        ui.close();
+                    }
+                    if ui.button("Show Transcript").clicked() {
+                        app.right_tab = RightTab::Transcript;
+                        if app.transcript.is_empty() && !app.transcript_loading {
+                            app.request_transcript(None);
+                        }
+                        ui.close();
+                    }
+                    if ui.button("Save Lossless PNG Snapshot").clicked() {
+                        app.save_video_snapshot_file();
+                        ui.close();
+                    }
+                    if ui
                         .button(format!("{}  Stats for Nerds (Ctrl+I)", icon::SETTINGS))
                         .clicked()
                     {
@@ -3415,10 +4135,14 @@ impl YtApp {
         let Some(w) = self.watch.as_ref() else {
             return;
         };
+        let is_live = w.is_live;
         let has_chat = w.live_chat_token.is_some() || !self.live_chat.is_empty();
         let has_queue = !self.queue.is_empty();
-        if has_chat || has_queue {
-            ui.horizontal(|ui| {
+        let has_transcript = !w.id.starts_with("local:")
+            && (w.transcript_params.is_some() || !w.captions.is_empty());
+        let mut load_transcript = false;
+        if has_chat || has_queue || has_transcript {
+            ui.horizontal_wrapped(|ui| {
                 if ui
                     .selectable_label(
                         self.right_tab == RightTab::UpNext,
@@ -3443,12 +4167,25 @@ impl YtApp {
                     && ui
                         .selectable_label(
                             self.right_tab == RightTab::LiveChat,
-                            RichText::new(if w.is_live { "Live Chat" } else { "Chat Replay" })
+                            RichText::new(if is_live { "Live Chat" } else { "Chat Replay" })
                                 .font(theme::semibold(14.0)),
                         )
                         .clicked()
                 {
                     self.right_tab = RightTab::LiveChat;
+                }
+                if has_transcript
+                    && ui
+                        .selectable_label(
+                            self.right_tab == RightTab::Transcript,
+                            RichText::new("Transcript").font(theme::semibold(14.0)),
+                        )
+                        .clicked()
+                {
+                    self.right_tab = RightTab::Transcript;
+                    if self.transcript.is_empty() && !self.transcript_loading {
+                        load_transcript = true;
+                    }
                 }
             });
             ui.add_space(8.0);
@@ -3456,6 +4193,17 @@ impl YtApp {
             ui.label(RichText::new("Up Next").font(theme::semibold(15.5)));
             ui.add_space(8.0);
         }
+
+        if load_transcript {
+            self.request_transcript(None);
+        }
+        if has_transcript && self.right_tab == RightTab::Transcript {
+            self.draw_transcript_panel(ui, ctx);
+            return;
+        }
+        let Some(w) = self.watch.as_ref() else {
+            return;
+        };
 
         if has_queue && self.right_tab == RightTab::Queue {
             let mut clear_queue = false;
@@ -4242,47 +4990,89 @@ impl YtApp {
         let mut clicked_chip: Option<(usize, crate::model::UpNextFilterMode, String, Option<String>)> =
             None;
         if !chips.is_empty() {
-            ScrollArea::horizontal()
-                .id_salt("up_next_chips_scroll")
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        for (idx, (mode, title, cont)) in chips.iter().enumerate() {
-                            let selected = if self.up_next_active_chip < chips.len() {
-                                idx == self.up_next_active_chip
-                            } else {
-                                *mode == self.up_next_mode
-                            };
-                            let fill = if selected {
-                                Color32::from_rgb(241, 241, 241)
-                            } else {
-                                theme::CHIP
-                            };
-                            let text_col = if selected {
-                                Color32::from_rgb(15, 15, 15)
-                            } else {
-                                theme::TEXT
-                            };
-                            let btn = egui::Button::new(
-                                RichText::new(title)
-                                    .font(theme::medium(12.0))
-                                    .color(text_col),
-                            )
-                            .fill(fill)
-                            .corner_radius(8)
-                            .min_size(vec2(0.0, 28.0));
-                            let resp = ui.add(btn);
-                            if resp.hovered() {
-                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            let pan_id = ui.make_persistent_id("up_next_chips_pan");
+            let (mut scroll_x, mut dragging, mut drag_dist) = ui
+                .data(|d| d.get_temp::<(f32, bool, f32)>(pan_id))
+                .unwrap_or((0.0, false, 0.0));
+            let drag_blocked = drag_dist >= 5.0;
+
+            let bar_out = ui.scope(|ui| {
+                ScrollArea::horizontal()
+                    .id_salt("up_next_chips_scroll")
+                    .horizontal_scroll_offset(scroll_x)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            for (idx, (mode, title, cont)) in chips.iter().enumerate() {
+                                let selected = if self.up_next_active_chip < chips.len() {
+                                    idx == self.up_next_active_chip
+                                } else {
+                                    *mode == self.up_next_mode
+                                };
+                                let fill = if selected {
+                                    Color32::from_rgb(241, 241, 241)
+                                } else {
+                                    theme::CHIP
+                                };
+                                let text_col = if selected {
+                                    Color32::from_rgb(15, 15, 15)
+                                } else {
+                                    theme::TEXT
+                                };
+                                let btn = egui::Button::new(
+                                    RichText::new(title)
+                                        .font(theme::medium(12.0))
+                                        .color(text_col),
+                                )
+                                .fill(fill)
+                                .corner_radius(8)
+                                .min_size(vec2(0.0, 28.0));
+                                let resp = ui.add(btn);
+                                if resp.hovered() && !drag_blocked {
+                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                }
+                                if resp.clicked() && !drag_blocked {
+                                    clicked_chip =
+                                        Some((idx, *mode, title.clone(), cont.clone()));
+                                }
                             }
-                            if resp.clicked() {
-                                clicked_chip =
-                                    Some((idx, *mode, title.clone(), cont.clone()));
-                            }
-                        }
-                    });
-                });
+                        });
+                    })
+            });
+            let scroll_out = bar_out.inner;
+            let bar_rect = bar_out.response.rect;
+            let max_scroll =
+                (scroll_out.content_size.x - scroll_out.inner_rect.width()).max(0.0);
+            scroll_x = scroll_out.state.clamped_offset().x.clamp(0.0, max_scroll);
+
+            let hovered_bar = ui.rect_contains_pointer(bar_rect);
+            let (primary_down, primary_pressed, delta_x, wheel_y) = ui.ctx().input(|i| {
+                (
+                    i.pointer.primary_down(),
+                    i.pointer.primary_pressed(),
+                    i.pointer.delta().x,
+                    i.smooth_scroll_delta.y,
+                )
+            });
+            if hovered_bar && primary_pressed {
+                dragging = true;
+                drag_dist = 0.0;
+            }
+            if dragging && primary_down {
+                drag_dist += delta_x.abs();
+                scroll_x = (scroll_x - delta_x).clamp(0.0, max_scroll);
+                if drag_dist >= 5.0 {
+                    ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                }
+            } else if !primary_down {
+                dragging = false;
+                drag_dist = 0.0;
+            }
+            if hovered_bar && wheel_y.abs() > 0.1 {
+                scroll_x = (scroll_x - wheel_y * 1.25).clamp(0.0, max_scroll);
+            }
+            ui.data_mut(|d| d.insert_temp(pan_id, (scroll_x, dragging, drag_dist)));
             ui.add_space(6.0);
         }
         if self.up_next_loading {
@@ -4388,6 +5178,286 @@ impl YtApp {
         }
         if let Some(act) = right_action {
             self.handle_grid_action(ctx, act, |_| {});
+        }
+    }
+
+    fn draw_transcript_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(w) = self.watch.clone() else {
+            return;
+        };
+        Frame::new()
+            .fill(theme::SURFACE)
+            .stroke(Stroke::new(1.0, theme::BORDER))
+            .corner_radius(12)
+            .inner_margin(Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let input_w = (ui.available_width() - 82.0).max(90.0);
+                    ui.add_sized(
+                        Vec2::new(input_w, 28.0),
+                        egui::TextEdit::singleline(&mut self.transcript_query)
+                            .hint_text("Search transcript..."),
+                    );
+                    if !self.transcript_query.is_empty() && icon_circle_button(ui, icon::X, 12.0, "Clear") {
+                        self.transcript_query.clear();
+                    }
+                    let follow_btn = egui::Button::new(
+                        RichText::new("Follow")
+                            .font(theme::medium(11.5))
+                            .color(if self.transcript_auto_scroll {
+                                Color32::from_rgb(15, 15, 15)
+                            } else {
+                                theme::TEXT
+                            }),
+                    )
+                    .fill(if self.transcript_auto_scroll {
+                        theme::YT_BLUE
+                    } else {
+                        theme::CHIP
+                    })
+                    .corner_radius(8);
+                    if ui
+                        .add(follow_btn)
+                        .on_hover_text("Auto-scroll transcript with current playback time")
+                        .clicked()
+                    {
+                        self.transcript_auto_scroll = !self.transcript_auto_scroll;
+                        if self.transcript_auto_scroll {
+                            self.transcript_last_active_idx = None;
+                        }
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(5.0, 4.0);
+                    if w.captions.len() > 1 {
+                        let cur_name = w
+                            .captions
+                            .get(self.transcript_caption_idx)
+                            .map(|c| c.name.as_str())
+                            .unwrap_or("Track");
+                        let mut switch_cap: Option<usize> = None;
+                        egui::ComboBox::from_id_salt("transcript_lang_pick")
+                            .width(120.0)
+                            .selected_text(cur_name)
+                            .show_ui(ui, |ui| {
+                                for (idx, c) in w.captions.iter().enumerate() {
+                                    if ui
+                                        .selectable_label(
+                                            self.transcript_caption_idx == idx,
+                                            &c.name,
+                                        )
+                                        .clicked()
+                                    {
+                                        switch_cap = Some(idx);
+                                    }
+                                }
+                            });
+                        if let Some(idx) = switch_cap {
+                            self.request_transcript(Some(idx));
+                        }
+                    }
+                    if !self.transcript.is_empty() {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Copy").font(theme::medium(11.0)),
+                                )
+                                .fill(theme::CHIP)
+                                .corner_radius(7),
+                            )
+                            .clicked()
+                        {
+                            ctx.copy_text(crate::innertube::format_transcript_txt(
+                                &self.transcript,
+                            ));
+                            self.toast("Copied transcript to clipboard");
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Export .txt").font(theme::medium(11.0)),
+                                )
+                                .fill(theme::CHIP)
+                                .corner_radius(7),
+                            )
+                            .clicked()
+                        {
+                            self.export_transcript_file(&w.title, false);
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Export .srt").font(theme::medium(11.0)),
+                                )
+                                .fill(theme::CHIP)
+                                .corner_radius(7),
+                            )
+                            .clicked()
+                        {
+                            self.export_transcript_file(&w.title, true);
+                        }
+                    } else if !self.transcript_loading
+                        && ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Reload").font(theme::medium(11.0)),
+                                )
+                                .fill(theme::CHIP)
+                                .corner_radius(7),
+                            )
+                            .clicked()
+                    {
+                        self.request_transcript(None);
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                if self.transcript_loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("Loading transcript...")
+                                .font(theme::regular(12.5))
+                                .color(theme::TEXT_DIM),
+                        );
+                    });
+                    return;
+                }
+                if let Some(err) = &self.transcript_error {
+                    ui.label(
+                        RichText::new(err)
+                            .font(theme::regular(12.0))
+                            .color(theme::TEXT_DIM),
+                    );
+                    return;
+                }
+                if self.transcript.is_empty() {
+                    ui.label(
+                        RichText::new("No transcript available for this video.")
+                            .font(theme::regular(12.5))
+                            .color(theme::TEXT_DIM),
+                    );
+                    return;
+                }
+
+                let q = self.transcript_query.trim().to_ascii_lowercase();
+                let pos = self.playback.time_pos.max(0.0);
+                let active_idx = self
+                    .transcript
+                    .iter()
+                    .rposition(|c| pos >= c.start_secs && pos <= c.end_secs + 0.5);
+                let should_scroll = self.transcript_auto_scroll
+                    && q.is_empty()
+                    && active_idx.is_some()
+                    && active_idx != self.transcript_last_active_idx;
+                if should_scroll {
+                    self.transcript_last_active_idx = active_idx;
+                }
+
+                let mut seek_to: Option<f64> = None;
+                let max_h = (ui.available_height() - 8.0).clamp(240.0, 560.0);
+                ScrollArea::vertical()
+                    .id_salt("watch_transcript_scroll")
+                    .max_height(max_h)
+                    .show(ui, |ui| {
+                        for (idx, cue) in self.transcript.iter().enumerate() {
+                            if !q.is_empty() && !cue.text.to_ascii_lowercase().contains(&q) {
+                                continue;
+                            }
+                            let is_active = active_idx == Some(idx);
+                            let row_fill = if is_active {
+                                Color32::from_rgba_unmultiplied(62, 166, 255, 34)
+                            } else {
+                                Color32::TRANSPARENT
+                            };
+                            let frame_resp = Frame::new()
+                                .fill(row_fill)
+                                .corner_radius(7)
+                                .inner_margin(Margin::symmetric(8, 5))
+                                .show(ui, |ui| {
+                                    ui.set_width((ui.available_width() - 6.0).max(80.0));
+                                    ui.horizontal_top(|ui| {
+                                        let ts_col = if is_active {
+                                            theme::YT_BLUE
+                                        } else {
+                                            theme::TEXT_DIM
+                                        };
+                                        ui.label(
+                                            RichText::new(format_duration(cue.start_secs))
+                                                .font(theme::semibold(11.5))
+                                                .color(ts_col),
+                                        );
+                                        ui.add_space(4.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&cue.text)
+                                                    .font(if is_active {
+                                                        theme::semibold(12.5)
+                                                    } else {
+                                                        theme::regular(12.5)
+                                                    })
+                                                    .color(if is_active {
+                                                        Color32::WHITE
+                                                    } else {
+                                                        theme::TEXT
+                                                    }),
+                                            )
+                                            .wrap(),
+                                        );
+                                    });
+                                })
+                                .response
+                                .interact(Sense::click());
+                            if frame_resp.hovered() {
+                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                            }
+                            if frame_resp.clicked() {
+                                seek_to = Some(cue.start_secs);
+                            }
+                            if should_scroll && is_active {
+                                frame_resp.scroll_to_me(Some(Align::Center));
+                            }
+                            ui.add_space(2.0);
+                        }
+                    });
+                if let Some(secs) = seek_to {
+                    if let Some(mpv) = &self.mpv {
+                        mpv.seek_abs(secs);
+                        if self.playback.eof {
+                            mpv.set_paused(false);
+                        }
+                        self.trigger_hud(HudIcon::SeekForward, format_duration(secs));
+                    }
+                }
+            });
+    }
+
+    fn export_transcript_file(&mut self, title: &str, as_srt: bool) {
+        let dir = self.effective_download_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.toast(format!("Export failed: {e}"));
+            return;
+        }
+        let clean = super::sanitize_filename(title);
+        let ext = if as_srt { "srt" } else { "txt" };
+        let path = dir.join(format!("{clean}.{ext}"));
+        let content = if as_srt {
+            crate::innertube::format_transcript_srt(&self.transcript)
+        } else {
+            crate::innertube::format_transcript_txt(&self.transcript)
+        };
+        match std::fs::write(&path, content) {
+            Ok(()) => self.toast(format!(
+                "Exported {}",
+                path.file_name().and_then(|s| s.to_str()).unwrap_or(ext)
+            )),
+            Err(e) => self.toast(format!("Export failed: {e}")),
         }
     }
 
@@ -5958,6 +7028,715 @@ fn popover_option_row(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
     resp.clicked()
 }
 
+fn popover_toggle_row(ui: &mut egui::Ui, label: &str, on: bool) -> bool {
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 30.0), Sense::click());
+    let hover_t = ui
+        .ctx()
+        .animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    if hover_t > 0.01 {
+        ui.painter().rect_filled(
+            rect,
+            7.0,
+            Color32::from_white_alpha((18.0 * hover_t) as u8),
+        );
+    }
+    ui.painter().text(
+        pos2(rect.left() + 8.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        theme::medium(12.0),
+        if on { Color32::WHITE } else { theme::TEXT },
+    );
+
+    let on_t = ui
+        .ctx()
+        .animate_bool_with_time(resp.id.with("sw"), on, 0.14);
+    let sw_rect = Rect::from_center_size(pos2(rect.right() - 22.0, rect.center().y), vec2(32.0, 18.0));
+    let track_col = if on {
+        theme::YT_BLUE
+    } else {
+        Color32::from_white_alpha(38)
+    };
+    ui.painter().rect_filled(sw_rect, 9.0, track_col);
+    let knob_x = sw_rect.left() + 9.0 + on_t * 14.0;
+    ui.painter()
+        .circle_filled(pos2(knob_x, sw_rect.center().y), 6.5, Color32::WHITE);
+
+    resp.clicked()
+}
+
+fn popover_nav_row(ui: &mut egui::Ui, label: &str, badge: &str, active: bool) -> bool {
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 30.0), Sense::click());
+    let hover_t = ui
+        .ctx()
+        .animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    if hover_t > 0.01 {
+        ui.painter().rect_filled(
+            rect,
+            7.0,
+            Color32::from_white_alpha((18.0 * hover_t) as u8),
+        );
+    }
+    ui.painter().text(
+        pos2(rect.left() + 8.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        theme::medium(12.0),
+        theme::TEXT,
+    );
+    let badge_col = if active { theme::YT_BLUE } else { theme::TEXT_DIM };
+    let chevron_x = rect.right() - 10.0;
+    ui.painter().text(
+        pos2(chevron_x - 8.0, rect.center().y),
+        Align2::RIGHT_CENTER,
+        badge,
+        theme::medium(11.5),
+        badge_col,
+    );
+    let stroke = Stroke::new(1.4, theme::TEXT_DIM);
+    let cy = rect.center().y;
+    ui.painter()
+        .line_segment([pos2(chevron_x - 3.0, cy - 3.5), pos2(chevron_x + 1.0, cy)], stroke);
+    ui.painter()
+        .line_segment([pos2(chevron_x + 1.0, cy), pos2(chevron_x - 3.0, cy + 3.5)], stroke);
+    resp.clicked()
+}
+
+fn step_timer_segment(val: u32, delta: i32, max_val: u32) -> u32 {
+    let modulo = max_val as i32 + 1;
+    (val as i32 + delta).rem_euclid(modulo) as u32
+}
+
+fn segments_to_secs(h: u32, m: u32, s: u32) -> u64 {
+    h as u64 * 3600 + m as u64 * 60 + s as u64
+}
+
+fn timer_arrow_button(ui: &mut egui::Ui, id_salt: (&str, usize), width: f32, up: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, 20.0), Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        ui.painter()
+            .rect_filled(rect, 6.0, Color32::from_white_alpha(20));
+    }
+    let col = if resp.hovered() {
+        Color32::WHITE
+    } else {
+        theme::TEXT_DIM
+    };
+    let c = rect.center();
+    let dy = if up { -2.5 } else { 2.5 };
+    let stroke = Stroke::new(1.6, col);
+    ui.painter().line_segment([c + vec2(-5.5, -dy), c + vec2(0.0, dy)], stroke);
+    ui.painter().line_segment([c + vec2(0.0, dy), c + vec2(5.5, -dy)], stroke);
+    let _ = id_salt;
+    resp.clicked()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_timer_segment_box(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    seg_idx: u8,
+    width: f32,
+    value: &mut u32,
+    max_val: u32,
+    editing_seg: &mut Option<u8>,
+    seg_buf: &mut String,
+) -> bool {
+    let id = ui.make_persistent_id(("sleep_seg_box", seg_idx));
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, 46.0), Sense::click_and_drag());
+    let editing = *editing_seg == Some(seg_idx);
+    let mut changed = false;
+
+    if resp.dragged() {
+        *editing_seg = None;
+        ctx.set_cursor_icon(CursorIcon::ResizeVertical);
+        let accum_id = id.with("drag_y");
+        let dy = -resp.drag_delta().y;
+        let step_px = 10.0_f32;
+        let mut accum = ui.data(|d| d.get_temp::<f32>(accum_id)).unwrap_or(0.0) + dy;
+        let steps = (accum / step_px).trunc() as i32;
+        if steps != 0 {
+            accum -= steps as f32 * step_px;
+            *value = step_timer_segment(*value, steps, max_val);
+            changed = true;
+        }
+        ui.data_mut(|d| d.insert_temp(accum_id, accum));
+    } else {
+        ui.data_mut(|d| d.insert_temp(id.with("drag_y"), 0.0_f32));
+        if resp.hovered() {
+            ctx.set_cursor_icon(CursorIcon::ResizeVertical);
+        }
+    }
+
+    if resp.hovered() {
+        let wheel_y = ctx.input(|i| i.smooth_scroll_delta.y);
+        if wheel_y.abs() > 0.01 {
+            *editing_seg = None;
+            let s_id = id.with("wheel_y");
+            let mut accum = ui.data(|d| d.get_temp::<f32>(s_id)).unwrap_or(0.0) + wheel_y;
+            if accum.abs() >= 18.0 {
+                let step = accum.signum() as i32;
+                accum = 0.0;
+                *value = step_timer_segment(*value, step, max_val);
+                changed = true;
+            }
+            ui.data_mut(|d| d.insert_temp(s_id, accum));
+        }
+    }
+
+    if resp.clicked() && !resp.drag_stopped() {
+        if editing {
+            *editing_seg = None;
+            seg_buf.clear();
+        } else {
+            *editing_seg = Some(seg_idx);
+            seg_buf.clear();
+        }
+        changed = true;
+    }
+
+    let bg = if editing {
+        Color32::from_rgb(46, 48, 58)
+    } else if resp.hovered() || resp.dragged() {
+        Color32::from_rgb(42, 42, 49)
+    } else {
+        Color32::TRANSPARENT
+    };
+    if bg != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 7.0, bg);
+    }
+    if editing {
+        ui.painter()
+            .rect_stroke(rect, 7.0, Stroke::new(1.5, theme::YT_BLUE), egui::StrokeKind::Inside);
+    }
+
+    let text_col = if editing || resp.hovered() || resp.dragged() {
+        Color32::WHITE
+    } else {
+        Color32::from_rgb(205, 207, 214)
+    };
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        format!("{:02}", *value),
+        egui::FontId::proportional(25.0),
+        text_col,
+    );
+    changed
+}
+
+fn lerp_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let r = (a[0] as f32 + (b[0] as f32 - a[0] as f32) * t).round() as u8;
+    let g = (a[1] as f32 + (b[1] as f32 - a[1] as f32) * t).round() as u8;
+    let bl = (a[2] as f32 + (b[2] as f32 - a[2] as f32) * t).round() as u8;
+    Color32::from_rgb(r, g, bl)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_smooth_ambient_glow(
+    painter: &egui::Painter,
+    ctx: &egui::Context,
+    rect: Rect,
+    palette: [[u8; 3]; 4],
+    prev_palette: [[u8; 3]; 4],
+    changed_at: Option<Instant>,
+    opacity_setting: f32,
+    paused: bool,
+) {
+    let fade_t = changed_at
+        .map(|t| (t.elapsed().as_secs_f32() / 1.4).clamp(0.0, 1.0))
+        .unwrap_or(1.0);
+    let animated = !paused;
+    if animated || fade_t < 1.0 {
+        ctx.request_repaint_after(Duration::from_millis(50));
+    }
+    let time = if animated {
+        ctx.input(|i| i.time) as f32
+    } else {
+        0.0
+    };
+    let strength = (opacity_setting.clamp(0.05, 0.70) * 1.65).clamp(0.24, 1.0);
+    let base_alpha = 112.0 * strength;
+
+    let anchors = [
+        pos2(rect.left() + rect.width() * 0.24, rect.top() + rect.height() * 0.26),
+        pos2(rect.left() + rect.width() * 0.76, rect.top() + rect.height() * 0.24),
+        pos2(rect.left() + rect.width() * 0.26, rect.top() + rect.height() * 0.76),
+        pos2(rect.left() + rect.width() * 0.74, rect.top() + rect.height() * 0.74),
+    ];
+    let phases = [0.0_f32, 1.55, 3.1, 4.65];
+    let rx_base = (rect.width() * 0.48).clamp(180.0, 480.0);
+    let ry_base = (rect.height() * 0.62).clamp(150.0, 380.0);
+
+    let mut mesh = egui::Mesh::default();
+    const RINGS: [f32; 4] = [0.28, 0.54, 0.78, 1.0];
+    const SEGS: usize = 28;
+
+    for i in 0..4 {
+        let col = lerp_rgb(prev_palette[i], palette[i], fade_t);
+        let ph = phases[i];
+        let drift_x = (time * 0.42 + ph).sin() * rect.width() * 0.045;
+        let drift_y = (time * 0.31 + ph * 1.3).cos() * rect.height() * 0.045;
+        let pulse = 1.0 + 0.065 * (time * 0.55 + ph * 0.8).sin();
+        let alpha_pulse = 0.88 + 0.12 * (time * 0.62 + ph).cos();
+
+        let center = anchors[i] + vec2(drift_x, drift_y);
+        let rx = rx_base * pulse;
+        let ry = ry_base * (2.0 - pulse * 0.96);
+        let peak_a = (base_alpha * alpha_pulse).clamp(12.0, 128.0);
+
+        let base_idx = mesh.vertices.len() as u32;
+        mesh.colored_vertex(
+            center,
+            Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), peak_a.round() as u8),
+        );
+
+        for (ring_i, &t) in RINGS.iter().enumerate() {
+            // Cosine-squared falloff gives C^1 smoothness with zero visible ring edges
+            let w = 0.5 + 0.5 * (t * std::f32::consts::PI).cos();
+            let a = if ring_i + 1 == RINGS.len() {
+                0
+            } else {
+                (peak_a * w * w).round() as u8
+            };
+            let ring_col = Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), a);
+            for s in 0..SEGS {
+                let ang = (s as f32 / SEGS as f32) * std::f32::consts::TAU;
+                let pos = pos2(center.x + ang.cos() * rx * t, center.y + ang.sin() * ry * t);
+                mesh.colored_vertex(pos, ring_col);
+            }
+        }
+
+        for s in 0..SEGS {
+            let next = (s + 1) % SEGS;
+            mesh.add_triangle(base_idx, base_idx + 1 + s as u32, base_idx + 1 + next as u32);
+        }
+        for ring_i in 0..(RINGS.len() - 1) {
+            let r0 = base_idx + 1 + (ring_i * SEGS) as u32;
+            let r1 = r0 + SEGS as u32;
+            for s in 0..SEGS {
+                let next = (s + 1) % SEGS;
+                let a = r0 + s as u32;
+                let b = r0 + next as u32;
+                let c = r1 + s as u32;
+                let d = r1 + next as u32;
+                mesh.add_triangle(a, c, d);
+                mesh.add_triangle(a, d, b);
+            }
+        }
+    }
+
+    let scroll_clip = painter.clip_rect();
+    let glow_clip = Rect::from_min_max(
+        pos2(scroll_clip.left() - 140.0, scroll_clip.top() - 18.0),
+        pos2(scroll_clip.right() + 140.0, scroll_clip.bottom() + 140.0),
+    )
+    .intersect(ctx.content_rect());
+    painter
+        .with_clip_rect(glow_clip)
+        .add(egui::Shape::mesh(mesh));
+}
+
+fn popover_pill_button(
+    ui: &mut egui::Ui,
+    size: Vec2,
+    label: &str,
+    active: bool,
+    danger: bool,
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    let fill = if active {
+        Color32::from_rgb(241, 241, 241)
+    } else if resp.hovered() {
+        Color32::from_rgb(56, 56, 64)
+    } else {
+        theme::CHIP
+    };
+    ui.painter().rect_filled(rect, 7.0, fill);
+    let col = if active {
+        Color32::from_rgb(15, 15, 15)
+    } else if danger {
+        theme::YT_RED
+    } else {
+        theme::TEXT
+    };
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        theme::medium(11.0),
+        col,
+    );
+    resp.clicked()
+}
+
+fn sample_perimeter_ambilight(grid: &[[u8; 3]; AMB_GRID_W * AMB_GRID_H], angle: f32) -> Color32 {
+    // Project ray from unit square center at `angle` onto the nearest video border and sample 2-deep
+    let (s, c) = angle.sin_cos();
+    let scale = 1.0 / c.abs().max(s.abs()).max(1e-4);
+    let u = (0.5 + 0.45 * c * scale).clamp(0.0, 1.0);
+    let v = (0.5 + 0.45 * s * scale).clamp(0.0, 1.0);
+    let fx = u * (AMB_GRID_W - 1) as f32;
+    let fy = v * (AMB_GRID_H - 1) as f32;
+    let x0 = (fx.floor() as usize).min(AMB_GRID_W - 1);
+    let x1 = (x0 + 1).min(AMB_GRID_W - 1);
+    let y0 = (fy.floor() as usize).min(AMB_GRID_H - 1);
+    let y1 = (y0 + 1).min(AMB_GRID_H - 1);
+    let tx = fx - x0 as f32;
+    let ty = fy - y0 as f32;
+
+    let c00 = grid[y0 * AMB_GRID_W + x0];
+    let c10 = grid[y0 * AMB_GRID_W + x1];
+    let c01 = grid[y1 * AMB_GRID_W + x0];
+    let c11 = grid[y1 * AMB_GRID_W + x1];
+    let mut out = [0u8; 3];
+    for ch in 0..3 {
+        let top = c00[ch] as f32 * (1.0 - tx) + c10[ch] as f32 * tx;
+        let bot = c01[ch] as f32 * (1.0 - tx) + c11[ch] as f32 * tx;
+        out[ch] = (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8;
+    }
+    Color32::from_rgb(out[0], out[1], out[2])
+}
+
+/// Real-time YouTube-Ambilight perimeter bloom driven directly by live decoded video frames.
+fn paint_video_ambilight_glow(
+    painter: &egui::Painter,
+    ctx: &egui::Context,
+    rect: Rect,
+    snap: &LiveAmbientSnapshot,
+    opacity_setting: f32,
+    paused: bool,
+) {
+    if !paused {
+        ctx.request_repaint_after(Duration::from_millis(33));
+    }
+    let strength = (opacity_setting.clamp(0.05, 0.70) * 1.60).clamp(0.24, 0.92);
+    let peak_alpha = 112.0 * strength;
+    let spread_x = (rect.width() * 0.28).clamp(130.0, 250.0);
+    let spread_y = (rect.height() * 0.34).clamp(110.0, 220.0);
+    let hw = rect.width() * 0.5;
+    let hh = rect.height() * 0.5;
+    let center = rect.center();
+
+    const SEGS: usize = 48;
+    const RINGS: [f32; 5] = [0.0, 0.24, 0.52, 0.78, 1.0];
+    let mut mesh = egui::Mesh::default();
+
+    for (ri, &t) in RINGS.iter().enumerate() {
+        let w = 0.5 + 0.5 * (t * std::f32::consts::PI).cos();
+        let ring_a = if ri + 1 == RINGS.len() {
+            0
+        } else {
+            (peak_alpha * w * w).round().clamp(0.0, 165.0) as u8
+        };
+        let rx = (hw - 4.0) + (spread_x + 4.0) * t;
+        let ry = (hh - 4.0) + (spread_y + 4.0) * t;
+        for s in 0..SEGS {
+            let ang = (s as f32 / SEGS as f32) * std::f32::consts::TAU;
+            let (sa, ca) = ang.sin_cos();
+            // Superellipse n=4 blends cleanly around rounded player corners
+            let norm = (ca.abs().powi(4) + sa.abs().powi(4)).powf(-0.25);
+            let pos = pos2(center.x + ca * norm * rx, center.y + sa * norm * ry);
+            let edge = sample_perimeter_ambilight(&snap.grid, ang);
+            let col = Color32::from_rgba_unmultiplied(edge.r(), edge.g(), edge.b(), ring_a);
+            mesh.colored_vertex(pos, col);
+        }
+    }
+
+    for ri in 0..(RINGS.len() - 1) {
+        let r0 = (ri * SEGS) as u32;
+        let r1 = ((ri + 1) * SEGS) as u32;
+        for s in 0..SEGS {
+            let next = (s + 1) % SEGS;
+            let a = r0 + s as u32;
+            let b = r0 + next as u32;
+            let c = r1 + s as u32;
+            let d = r1 + next as u32;
+            mesh.add_triangle(a, c, d);
+            mesh.add_triangle(a, d, b);
+        }
+    }
+
+    let scroll_clip = painter.clip_rect();
+    let glow_clip = Rect::from_min_max(
+        pos2(scroll_clip.left() - 180.0, scroll_clip.top() - 28.0),
+        pos2(scroll_clip.right() + 180.0, scroll_clip.bottom() + 180.0),
+    )
+    .intersect(ctx.content_rect());
+    painter
+        .with_clip_rect(glow_clip)
+        .add(egui::Shape::mesh(mesh));
+}
+
+fn lerp_color32(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    Color32::from_rgba_unmultiplied(
+        (a.r() as f32 + (b.r() as f32 - a.r() as f32) * t).round() as u8,
+        (a.g() as f32 + (b.g() as f32 - a.g() as f32) * t).round() as u8,
+        (a.b() as f32 + (b.b() as f32 - a.b() as f32) * t).round() as u8,
+        (a.a() as f32 + (b.a() as f32 - a.a() as f32) * t).round() as u8,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_audio_spectrum(
+    ui: &egui::Ui,
+    ctx: &egui::Context,
+    rect: Rect,
+    radius: f32,
+    bands: &[f32; NUM_BANDS],
+    wave: &[f32; NUM_BANDS],
+    theme_mode: SpectrumTheme,
+    palette: [[u8; 3]; 4],
+) {
+    let p = ui.painter().with_clip_rect(rect.shrink(radius.min(4.0) * 0.25));
+    let time = ctx.input(|i| i.time) as f32;
+    let col_a = Color32::from_rgb(
+        palette[0][0].max(62),
+        palette[0][1].max(145),
+        palette[0][2].max(220),
+    );
+    let col_b = Color32::from_rgb(
+        palette[1][0].max(185),
+        palette[1][1].max(72),
+        palette[1][2].max(175),
+    );
+
+    match theme_mode {
+        SpectrumTheme::WaveBars => {
+            // Symmetrical sleek wave bars centered vertically across the canvas (ref: screenshot 4)
+            let pad_x = 32.0_f32;
+            let inner_w = (rect.width() - pad_x * 2.0).max(100.0);
+            let step_w = inner_w / NUM_BANDS as f32;
+            let bar_w = (step_w * 0.56).clamp(2.5, 6.0);
+            let half_max = rect.height() * 0.38;
+            let cy = rect.center().y + 6.0;
+
+            p.line_segment(
+                [pos2(rect.left() + pad_x, cy), pos2(rect.right() - pad_x, cy)],
+                Stroke::new(1.0, Color32::from_white_alpha(32)),
+            );
+            for i in 0..NUM_BANDS {
+                let b_mir = if i < NUM_BANDS / 2 {
+                    bands[NUM_BANDS / 2 - 1 - i]
+                } else {
+                    bands[i - NUM_BANDS / 2]
+                };
+                let amp = (0.55 * wave[i] + 0.45 * b_mir).clamp(0.0, 1.0);
+                let half_h = (amp * half_max).max(3.0);
+                let x = rect.left() + pad_x + i as f32 * step_w + (step_w - bar_w) * 0.5;
+                let bar_rect = Rect::from_min_max(pos2(x, cy - half_h), pos2(x + bar_w, cy + half_h));
+                p.rect_filled(
+                    bar_rect.expand2(vec2(1.5, 2.0)),
+                    bar_w,
+                    Color32::from_white_alpha(20),
+                );
+                p.rect_filled(
+                    bar_rect,
+                    bar_w * 0.5,
+                    Color32::from_rgba_unmultiplied(245, 248, 255, 232),
+                );
+            }
+        }
+        SpectrumTheme::SynthHorizon => {
+            // Luminous center glow + mirror horizon frequency spikes + water reflection (ref: screenshot 5)
+            let pad_x = 24.0_f32;
+            let inner_w = (rect.width() - pad_x * 2.0).max(100.0);
+            let horizon_y = rect.top() + rect.height() * 0.56;
+            let up_max = rect.height() * 0.38;
+            let down_max = rect.height() * 0.28;
+            let step_w = inner_w / NUM_BANDS as f32;
+            let bar_w = (step_w * 0.62).clamp(2.0, 5.0);
+
+            // Soft horizon center glow
+            let energy: f32 = bands.iter().take(16).sum::<f32>() / 16.0;
+            let halo_r = (rect.height() * (0.28 + energy * 0.14)).clamp(70.0, 210.0);
+            p.circle_filled(
+                pos2(rect.center().x, horizon_y),
+                halo_r,
+                col_b.gamma_multiply(0.14 + energy * 0.14),
+            );
+            p.line_segment(
+                [
+                    pos2(rect.left() + pad_x, horizon_y),
+                    pos2(rect.right() - pad_x, horizon_y),
+                ],
+                Stroke::new(1.2, Color32::from_rgba_unmultiplied(255, 220, 245, 110)),
+            );
+
+            for i in 0..NUM_BANDS {
+                // Mirror low frequencies smoothly on both sides / outer flanks + detail across center
+                let edge_dist = ((i as f32 / (NUM_BANDS - 1) as f32) - 0.5).abs() * 2.0;
+                let idx = ((edge_dist * (NUM_BANDS - 1) as f32).round() as usize).min(NUM_BANDS - 1);
+                let amp = (bands[idx] * 0.72 + wave[i] * 0.28).clamp(0.0, 1.0);
+                let uh = (amp * up_max).max(1.5);
+                let dh = (amp * down_max).max(1.0);
+                let x = rect.left() + pad_x + i as f32 * step_w + (step_w - bar_w) * 0.5;
+                let tint = lerp_color32(Color32::from_rgb(255, 242, 252), col_b, 0.22);
+
+                let top_rect =
+                    Rect::from_min_max(pos2(x, horizon_y - uh), pos2(x + bar_w, horizon_y));
+                p.rect_filled(top_rect.expand2(vec2(1.5, 2.5)), 2.0, col_b.gamma_multiply(0.24));
+                p.rect_filled(top_rect, 1.5, tint.gamma_multiply(0.94));
+
+                let ref_rect =
+                    Rect::from_min_max(pos2(x, horizon_y + 1.0), pos2(x + bar_w, horizon_y + dh));
+                p.rect_filled(ref_rect, 1.5, col_b.gamma_multiply(0.32));
+            }
+        }
+        SpectrumTheme::NeonBars => {
+            let pad_x = 24.0_f32;
+            let inner_w = (rect.width() - pad_x * 2.0).max(80.0);
+            let step_w = inner_w / NUM_BANDS as f32;
+            let bar_w = (step_w * 0.68).max(2.5);
+            let max_h = rect.height() * 0.56;
+            let base_y = rect.bottom() - 22.0;
+
+            let peak_id = ui.make_persistent_id("spec_neon_peaks");
+            let mut peaks = ui
+                .data(|d| d.get_temp::<[f32; NUM_BANDS]>(peak_id))
+                .unwrap_or([0.0; NUM_BANDS]);
+
+            for i in 0..NUM_BANDS {
+                let v = bands[i].clamp(0.0, 1.0);
+                peaks[i] = (peaks[i] - 0.012).max(v).clamp(0.0, 1.0);
+                let bh = (v * max_h).max(3.0);
+                let x = rect.left() + pad_x + i as f32 * step_w + (step_w - bar_w) * 0.5;
+                let frac = i as f32 / (NUM_BANDS - 1) as f32;
+                let c = lerp_color32(col_a, col_b, frac);
+
+                let bar_rect = Rect::from_min_max(pos2(x, base_y - bh), pos2(x + bar_w, base_y));
+                let glow_rect = bar_rect.expand2(vec2(2.0, 3.0));
+                p.rect_filled(glow_rect, 3.0, c.gamma_multiply(0.18));
+                p.rect_filled(bar_rect, (bar_w * 0.45).min(4.0), c.gamma_multiply(0.90));
+
+                let cap_y = base_y - peaks[i] * max_h - 3.0;
+                p.rect_filled(
+                    Rect::from_min_max(pos2(x, cap_y - 2.0), pos2(x + bar_w, cap_y + 1.0)),
+                    1.5,
+                    Color32::from_rgba_unmultiplied(245, 248, 255, 205),
+                );
+            }
+            ui.data_mut(|d| d.insert_temp(peak_id, peaks));
+        }
+        SpectrumTheme::RadialHalo => {
+            let center = rect.center() + vec2(0.0, 8.0);
+            let base_r = (rect.height().min(rect.width()) * 0.24).clamp(58.0, 130.0);
+            let max_len = (rect.height().min(rect.width()) * 0.22).clamp(48.0, 125.0);
+            let bass = (bands[0] + bands[1] + bands[2] + bands[3]) * 0.25;
+            p.circle_filled(
+                center,
+                base_r * (0.94 + bass * 0.10),
+                col_a.gamma_multiply(0.10 + bass * 0.12),
+            );
+            p.circle_stroke(
+                center,
+                base_r * (0.96 + bass * 0.08),
+                Stroke::new(2.0, col_a.gamma_multiply(0.55)),
+            );
+            let count = NUM_BANDS;
+            for i in 0..count {
+                let ang = (i as f32 / count as f32) * std::f32::consts::TAU + time * 0.20;
+                let (sa, ca) = ang.sin_cos();
+                let amp = bands[i].clamp(0.0, 1.0);
+                let r0 = base_r + 2.0;
+                let r1 = r0 + 2.0 + amp * max_len;
+                let frac = i as f32 / (NUM_BANDS - 1) as f32;
+                let c = lerp_color32(col_a, col_b, frac).gamma_multiply(0.92);
+                p.line_segment(
+                    [
+                        pos2(center.x + ca * r0, center.y + sa * r0),
+                        pos2(center.x + ca * r1, center.y + sa * r1),
+                    ],
+                    Stroke::new(3.0, c),
+                );
+            }
+        }
+        SpectrumTheme::AuroraRibbon => {
+            let layers = [
+                (col_a.gamma_multiply(0.36), 0.56, 0.0_f32),
+                (lerp_color32(col_a, col_b, 0.5).gamma_multiply(0.34), 0.44, 1.4),
+                (col_b.gamma_multiply(0.32), 0.34, 2.8),
+            ];
+            let base_y = rect.bottom() - 8.0;
+            for (fill_col, scale_h, phase) in layers {
+                let mut mesh = egui::Mesh::default();
+                let top_clear = Color32::from_rgba_unmultiplied(fill_col.r(), fill_col.g(), fill_col.b(), 165);
+                let bot_col = Color32::from_rgba_unmultiplied(fill_col.r(), fill_col.g(), fill_col.b(), 12);
+                let pts = 72usize;
+                for i in 0..=pts {
+                    let u = i as f32 / pts as f32;
+                    let bf = u * (NUM_BANDS - 1) as f32;
+                    let b0 = bf.floor() as usize;
+                    let b1 = (b0 + 1).min(NUM_BANDS - 1);
+                    let frac = bf - b0 as f32;
+                    let amp = (bands[b0] * 0.65 + wave[b0] * 0.35) * (1.0 - frac)
+                        + (bands[b1] * 0.65 + wave[b1] * 0.35) * frac;
+                    let wave_mod = 0.05 * (u * 8.0 + time * 1.4 + phase).sin();
+                    let h = ((amp + wave_mod).max(0.04) * rect.height() * scale_h).min(rect.height() * 0.74);
+                    let x = rect.left() + u * rect.width();
+                    mesh.colored_vertex(pos2(x, base_y - h), top_clear);
+                    mesh.colored_vertex(pos2(x, base_y), bot_col);
+                }
+                for i in 0..pts {
+                    let a = (i * 2) as u32;
+                    mesh.add_triangle(a, a + 1, a + 3);
+                    mesh.add_triangle(a, a + 3, a + 2);
+                }
+                p.add(egui::Shape::mesh(mesh));
+            }
+        }
+        SpectrumTheme::DotMatrix => {
+            let pad_x = 26.0_f32;
+            let inner_w = (rect.width() - pad_x * 2.0).max(80.0);
+            let cols = 40usize;
+            let rows = 18usize;
+            let step_x = inner_w / cols as f32;
+            let cell_w = (step_x * 0.66).max(3.0);
+            let max_h = rect.height() * 0.58;
+            let step_y = max_h / rows as f32;
+            let cell_h = (step_y * 0.66).max(2.5);
+            let base_y = rect.bottom() - 20.0;
+
+            for c_idx in 0..cols {
+                let band_idx = (c_idx * NUM_BANDS) / cols;
+                let lit_rows = (bands[band_idx].clamp(0.0, 1.0) * rows as f32).round() as usize;
+                let x = rect.left() + pad_x + c_idx as f32 * step_x + (step_x - cell_w) * 0.5;
+                for r_idx in 0..rows {
+                    let y1 = base_y - r_idx as f32 * step_y;
+                    let cell_rect = Rect::from_min_max(pos2(x, y1 - cell_h), pos2(x + cell_w, y1));
+                    if r_idx < lit_rows {
+                        let lvl = r_idx as f32 / (rows - 1) as f32;
+                        let col = if lvl > 0.78 {
+                            theme::YT_RED
+                        } else if lvl > 0.48 {
+                            col_b
+                        } else {
+                            theme::YT_BLUE
+                        };
+                        p.rect_filled(cell_rect, 2.0, col.gamma_multiply(0.92));
+                    } else {
+                        p.rect_filled(cell_rect, 2.0, Color32::from_white_alpha(12));
+                    }
+                }
+            }
+        }
+    }
+}
+
 enum ShortsUiAction {
     None,
     Step(isize),
@@ -6872,4 +8651,70 @@ mod watch_timestamp_tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(&txt[spans[0].0..spans[0].1], "0:30");
     }
+
+    #[test]
+    fn steps_and_wraps_sleep_timer_segments() {
+        assert_eq!(step_timer_segment(0, -1, 59), 59);
+        assert_eq!(step_timer_segment(59, 1, 59), 0);
+        assert_eq!(step_timer_segment(23, 2, 23), 1);
+        assert_eq!(step_timer_segment(1, -3, 23), 22);
+        assert_eq!(segments_to_secs(1, 10, 5), 4205);
+    }
+}
+
+fn tlang_chip(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
+    let resp = ui.add(
+        egui::Button::new(
+            RichText::new(label)
+                .font(theme::medium(10.5))
+                .color(if active {
+                    Color32::from_rgb(15, 15, 15)
+                } else {
+                    theme::TEXT
+                }),
+        )
+        .min_size(vec2(0.0, 22.0))
+        .fill(if active {
+            Color32::from_rgb(241, 241, 241)
+        } else {
+            theme::CHIP
+        })
+        .corner_radius(6),
+    );
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    resp.clicked()
+}
+
+fn build_tlang_options(yt_langs: &[(String, String)]) -> Vec<(String, String)> {
+    const COMMON: &[(&str, &str)] = &[
+        ("en", "EN"),
+        ("id", "ID"),
+        ("ja", "JA"),
+        ("ko", "KO"),
+        ("es", "ES"),
+        ("fr", "FR"),
+        ("de", "DE"),
+        ("pt", "PT"),
+        ("zh-Hans", "ZH"),
+        ("ar", "AR"),
+        ("hi", "HI"),
+        ("ru", "RU"),
+    ];
+    let mut out = Vec::new();
+    for (code, short) in COMMON {
+        out.push(((*code).to_owned(), (*short).to_owned()));
+    }
+    if yt_langs.is_empty() {
+        return out;
+    }
+    // Keep common quick codes while ensuring only valid/known codes or extra top languages are reachable
+    for (code, name) in yt_langs.iter().take(6) {
+        if !out.iter().any(|(c, _)| c == code) {
+            let short = name.chars().take(10).collect::<String>();
+            out.push((code.clone(), short));
+        }
+    }
+    out
 }

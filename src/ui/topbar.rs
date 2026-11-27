@@ -7,9 +7,12 @@ use egui::{
 
 use crate::backend::Request;
 use crate::innertube;
+use crate::model::{NotificationMenuItem, VideoItem};
 use crate::theme::{self, icon};
 
-use super::cards::{draw_avatar, draw_thumbnail, icon_circle_button};
+use super::cards::{
+    GridAction, draw_avatar, draw_thumbnail, draw_video_context_menu, icon_circle_button,
+};
 use super::{NotifFilter, Page, YtApp};
 
 impl YtApp {
@@ -663,10 +666,13 @@ impl YtApp {
         let mut open_video: Option<String> = None;
         let mut open_channel: Option<String> = None;
         let mut clicked_idx: Option<usize> = None;
+        let mut ctx_action: Option<GridAction> = None;
+        let mut ctx_menu_open = egui::Popup::is_any_open(ctx);
 
         let area_resp = egui::Area::new(egui::Id::unique("topbar_notifications_popup"))
             .pivot(Align2::RIGHT_TOP)
             .fixed_pos(anchor)
+            .constrain_to(screen.shrink(6.0))
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 Frame::new()
@@ -833,11 +839,14 @@ impl YtApp {
                             ui.add_space(24.0);
                         } else {
                             let max_h = (screen.height() - 120.0).clamp(240.0, 520.0);
-                            egui::ScrollArea::vertical()
-                                .id_salt("notifications_menu_scroll")
-                                .max_height(max_h)
-                                .auto_shrink([false, true])
-                                .show(ui, |ui| {
+                            let target_h = (filtered_count as f32 * 82.0 + 36.0).clamp(150.0, max_h);
+                            ui.allocate_ui(Vec2::new(popup_w, target_h), |ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("notifications_menu_scroll")
+                                    .max_height(target_h)
+                                    .min_scrolled_height(target_h)
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
                                     let mut last_section: Option<&str> = None;
                                     for (idx, item) in self.notifications.iter().enumerate() {
                                         let matches = match self.notif_filter {
@@ -963,6 +972,20 @@ impl YtApp {
                                         if row_resp.hovered() {
                                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                         }
+                                        if let Some(vid) = &item.video_id {
+                                            let v_item = notification_to_video_item(item, vid);
+                                            if row_resp.middle_clicked() {
+                                                clicked_idx = Some(idx);
+                                                ctx_action = Some(GridAction::OpenInSecondTab(v_item.clone()));
+                                            }
+                                            row_resp.context_menu(|ui| {
+                                                ctx_menu_open = true;
+                                                draw_video_context_menu(ui, &v_item, &mut ctx_action, true);
+                                            });
+                                            if row_resp.context_menu_opened() {
+                                                ctx_menu_open = true;
+                                            }
+                                        }
                                         if row_resp.clicked() {
                                             clicked_idx = Some(idx);
                                             if let Some(vid) = &item.video_id {
@@ -973,6 +996,7 @@ impl YtApp {
                                         }
                                     }
                                 });
+                            });
                         }
                     });
             });
@@ -982,7 +1006,22 @@ impl YtApp {
                 n.read = true;
             }
             self.unread_notifications = self.unread_notifications.saturating_sub(1);
-            self.notifications_open = false;
+            if ctx_action.is_none() {
+                self.notifications_open = false;
+            }
+        }
+        if let Some(act) = ctx_action {
+            let close_popup = matches!(
+                act,
+                GridAction::Open(_)
+                    | GridAction::OpenChannel { .. }
+                    | GridAction::OpenPlaylistPicker(_)
+            );
+            self.handle_grid_action(ctx, act, |_| {});
+            if close_popup {
+                self.notifications_open = false;
+            }
+            return;
         }
         if let Some(vid) = open_video {
             self.open_video_id(&vid);
@@ -994,6 +1033,8 @@ impl YtApp {
         }
 
         let clicked_outside = !just_toggled
+            && !ctx_menu_open
+            && !egui::Popup::is_any_open(ctx)
             && ctx.input(|i| i.pointer.any_released())
             && ctx.input(|i| i.pointer.interact_pos()).is_none_or(|p| {
                 !area_resp.response.rect.contains(p) && !bell_rect.contains(p)
@@ -1107,5 +1148,43 @@ impl YtApp {
                         });
                     });
             });
+    }
+}
+
+fn notification_to_video_item(item: &NotificationMenuItem, video_id: &str) -> VideoItem {
+    let raw = item.message.trim();
+    let stripped = raw.strip_prefix("🔴 ").unwrap_or(raw);
+    let (channel, title) = if let Some((ch, rest)) = stripped.split_once(" is live: ") {
+        (ch.trim().to_owned(), rest.trim().to_owned())
+    } else if let Some((ch, rest)) = stripped.split_once(" uploaded: ") {
+        (ch.trim().to_owned(), rest.trim().to_owned())
+    } else if let Some((ch, rest)) = stripped.split_once(": ") {
+        (ch.trim().to_owned(), rest.trim().to_owned())
+    } else {
+        (String::new(), stripped.to_owned())
+    };
+    let title = if title.is_empty() {
+        stripped.to_owned()
+    } else {
+        title
+    };
+    VideoItem {
+        id: video_id.to_owned(),
+        title,
+        channel,
+        channel_id: item.channel_id.clone(),
+        channel_avatar_url: item.channel_avatar_url.clone(),
+        published_text: item.sent_time_text.clone(),
+        duration_text: if item.is_live {
+            "LIVE".to_owned()
+        } else {
+            String::new()
+        },
+        thumbnail_url: item
+            .video_thumbnail_url
+            .clone()
+            .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")),
+        is_live: item.is_live,
+        ..Default::default()
     }
 }

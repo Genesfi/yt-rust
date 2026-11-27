@@ -10,7 +10,7 @@ use crate::model::{
     LiveChatMessage, LiveChatRun, NotificationLevel, NotificationMenuItem, PlaylistOption,
     PlaylistPrivacy, PlaylistSummary, SearchChannelResult, SearchDateFilter,
     SearchDurationFilter, SearchFilter, SearchSortBy, SearchTypeFilter, SidebarChannel,
-    StoryboardSpec, VideoFormat, VideoItem, WatchData,
+    StoryboardSpec, TranscriptCue, VideoFormat, VideoItem, WatchData,
 };
 
 const ORIGIN: &str = "https://www.youtube.com";
@@ -4543,6 +4543,8 @@ pub fn watch_data_from_next(video_id: &str, next: &Value) -> Option<WatchData> {
         audio_tracks: Vec::new(),
         hls_url: None,
         captions: Vec::new(),
+        translation_languages: Vec::new(),
+        transcript_params: find_transcript_params(next),
         chapters: Vec::new(),
         storyboard: None,
         comments_token,
@@ -4761,6 +4763,8 @@ fn build_watch_data(video_id: &str, player: Value, next: Option<Value>) -> Watch
         .map(str::to_owned);
 
     let captions = parse_captions(&player);
+    let translation_languages = parse_translation_languages(&player);
+    let transcript_params = next.as_ref().and_then(find_transcript_params);
     let chapters = parse_chapters(&description, duration_secs);
     let storyboard = player["storyboards"]["playerStoryboardSpecRenderer"]["spec"]
         .as_str()
@@ -4794,6 +4798,8 @@ fn build_watch_data(video_id: &str, player: Value, next: Option<Value>) -> Watch
         audio_tracks,
         hls_url,
         captions,
+        translation_languages,
+        transcript_params,
         chapters,
         storyboard,
         comments_token,
@@ -4810,9 +4816,17 @@ pub async fn fetch_hls_variants(
     http: &reqwest::Client,
     hls_url: &str,
 ) -> (Vec<VideoFormat>, Vec<AudioTrack>) {
+    fetch_hls_variants_with_ua(http, hls_url, VISIONOS_UA).await
+}
+
+pub async fn fetch_hls_variants_with_ua(
+    http: &reqwest::Client,
+    hls_url: &str,
+    ua: &str,
+) -> (Vec<VideoFormat>, Vec<AudioTrack>) {
     let Ok(resp) = http
         .get(hls_url)
-        .header("User-Agent", VISIONOS_UA)
+        .header("User-Agent", ua)
         .timeout(Duration::from_secs(6))
         .send()
         .await
@@ -5142,6 +5156,282 @@ fn parse_captions(player: &Value) -> Vec<CaptionTrack> {
         });
     }
     tracks
+}
+
+fn parse_translation_languages(player: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Some(arr) =
+        player["captions"]["playerCaptionsTracklistRenderer"]["translationLanguages"].as_array()
+    else {
+        return out;
+    };
+    for lang in arr {
+        let Some(code) = lang["languageCode"].as_str() else {
+            continue;
+        };
+        let name = text(&lang["languageName"]).unwrap_or_else(|| code.to_owned());
+        if !code.is_empty() && !out.iter().any(|(c, _)| c == code) {
+            out.push((code.to_owned(), name));
+        }
+    }
+    out
+}
+
+pub fn translated_vtt_url(base_vtt_url: &str, tlang: &str) -> String {
+    let tlang = tlang.trim();
+    if tlang.is_empty() {
+        return base_vtt_url.to_owned();
+    }
+    if let Ok(mut parsed) = url::Url::parse(base_vtt_url) {
+        let pairs: Vec<(String, String)> = parsed
+            .query_pairs()
+            .filter(|(k, _)| k != "tlang")
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        parsed.query_pairs_mut().clear().extend_pairs(pairs).append_pair("tlang", tlang);
+        return parsed.to_string();
+    }
+    if base_vtt_url.contains('?') {
+        format!("{base_vtt_url}&tlang={tlang}")
+    } else {
+        format!("{base_vtt_url}?tlang={tlang}")
+    }
+}
+
+fn find_transcript_params(next: &Value) -> Option<String> {
+    fn walk(v: &Value) -> Option<String> {
+        match v {
+            Value::Object(map) => {
+                if let Some(p) = map
+                    .get("getTranscriptEndpoint")
+                    .and_then(|e| e.get("params"))
+                    .and_then(|s| s.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(p.to_owned());
+                }
+                for val in map.values() {
+                    if let Some(found) = walk(val) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            Value::Array(arr) => arr.iter().find_map(walk),
+            _ => None,
+        }
+    }
+    walk(&next["engagementPanels"])
+}
+
+pub async fn fetch_transcript(
+    http: &reqwest::Client,
+    transcript_params: Option<&str>,
+    fallback_vtt_url: Option<&str>,
+    cfg: &WebConfig,
+    session: Option<&Session>,
+) -> anyhow::Result<Vec<TranscriptCue>> {
+    if let Some(params) = transcript_params.filter(|s| !s.is_empty()) {
+        if let Ok(v) = post_web(
+            http,
+            "get_transcript",
+            json!({ "params": params }),
+            cfg,
+            session,
+        )
+        .await
+        {
+            let cues = parse_get_transcript_json(&v);
+            if !cues.is_empty() {
+                return Ok(cues);
+            }
+        }
+    }
+    if let Some(vtt_url) = fallback_vtt_url.filter(|s| !s.is_empty()) {
+        let resp = http
+            .get(vtt_url)
+            .header("User-Agent", WEB_UA)
+            .timeout(Duration::from_secs(12))
+            .send()
+            .await?
+            .error_for_status()?;
+        let body = resp.text().await?;
+        let cues = parse_vtt_cues(&body);
+        if !cues.is_empty() {
+            return Ok(cues);
+        }
+    }
+    anyhow::bail!("Transcript is unavailable for this video")
+}
+
+pub fn parse_get_transcript_json(v: &Value) -> Vec<TranscriptCue> {
+    let mut cues = Vec::new();
+    fn walk(node: &Value, cues: &mut Vec<TranscriptCue>) {
+        match node {
+            Value::Object(map) => {
+                if let Some(seg) = map.get("transcriptSegmentRenderer") {
+                    let start_ms = seg["startMs"]
+                        .as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .or_else(|| seg["startMs"].as_u64())
+                        .unwrap_or(0);
+                    let end_ms = seg["endMs"]
+                        .as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .or_else(|| seg["endMs"].as_u64())
+                        .unwrap_or(start_ms + 2500);
+                    if let Some(snippet) = text(&seg["snippet"]) {
+                        let clean = snippet.replace('\n', " ").trim().to_owned();
+                        if !clean.is_empty() {
+                            cues.push(TranscriptCue {
+                                start_secs: start_ms as f64 / 1000.0,
+                                end_secs: (end_ms.max(start_ms + 200)) as f64 / 1000.0,
+                                text: clean,
+                            });
+                        }
+                    }
+                    return;
+                }
+                for val in map.values() {
+                    walk(val, cues);
+                }
+            }
+            Value::Array(arr) => {
+                for val in arr {
+                    walk(val, cues);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(v, &mut cues);
+    cues
+}
+
+fn parse_vtt_timestamp(tok: &str) -> Option<f64> {
+    let clean = tok.trim().trim_start_matches('\u{feff}');
+    let (hms, ms_str) = clean.split_once('.').or_else(|| clean.split_once(','))?;
+    let ms: f64 = ms_str.chars().take(3).collect::<String>().parse::<f64>().ok()?;
+    let ms_scale = match ms_str.len().min(3) {
+        1 => 100.0,
+        2 => 10.0,
+        _ => 1.0,
+    };
+    let parts: Vec<f64> = hms.split(':').filter_map(|p| p.parse().ok()).collect();
+    let secs = match parts.as_slice() {
+        [m, s] => m * 60.0 + s,
+        [h, m, s] => h * 3600.0 + m * 60.0 + s,
+        _ => return None,
+    };
+    Some(secs + (ms * ms_scale) / 1000.0)
+}
+
+fn strip_vtt_tags(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut in_tag = false;
+    for ch in line.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+}
+
+pub fn parse_vtt_cues(vtt: &str) -> Vec<TranscriptCue> {
+    let mut cues: Vec<TranscriptCue> = Vec::new();
+    let normalized = vtt.replace("\r\n", "\n");
+    for block in normalized.split("\n\n") {
+        let mut lines = block.lines().map(str::trim).filter(|l| !l.is_empty());
+        let Some(first) = lines.next() else {
+            continue;
+        };
+        if first.starts_with("WEBVTT") || first.starts_with("NOTE") || first.starts_with("STYLE") {
+            continue;
+        }
+        let timing_line = if first.contains("-->") {
+            first
+        } else if let Some(second) = lines.next().filter(|l| l.contains("-->")) {
+            second
+        } else {
+            continue;
+        };
+        let Some((lhs, rhs)) = timing_line.split_once("-->") else {
+            continue;
+        };
+        let Some(start) = parse_vtt_timestamp(lhs) else {
+            continue;
+        };
+        let rhs_time = rhs.split_whitespace().next().unwrap_or("");
+        let end = parse_vtt_timestamp(rhs_time)
+            .unwrap_or(start + 2.5)
+            .max(start + 0.1);
+        let text = lines
+            .map(strip_vtt_tags)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if text.is_empty() {
+            continue;
+        }
+        if let Some(prev) = cues.last() {
+            if prev.text == text && (start - prev.start_secs).abs() < 0.25 {
+                continue;
+            }
+        }
+        cues.push(TranscriptCue {
+            start_secs: start,
+            end_secs: end,
+            text,
+        });
+    }
+    cues
+}
+
+pub fn format_transcript_txt(cues: &[TranscriptCue]) -> String {
+    let mut out = String::new();
+    for c in cues {
+        let total = c.start_secs.max(0.0).floor() as u64;
+        let h = total / 3600;
+        let m = (total % 3600) / 60;
+        let s = total % 60;
+        if h > 0 {
+            out.push_str(&format!("[{h}:{m:02}:{s:02}] {}\n", c.text));
+        } else {
+            out.push_str(&format!("[{m:02}:{s:02}] {}\n", c.text));
+        }
+    }
+    out
+}
+
+fn format_srt_time(secs: f64) -> String {
+    let total_ms = (secs.max(0.0) * 1000.0).round() as u64;
+    let h = total_ms / 3_600_000;
+    let m = (total_ms % 3_600_000) / 60_000;
+    let s = (total_ms % 60_000) / 1000;
+    let ms = total_ms % 1000;
+    format!("{h:02}:{m:02}:{s:02},{ms:03}")
+}
+
+pub fn format_transcript_srt(cues: &[TranscriptCue]) -> String {
+    let mut out = String::new();
+    for (idx, c) in cues.iter().enumerate() {
+        out.push_str(&format!(
+            "{}\n{} --> {}\n{}\n\n",
+            idx + 1,
+            format_srt_time(c.start_secs),
+            format_srt_time(c.end_secs.max(c.start_secs + 0.2)),
+            c.text
+        ));
+    }
+    out
 }
 
 pub fn parse_chapters(description: &str, duration_secs: f64) -> Vec<Chapter> {
@@ -8409,5 +8699,59 @@ mod tests {
         assert_eq!(parsed_posts[0].comments_token.as_deref(), Some("DIRECT_POST_TOK"));
         assert_eq!(parsed_posts[0].comments_browse_id.as_deref(), Some("FEpost_detail"));
         assert_eq!(parsed_posts[0].comments_browse_params.as_deref(), Some("EggPost2Param"));
+    }
+
+    #[test]
+    fn parses_transcript_vtt_and_exports_srt_txt() {
+        let vtt = "WEBVTT\nKind: captions\n\n00:00:01.200 --> 00:00:03.500\n<c>Hello</c> world\n\n00:01:05.000 --> 00:01:08.250\nSecond line &amp; more\n";
+        let cues = parse_vtt_cues(vtt);
+        assert_eq!(cues.len(), 2);
+        assert!((cues[0].start_secs - 1.2).abs() < 0.01);
+        assert_eq!(cues[0].text, "Hello world");
+        assert_eq!(cues[1].text, "Second line & more");
+
+        let txt = format_transcript_txt(&cues);
+        assert!(txt.contains("[00:01] Hello world"));
+        assert!(txt.contains("[01:05] Second line & more"));
+
+        let srt = format_transcript_srt(&cues);
+        assert!(srt.contains("1\n00:00:01,200 --> 00:00:03,500\nHello world\n"));
+        assert!(srt.contains("2\n00:01:05,000 --> 00:01:08,250\nSecond line & more\n"));
+
+        let json_resp = json!({
+            "actions": [{
+                "updateEngagementPanelAction": {
+                    "content": {
+                        "transcriptRenderer": {
+                            "content": {
+                                "transcriptSearchPanelRenderer": {
+                                    "body": {
+                                        "transcriptSegmentListRenderer": {
+                                            "initialSegments": [{
+                                                "transcriptSegmentRenderer": {
+                                                    "startMs": "4500",
+                                                    "endMs": "7200",
+                                                    "snippet": { "runs": [{ "text": "Transcript cue" }] }
+                                                }
+                                            }]
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        });
+        let jcues = parse_get_transcript_json(&json_resp);
+        assert_eq!(jcues.len(), 1);
+        assert!((jcues[0].start_secs - 4.5).abs() < 0.01);
+        assert_eq!(jcues[0].text, "Transcript cue");
+
+        let turl = translated_vtt_url("https://www.youtube.com/api/timedtext?v=abc&lang=en&fmt=vtt", "id");
+        assert!(turl.contains("tlang=id"));
+        let turl2 = translated_vtt_url(&turl, "ja");
+        assert!(turl2.contains("tlang=ja"));
+        assert!(!turl2.contains("tlang=id"));
     }
 }

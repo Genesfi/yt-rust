@@ -12,8 +12,8 @@ use crate::model::{
     AudioTrack, ChannelInfo, ChannelNotificationParams, CommentItem, CommunityPost, FeedChip,
     LiveChatEmote, LiveChatMessage, NotificationLevel, NotificationMenuItem, PlaylistOption,
     PlaylistPrivacy, PlaylistSummary, PoTokenMode, PreferredQuality, SearchChannelResult,
-    SearchFilter, SidebarChannel, SponsorSegment, UpNextFilterMode, VideoFormat, VideoItem,
-    WatchData,
+    SearchFilter, SidebarChannel, SponsorSegment, TranscriptCue, UpNextFilterMode, VideoFormat,
+    VideoItem, WatchData,
 };
 use crate::potoken::PoTokenClient;
 use crate::proxy::StreamProxy;
@@ -254,6 +254,11 @@ pub enum Request {
         params: Option<String>,
         continuation: Option<String>,
         append: bool,
+    },
+    LoadTranscript {
+        video_id: String,
+        transcript_params: Option<String>,
+        fallback_vtt_url: Option<String>,
     },
 }
 
@@ -511,10 +516,16 @@ pub enum Response {
         tiled_width: u32,
         tiled_height: u32,
         tiled_rgba: Vec<u8>,
+        palette: [[u8; 3]; 4],
     },
     DropBoardStatus(bool),
     ScreenshotDone {
         sent_to_dropboard: bool,
+        error: Option<String>,
+    },
+    TranscriptLoaded {
+        video_id: String,
+        cues: Vec<TranscriptCue>,
         error: Option<String>,
     },
     RelatedChipLoaded {
@@ -2971,8 +2982,11 @@ impl Backend {
                                     .await
                                     .ok()
                                     .flatten();
-                                    if let Some(((width, height, rgba), (tiled_width, tiled_height, tiled_rgba))) =
-                                        ok
+                                    if let Some((
+                                        (width, height, rgba),
+                                        (tiled_width, tiled_height, tiled_rgba),
+                                        palette,
+                                    )) = ok
                                     {
                                         let _ = resp_tx.send(Response::AmbientArtReady {
                                             key,
@@ -2982,6 +2996,7 @@ impl Backend {
                                             tiled_width,
                                             tiled_height,
                                             tiled_rgba,
+                                            palette,
                                         });
                                         wake();
                                     }
@@ -3214,6 +3229,41 @@ impl Backend {
                                     wake();
                                 });
                             }
+                            Request::LoadTranscript {
+                                video_id,
+                                transcript_params,
+                                fallback_vtt_url,
+                            } => {
+                                let cfg_clone = cfg.clone();
+                                let sess_clone = session.clone();
+                                tokio::spawn(async move {
+                                    match innertube::fetch_transcript(
+                                        &http,
+                                        transcript_params.as_deref(),
+                                        fallback_vtt_url.as_deref(),
+                                        &cfg_clone,
+                                        sess_clone.as_ref(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(cues) => {
+                                            let _ = resp_tx.send(Response::TranscriptLoaded {
+                                                video_id,
+                                                cues,
+                                                error: None,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = resp_tx.send(Response::TranscriptLoaded {
+                                                video_id,
+                                                cues: Vec::new(),
+                                                error: Some(format!("{e:#}")),
+                                            });
+                                        }
+                                    }
+                                    wake();
+                                });
+                            }
                         }
                     }
                 });
@@ -3339,14 +3389,18 @@ async fn report_history_loop(
     }
 }
 
-async fn populate_hls_variants_if_needed(http: &reqwest::Client, data: &mut WatchData) {
+async fn populate_hls_variants_if_needed(
+    http: &reqwest::Client,
+    data: &mut WatchData,
+    ua: &str,
+) {
     let Some(hls) = data.hls_url.as_deref() else {
         return;
     };
     if !data.is_live && !data.video_formats.is_empty() {
         return;
     }
-    let (fmts, audio) = innertube::fetch_hls_variants(http, hls).await;
+    let (fmts, audio) = innertube::fetch_hls_variants_with_ua(http, hls, ua).await;
     if !fmts.is_empty() {
         data.video_formats = fmts;
     }
@@ -3563,7 +3617,16 @@ async fn resolve_ytdlp_with_potoken(
 
 async fn probe_url_ok(http: &reqwest::Client, url: &str, ua: &str) -> bool {
     if url.contains(".m3u8") || url.contains("/manifest/hls") {
-        return true;
+        return match http
+            .get(url)
+            .header("User-Agent", ua)
+            .timeout(std::time::Duration::from_secs(3))
+            .send()
+            .await
+        {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => true,
+        };
     }
     let sep = if url.contains('?') { '&' } else { '?' };
     let probe_url = if url.contains("range=") {
@@ -3697,6 +3760,23 @@ async fn probe_and_wrap_web_watch(
     None
 }
 
+static ANON_BOT_BLOCKED_AT: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+fn anon_recently_bot_blocked() -> bool {
+    ANON_BOT_BLOCKED_AT
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(10 * 60))
+}
+
+fn mark_anon_bot_blocked() {
+    if let Ok(mut g) = ANON_BOT_BLOCKED_AT.lock() {
+        *g = Some(std::time::Instant::now());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn resolve_web_native(
     http: &reqwest::Client,
@@ -3712,7 +3792,10 @@ async fn resolve_web_native(
     strict_auth: bool,
     prefetch_blocks: usize,
 ) -> (Option<Response>, Option<serde_json::Value>, Option<(String, crate::potoken::PoTokens)>) {
-    let want_pot = po_mode != PoTokenMode::Off && need_pot;
+    // Only mint an anonymous BotGuard token upfront if signed out (or Always On); when signed in,
+    // authenticated WEB+jsc works directly without stalling on WebView2 PO-token minting.
+    let want_pot = po_mode == PoTokenMode::On
+        || (po_mode == PoTokenMode::Auto && need_pot && session.is_none());
     let (next_json, js_res, (mut vd, mut pot)) = tokio::join!(
         innertube::fetch_next_json(http, video_id, cfg, session),
         jsc.player(http),
@@ -3734,12 +3817,10 @@ async fn resolve_web_native(
     }
 
     let mut attempt_cookies = if session.is_some() {
-        if pot.is_some() && !strict_auth {
-            // Anonymous PO tokens match unauthenticated WEB requests; avoid sending session cookies
-            // with an anonymous token on the first pass.
-            vec![false, true]
-        } else {
+        if strict_auth {
             vec![true]
+        } else {
+            vec![true, false]
         }
     } else {
         vec![false]
@@ -3748,8 +3829,15 @@ async fn resolve_web_native(
     let mut sd_fallback: Option<Response> = None;
 
     for use_cookies in attempt_cookies.drain(..) {
-        // Anonymous WebView PO tokens & visitorData must not be mixed with signed-in session cookies
-        // (mismatched visitor/PO bindings cause YouTube 403s on high-res streams).
+        // Lazily mint anonymous PO token only if signed-in WEB failed/capped and we fall back to anon.
+        if !use_cookies && pot.is_none() && need_pot && po_mode == PoTokenMode::Auto {
+            if let Some((v, p)) =
+                mint_po_tokens_if_needed(http, cfg, session, potoken, video_id).await
+            {
+                vd = v;
+                pot = Some(p);
+            }
+        }
         let attempt_vd = if use_cookies {
             cfg.visitor_data.as_deref().unwrap_or("")
         } else {
@@ -3770,7 +3858,7 @@ async fn resolve_web_native(
         .await
         {
             Ok(mut data) => {
-                populate_hls_variants_if_needed(http, &mut data).await;
+                populate_hls_variants_if_needed(http, &mut data, innertube::WEB_UA).await;
                 if let Some((v_url, a_url, idx)) =
                     probe_and_wrap_web_watch(http, &data, quality, proxy, prefetch_blocks).await
                 {
@@ -3782,7 +3870,10 @@ async fn resolve_web_native(
                         data: Box::new(data),
                         used_ytdlp: false,
                     };
-                    if quality.max_height() > 360 && max_h <= 360 && !use_cookies {
+                    if quality.max_height() > 360 && max_h <= 360 && use_cookies {
+                        log::warn!(
+                            "WEB InnerTube for {video_id} (cookies={use_cookies}) only returned {max_h}p; keeping as SD fallback while trying anonymous / yt-dlp HD"
+                        );
                         if sd_fallback.is_none() {
                             sd_fallback = Some(resp);
                         }
@@ -3827,7 +3918,8 @@ async fn resolve_web_native(
                             )
                             .await
                             {
-                                populate_hls_variants_if_needed(http, &mut data).await;
+                                populate_hls_variants_if_needed(http, &mut data, innertube::WEB_UA)
+                                    .await;
                                 if let Some((v_url, a_url, idx)) = probe_and_wrap_web_watch(
                                     http,
                                     &data,
@@ -3910,11 +4002,12 @@ async fn resolve_watch_with_height(
     let mut blocked_hint = po_mode == PoTokenMode::On;
     let mut strict_auth = false;
 
-    if po_mode != PoTokenMode::On {
+    let skip_anon = session.is_some() && anon_recently_bot_blocked();
+    if po_mode != PoTokenMode::On && !skip_anon {
         match innertube::watch(http, video_id, cfg, session).await {
             Ok(mut data) => {
                 let had_direct_formats = !data.video_formats.is_empty();
-                populate_hls_variants_if_needed(http, &mut data).await;
+                populate_hls_variants_if_needed(http, &mut data, innertube::VISIONOS_UA).await;
                 if data.is_live || !had_direct_formats {
                     if let Some(hls) = data.hls_url.clone() {
                         if po_mode == PoTokenMode::Auto {
@@ -3963,9 +4056,14 @@ async fn resolve_watch_with_height(
                     || lc.contains("members on level");
                 blocked_hint = ytdlp::is_auth_required_error(&inner_msg)
                     || inner_msg.contains("UNPLAYABLE");
+                if blocked_hint {
+                    mark_anon_bot_blocked();
+                }
                 log::warn!("InnerTube watch failed ({inner_msg}), trying native WEB+jsc");
             }
         }
+    } else if skip_anon {
+        blocked_hint = true;
     }
 
     let (web_res, next_json, minted_pot) = resolve_web_native(
@@ -4047,6 +4145,8 @@ async fn resolve_watch_with_height(
         audio_tracks: Vec::new(),
         hls_url: None,
         captions: Vec::new(),
+        translation_languages: Vec::new(),
+        transcript_params: None,
         chapters: Vec::new(),
         storyboard: None,
         comments_token: None,
@@ -4098,7 +4198,9 @@ pub fn pick_format_index(formats: &[VideoFormat], max_height: u32) -> Option<usi
         .or_else(|| Some(formats.len() - 1))
 }
 
-fn blur_ambient_art(bytes: &[u8]) -> Option<((u32, u32, Vec<u8>), (u32, u32, Vec<u8>))> {
+fn blur_ambient_art(
+    bytes: &[u8],
+) -> Option<((u32, u32, Vec<u8>), (u32, u32, Vec<u8>), [[u8; 3]; 4])> {
     const N: u32 = 64;
     let img = image::load_from_memory(bytes).ok()?.to_rgb8();
     let small = image::imageops::resize(&img, N, N, image::imageops::FilterType::Triangle);
@@ -4220,7 +4322,24 @@ fn blur_ambient_art(bytes: &[u8]) -> Option<((u32, u32, Vec<u8>), (u32, u32, Vec
     }
     let tiled_rgba = to_rgba(&tiled);
 
-    Some(((N, N, soft_rgba), (tw as u32, tw as u32, tiled_rgba)))
+    let sample_quad = |x: usize, y: usize| -> [u8; 3] {
+        let p = px[y * n + x];
+        let mx = p[0].max(p[1]).max(p[2]).max(1.0);
+        let boost = if mx < 85.0 { 85.0 / mx } else { 1.0 };
+        [
+            (p[0] * boost).clamp(24.0, 245.0) as u8,
+            (p[1] * boost).clamp(24.0, 245.0) as u8,
+            (p[2] * boost).clamp(28.0, 245.0) as u8,
+        ]
+    };
+    let palette = [
+        sample_quad(n / 4, n / 4),
+        sample_quad(n * 3 / 4, n / 4),
+        sample_quad(n / 4, n * 3 / 4),
+        sample_quad(n * 3 / 4, n * 3 / 4),
+    ];
+
+    Some(((N, N, soft_rgba), (tw as u32, tw as u32, tiled_rgba), palette))
 }
 
 #[allow(clippy::too_many_arguments)]
