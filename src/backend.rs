@@ -3311,9 +3311,12 @@ async fn resolve_ytdlp_with_potoken(
     po_mode: PoTokenMode,
     blocked_hint: bool,
     prefer_cookies_for_auth: bool,
+    existing_pot: Option<(String, crate::potoken::PoTokens)>,
 ) -> anyhow::Result<ytdlp::YtdlpStreams> {
     let cookie = session.map(|s| s.cookie.as_str());
-    let eager_pot = if prefer_cookies_for_auth {
+    let eager_pot = if existing_pot.is_some() {
+        existing_pot
+    } else if prefer_cookies_for_auth {
         None
     } else {
         match po_mode {
@@ -3460,6 +3463,48 @@ fn select_and_wrap_watch_height(
     None
 }
 
+fn max_watch_height(data: &WatchData) -> u32 {
+    data.video_formats.iter().map(|f| f.height).max().unwrap_or(0)
+}
+
+async fn probe_and_wrap_web_watch(
+    http: &reqwest::Client,
+    data: &WatchData,
+    quality: PreferredQuality,
+    proxy: Option<&StreamProxy>,
+    prefetch_blocks: usize,
+) -> Option<(String, Option<String>, Option<usize>)> {
+    // Select unproxied raw URLs first so preflight HTTP 403s do not trigger speculative proxy prefetches.
+    if let Some((_, _, _, raw_v, raw_a)) =
+        select_and_wrap_watch(data, quality, None, Some(innertube::WEB_UA), 0)
+    {
+        let ok = match raw_a.as_deref() {
+            Some(a) => {
+                let (vo, ao) = tokio::join!(
+                    probe_url_ok(http, &raw_v, innertube::WEB_UA),
+                    probe_url_ok(http, a, innertube::WEB_UA),
+                );
+                vo && ao
+            }
+            None => probe_url_ok(http, &raw_v, innertube::WEB_UA).await,
+        };
+        if ok {
+            if let Some((v_url, a_url, idx, _, _)) =
+                select_and_wrap_watch(data, quality, proxy, Some(innertube::WEB_UA), prefetch_blocks)
+            {
+                return Some((v_url, a_url, idx));
+            }
+        }
+    }
+    if let Some(hls) = data.hls_url.clone() {
+        let idx = (quality != PreferredQuality::Best4K)
+            .then(|| pick_format_index(&data.video_formats, quality.max_height()))
+            .flatten();
+        return Some((hls, None, idx));
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn resolve_web_native(
     http: &reqwest::Client,
@@ -3498,8 +3543,8 @@ async fn resolve_web_native(
 
     let mut attempt_cookies = if session.is_some() {
         if pot.is_some() && !strict_auth {
-            // Anonymous PO tokens match unauthenticated WEB requests; avoid a 403 preflight
-            // round-trip with cookies first before falling back cleanly.
+            // Anonymous PO tokens match unauthenticated WEB requests; avoid sending session cookies
+            // with an anonymous token on the first pass.
             vec![false, true]
         } else {
             vec![true]
@@ -3508,15 +3553,25 @@ async fn resolve_web_native(
         vec![false]
     };
 
+    let mut sd_fallback: Option<Response> = None;
+
     for use_cookies in attempt_cookies.drain(..) {
+        // Anonymous WebView PO tokens & visitorData must not be mixed with signed-in session cookies
+        // (mismatched visitor/PO bindings cause YouTube 403s on high-res streams).
+        let attempt_vd = if use_cookies {
+            cfg.visitor_data.as_deref().unwrap_or("")
+        } else {
+            vd.as_str()
+        };
+        let attempt_pot = (!use_cookies).then_some(pot.as_ref()).flatten();
         match innertube::watch_web_solved(
             http,
             video_id,
             cfg,
             session,
             jsc,
-            &vd,
-            pot.as_ref(),
+            attempt_vd,
+            attempt_pot,
             next_json.clone(),
             use_cookies,
         )
@@ -3524,44 +3579,42 @@ async fn resolve_web_native(
         {
             Ok(mut data) => {
                 populate_hls_variants_if_needed(http, &mut data).await;
-                if let Some((v_url, a_url, idx, raw_v, raw_a)) = select_and_wrap_watch(
-                    &data,
-                    quality,
-                    proxy,
-                    Some(innertube::WEB_UA),
-                    prefetch_blocks,
-                ) {
-                    let ok = match raw_a.as_deref() {
-                        Some(a) => {
-                            let (vo, ao) = tokio::join!(
-                                probe_url_ok(http, &raw_v, innertube::WEB_UA),
-                                probe_url_ok(http, a, innertube::WEB_UA),
-                            );
-                            vo && ao
-                        }
-                        None => probe_url_ok(http, &raw_v, innertube::WEB_UA).await,
+                if let Some((v_url, a_url, idx)) =
+                    probe_and_wrap_web_watch(http, &data, quality, proxy, prefetch_blocks).await
+                {
+                    let max_h = max_watch_height(&data);
+                    let resp = Response::WatchReady {
+                        selected_video_url: v_url,
+                        selected_audio_url: a_url,
+                        selected_format_idx: idx,
+                        data: Box::new(data),
+                        used_ytdlp: false,
                     };
-                    if ok {
-                        return (
-                            Some(Response::WatchReady {
-                                selected_video_url: v_url,
-                                selected_audio_url: a_url,
-                                selected_format_idx: idx,
-                                data: Box::new(data),
-                                used_ytdlp: false,
-                            }),
-                            next_json,
-                            pot.map(|p| (vd, p)),
-                        );
+                    if quality.max_height() > 360 && max_h <= 360 && !use_cookies {
+                        if sd_fallback.is_none() {
+                            sd_fallback = Some(resp);
+                        }
+                        continue;
                     }
-                    log::warn!(
-                        "WEB InnerTube stream for {video_id} (cookies={use_cookies}) failed 403 preflight"
-                    );
+                    if quality.max_height() > 360 && max_h <= 360 {
+                        log::warn!(
+                            "WEB InnerTube for {video_id} (cookies={use_cookies}) only returned {max_h}p; keeping as SD fallback while trying yt-dlp HD"
+                        );
+                        if sd_fallback.is_none() {
+                            sd_fallback = Some(resp);
+                        }
+                        break;
+                    }
+                    log::info!("WEB+jsc resolved {video_id} (cookies={use_cookies}, max={max_h}p)");
+                    return (Some(resp), next_json, pot.map(|p| (vd, p)));
                 }
+                log::warn!(
+                    "WEB InnerTube stream for {video_id} (cookies={use_cookies}) failed 403 preflight"
+                );
             }
             Err(e) => {
                 log::warn!("WEB InnerTube player for {video_id} (cookies={use_cookies}) failed: {e:#}");
-                if pot.is_none() && po_mode == PoTokenMode::Auto {
+                if !use_cookies && pot.is_none() && po_mode == PoTokenMode::Auto {
                     let msg = format!("{e:#}");
                     if ytdlp::needs_potoken_retry(&msg) {
                         if let Some((v, p)) =
@@ -3578,41 +3631,31 @@ async fn resolve_web_native(
                                 &vd,
                                 pot.as_ref(),
                                 next_json.clone(),
-                                session.is_some() && !strict_auth,
+                                false,
                             )
                             .await
                             {
                                 populate_hls_variants_if_needed(http, &mut data).await;
-                                if let Some((v_url, a_url, idx, raw_v, raw_a)) = select_and_wrap_watch(
+                                if let Some((v_url, a_url, idx)) = probe_and_wrap_web_watch(
+                                    http,
                                     &data,
                                     quality,
                                     proxy,
-                                    Some(innertube::WEB_UA),
                                     prefetch_blocks,
-                                ) {
-                                    let ok = match raw_a.as_deref() {
-                                        Some(a) => {
-                                            let (vo, ao) = tokio::join!(
-                                                probe_url_ok(http, &raw_v, innertube::WEB_UA),
-                                                probe_url_ok(http, a, innertube::WEB_UA),
-                                            );
-                                            vo && ao
-                                        }
-                                        None => probe_url_ok(http, &raw_v, innertube::WEB_UA).await,
-                                    };
-                                    if ok {
-                                        return (
-                                            Some(Response::WatchReady {
-                                                selected_video_url: v_url,
-                                                selected_audio_url: a_url,
-                                                selected_format_idx: idx,
-                                                data: Box::new(data),
-                                                used_ytdlp: false,
-                                            }),
-                                            next_json,
-                                            pot.map(|p| (vd, p)),
-                                        );
-                                    }
+                                )
+                                .await
+                                {
+                                    return (
+                                        Some(Response::WatchReady {
+                                            selected_video_url: v_url,
+                                            selected_audio_url: a_url,
+                                            selected_format_idx: idx,
+                                            data: Box::new(data),
+                                            used_ytdlp: false,
+                                        }),
+                                        next_json,
+                                        pot.map(|p| (vd, p)),
+                                    );
                                 }
                             }
                         }
@@ -3622,7 +3665,7 @@ async fn resolve_web_native(
         }
     }
 
-    (None, next_json, pot.map(|p| (vd, p)))
+    (sd_fallback, next_json, pot.map(|p| (vd, p)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3733,7 +3776,7 @@ async fn resolve_watch_with_height(
         }
     }
 
-    let (web_res, next_json, _minted_pot) = resolve_web_native(
+    let (web_res, next_json, minted_pot) = resolve_web_native(
         http,
         video_id,
         quality,
@@ -3748,12 +3791,18 @@ async fn resolve_watch_with_height(
         prefetch_blocks,
     )
     .await;
-    if let Some(resp) = web_res {
-        return Ok(resp);
-    }
+    let sd_web_fallback = match web_res {
+        Some(Response::WatchReady { ref data, .. })
+            if target_h > 360 && max_watch_height(data) <= 360 =>
+        {
+            web_res
+        }
+        Some(resp) => return Ok(resp),
+        None => None,
+    };
 
     log::warn!("Native WEB+jsc fallback unavailable for {video_id}, falling back to yt-dlp");
-    let yt = resolve_ytdlp_with_potoken(
+    let yt = match resolve_ytdlp_with_potoken(
         http,
         data_dir,
         video_id,
@@ -3764,8 +3813,24 @@ async fn resolve_watch_with_height(
         po_mode,
         blocked_hint,
         strict_auth,
+        minted_pot,
     )
-    .await?;
+    .await
+    {
+        Ok(yt) => yt,
+        Err(err) => {
+            if let Some(sd) = sd_web_fallback {
+                log::warn!("yt-dlp failed for {video_id} ({err:#}); using SD WEB+jsc fallback");
+                return Ok(sd);
+            }
+            return Err(err);
+        }
+    };
+    log::info!(
+        "yt-dlp fallback resolved {video_id} (max={}p, formats={})",
+        ytdlp::max_stream_height(&yt),
+        yt.video_formats.len()
+    );
     let next_opt = next_json.and_then(|v| innertube::watch_data_from_next(video_id, &v));
     let mut data = next_opt.unwrap_or_else(|| WatchData {
         id: video_id.to_owned(),

@@ -432,7 +432,7 @@ pub async fn resolve_video(
         .await?
     };
 
-    let streams = match first_res {
+    let mut streams = match first_res {
         Ok(s) => s,
         Err(first_err) => {
             let msg = format!("{first_err:#}");
@@ -468,6 +468,50 @@ pub async fn resolve_video(
             }
         }
     };
+
+    // When authenticated cookies fall back to `web_safari,tv` and YouTube caps formats at 360p
+    // (progressive itag 18 only), try broader yt-dlp client sets before settling for SD.
+    if used_cookie && should_retry_for_hd(&streams, max_height) {
+        if let Some(ref c) = cookie_owned {
+            for client_override in [
+                None,
+                Some("youtube:player_client=tv,web,android_vr"),
+            ] {
+                let bin_hd = bin.clone();
+                let rt_hd = runtime.clone();
+                let dir_hd = data_dir.to_owned();
+                let c_hd = c.clone();
+                let vid_hd = video_id.to_owned();
+                if let Ok(Ok(cand)) = tokio::task::spawn_blocking(move || {
+                    run_ytdlp_with_override(
+                        &bin_hd,
+                        rt_hd.as_deref(),
+                        &dir_hd,
+                        &c_hd,
+                        &vid_hd,
+                        max_height,
+                        client_override,
+                    )
+                })
+                .await
+                {
+                    if max_stream_height(&cand) > max_stream_height(&streams)
+                        && probe_streams_ok(http, &cand).await
+                    {
+                        log::info!(
+                            "yt-dlp HD retry upgraded {video_id} from {}p to {}p",
+                            max_stream_height(&streams),
+                            max_stream_height(&cand)
+                        );
+                        streams = cand;
+                        if !should_retry_for_hd(&streams, max_height) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     if !probe_streams_ok(http, &streams).await {
         log::warn!(
@@ -538,6 +582,58 @@ fn invoke_ytdlp_json(
     }
 
     Ok(cmd.output()?)
+}
+
+pub fn max_stream_height(streams: &YtdlpStreams) -> u32 {
+    streams
+        .video_formats
+        .iter()
+        .map(|f| f.height)
+        .max()
+        .unwrap_or(0)
+}
+
+fn should_retry_for_hd(streams: &YtdlpStreams, target_height: u32) -> bool {
+    target_height > 360 && max_stream_height(streams) <= 360
+}
+
+fn run_ytdlp_with_override(
+    bin: &Path,
+    runtime: Option<&str>,
+    data_dir: &Path,
+    cookie: &str,
+    video_id: &str,
+    max_height: u32,
+    extractor_arg: Option<&str>,
+) -> anyhow::Result<YtdlpStreams> {
+    let jar = TempCookieJar::create(data_dir, cookie)?;
+    let cache_dir = data_dir.join("ytdlp-cache");
+    let hls_sel = format!(
+        "bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/bestvideo[height<={max_height}][protocol^=m3u8]+bestaudio/best[height<={max_height}][protocol^=m3u8]/best"
+    );
+    let args: Vec<&str> = match extractor_arg {
+        Some(arg) => vec!["--extractor-args", arg],
+        None => Vec::new(),
+    };
+    let out = invoke_ytdlp_json(
+        bin,
+        runtime,
+        &cache_dir,
+        Some(jar.path.as_path()),
+        video_id,
+        &hls_sel,
+        &args,
+    )?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let msg = err
+            .lines()
+            .rfind(|l| l.contains("ERROR"))
+            .unwrap_or("yt-dlp failed");
+        anyhow::bail!("{}", msg.trim());
+    }
+    let v: Value = serde_json::from_slice(&out.stdout)?;
+    parse_ytdlp_streams(&v)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1143,5 +1239,38 @@ mod tests {
             "ERROR: This video is available to this channel's members-only"
         ));
         assert!(!super::is_auth_required_error("HTTP Error 404: Not Found"));
+    }
+
+    #[test]
+    fn hd_retry_detects_360p_cap_when_higher_quality_requested() {
+        let sd = super::YtdlpStreams {
+            video_url: "https://example.com/360.mp4".into(),
+            video_content_length: 100,
+            audio_url: None,
+            audio_content_length: 0,
+            hls_url: None,
+            video_formats: vec![crate::model::VideoFormat {
+                itag: 18,
+                url: "https://example.com/360.mp4".into(),
+                mime: "video/mp4; codecs=\"avc1.42001E\"".into(),
+                width: 640,
+                height: 360,
+                fps: 30,
+                bitrate: 500_000,
+                content_length: 100,
+                has_audio: true,
+            }],
+            audio_tracks: Vec::new(),
+            user_agent: None,
+            title: None,
+            channel: None,
+            channel_id: None,
+            description: String::new(),
+            duration_secs: 0.0,
+            is_live: None,
+        };
+        assert_eq!(super::max_stream_height(&sd), 360);
+        assert!(super::should_retry_for_hd(&sd, 1080));
+        assert!(!super::should_retry_for_hd(&sd, 360));
     }
 }
