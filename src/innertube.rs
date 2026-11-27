@@ -7,8 +7,9 @@ use crate::auth::Session;
 use crate::model::{
     AudioTrack, CaptionTrack, ChannelInfo, ChannelNotificationParams, ChannelTab, Chapter,
     CommentItem, FeedChip, LiveChatEmote, LiveChatKind, LiveChatMessage, LiveChatRun,
-    NotificationLevel, NotificationMenuItem, PlaylistOption, PlaylistSummary, SidebarChannel,
-    StoryboardSpec, VideoFormat, VideoItem, WatchData,
+    NotificationLevel, NotificationMenuItem, PlaylistOption, PlaylistSummary, SearchChannelResult,
+    SearchDateFilter, SearchDurationFilter, SearchFilter, SearchSortBy, SearchTypeFilter,
+    SidebarChannel, StoryboardSpec, VideoFormat, VideoItem, WatchData,
 };
 
 const ORIGIN: &str = "https://www.youtube.com";
@@ -1281,36 +1282,139 @@ pub async fn trending_feed(
             }
         }
     }
-    search(http, "trending videos 2026", None, cfg, session).await
+    search(http, "trending videos 2026", Some("EgIQAQ%3D%3D"), None, cfg, session)
+        .await
+        .map(|sp| FeedPage {
+            items: sp.items,
+            chips: sp.chips,
+            continuation: sp.continuation,
+            visitor_data: sp.visitor_data,
+            is_fallback_trending: false,
+        })
+}
+
+pub struct SearchResultPage {
+    pub channels: Vec<SearchChannelResult>,
+    pub items: Vec<VideoItem>,
+    pub chips: Vec<FeedChip>,
+    pub continuation: Option<String>,
+    pub visitor_data: Option<String>,
+}
+
+/// Encodes a `SearchFilter` into YouTube InnerTube `/youtubei/v1/search` `params` protobuf base64.
+pub fn encode_search_params(filter: SearchFilter) -> Option<String> {
+    let mut sub = Vec::new();
+    match filter.date {
+        SearchDateFilter::Anytime => {}
+        SearchDateFilter::LastHour => sub.extend_from_slice(&[0x08, 1]),
+        SearchDateFilter::Today => sub.extend_from_slice(&[0x08, 2]),
+        SearchDateFilter::ThisWeek => sub.extend_from_slice(&[0x08, 3]),
+        SearchDateFilter::ThisMonth => sub.extend_from_slice(&[0x08, 4]),
+        SearchDateFilter::ThisYear => sub.extend_from_slice(&[0x08, 5]),
+    }
+    match filter.kind {
+        SearchTypeFilter::All => {}
+        SearchTypeFilter::Videos => sub.extend_from_slice(&[0x10, 1]),
+        SearchTypeFilter::Channels => sub.extend_from_slice(&[0x10, 2]),
+        SearchTypeFilter::Playlists => sub.extend_from_slice(&[0x10, 3]),
+        SearchTypeFilter::Live => sub.extend_from_slice(&[0x40, 1]),
+    }
+    match filter.duration {
+        SearchDurationFilter::Any => {}
+        SearchDurationFilter::Short => sub.extend_from_slice(&[0x18, 1]),
+        SearchDurationFilter::Medium => sub.extend_from_slice(&[0x18, 3]),
+        SearchDurationFilter::Long => sub.extend_from_slice(&[0x18, 2]),
+    }
+
+    let mut proto = Vec::new();
+    match filter.sort {
+        SearchSortBy::Relevance => {}
+        SearchSortBy::Rating => proto.extend_from_slice(&[0x08, 1]),
+        SearchSortBy::UploadDate => proto.extend_from_slice(&[0x08, 2]),
+        SearchSortBy::ViewCount => proto.extend_from_slice(&[0x08, 3]),
+    }
+    if !sub.is_empty() {
+        proto.push(0x12);
+        proto.push(sub.len() as u8);
+        proto.extend_from_slice(&sub);
+    }
+    if proto.is_empty() {
+        return None;
+    }
+    Some(base64_standard_encode(&proto).replace('=', "%3D"))
+}
+
+fn base64_standard_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+pub fn parse_search_results(v: &Value) -> SearchResultPage {
+    let new_vd = v["responseContext"]["visitorData"]
+        .as_str()
+        .map(str::to_owned);
+    let primary_root = if v["contents"]["twoColumnSearchResultsRenderer"]["primaryContents"].is_object()
+    {
+        &v["contents"]["twoColumnSearchResultsRenderer"]["primaryContents"]
+    } else {
+        v
+    };
+    let mut channels = Vec::new();
+    let mut seen_channels = HashSet::new();
+    collect_search_channels(primary_root, &mut channels, &mut seen_channels);
+
+    let mut items = Vec::new();
+    let mut seen_videos = HashSet::new();
+    collect_videos(primary_root, &mut items, &mut seen_videos);
+
+    let chips = collect_chips(v);
+    let cont = find_continuation(primary_root).or_else(|| find_continuation(v));
+    SearchResultPage {
+        channels,
+        items,
+        chips,
+        continuation: cont,
+        visitor_data: new_vd,
+    }
 }
 
 pub async fn search(
     http: &reqwest::Client,
     query: &str,
+    params: Option<&str>,
     continuation: Option<&str>,
     cfg: &WebConfig,
     session: Option<&Session>,
-) -> anyhow::Result<FeedPage> {
-        let body = match continuation {
-            Some(token) => json!({ "continuation": token }),
-            None => json!({ "query": query, "params": "EgIQAQ%3D%3D" }),
-        };
-        let v = post_web(http, "search", body, cfg, session).await?;
-        let new_vd = v["responseContext"]["visitorData"]
-            .as_str()
-            .map(str::to_owned);
-        let mut items = Vec::new();
-        let mut seen = HashSet::new();
-        collect_videos(&v, &mut items, &mut seen);
-        let cont = find_continuation(&v);
-        Ok(FeedPage {
-            items,
-            chips: Vec::new(),
-            continuation: cont,
-            visitor_data: new_vd,
-            is_fallback_trending: false,
-        })
-    }
+) -> anyhow::Result<SearchResultPage> {
+    let body = match continuation {
+        Some(token) => json!({ "continuation": token }),
+        None => match params.filter(|p| !p.is_empty()) {
+            Some(p) => json!({ "query": query, "params": p }),
+            None => json!({ "query": query }),
+        },
+    };
+    let v = post_web(http, "search", body, cfg, session).await?;
+    Ok(parse_search_results(&v))
+}
 
 pub async fn channel_videos(
     http: &reqwest::Client,
@@ -5261,7 +5365,7 @@ pub async fn shorts_feed(
     }
     // 2. Supplement via Shorts search / #shorts query so dedicated Shorts tab is always populated
     if out.len() < 16 {
-        if let Ok(sp) = search(http, "#shorts", None, cfg, session).await {
+        if let Ok(sp) = search(http, "#shorts", None, None, cfg, session).await {
             for mut it in sp.items {
                 if seen.insert(it.id.clone()) {
                     if it.duration_text.is_empty() {
@@ -5347,6 +5451,131 @@ pub async fn fetch_shorts_sequence(
     Ok(out)
 }
 
+fn collect_search_channels(
+    v: &Value,
+    out: &mut Vec<SearchChannelResult>,
+    seen: &mut HashSet<String>,
+) {
+    match v {
+        Value::Object(map) => {
+            if is_ad_container(map) {
+                return;
+            }
+            if let Some(cr) = map.get("channelRenderer") {
+                if let Some(ch) = parse_channel_renderer(cr) {
+                    if seen.insert(ch.id.clone()) {
+                        out.push(ch);
+                    }
+                }
+            }
+            for val in map.values() {
+                collect_search_channels(val, out, seen);
+            }
+        }
+        Value::Array(arr) => {
+            for val in arr {
+                collect_search_channels(val, out, seen);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_channel_renderer(cr: &Value) -> Option<SearchChannelResult> {
+    let id = cr["channelId"].as_str()?.to_owned();
+    let title = text(&cr["title"])?;
+    let sub_t = text(&cr["subscriberCountText"]).unwrap_or_default();
+    let vid_t = text(&cr["videoCountText"]).unwrap_or_default();
+    let (mut handle, subscribers_text, video_count_text) = if sub_t.trim_start().starts_with('@') {
+        (sub_t, vid_t, String::new())
+    } else {
+        (String::new(), sub_t, vid_t)
+    };
+    if handle.is_empty() {
+        if let Some(canon) = cr["navigationEndpoint"]["browseEndpoint"]["canonicalBaseUrl"]
+            .as_str()
+            .filter(|s| s.starts_with("/@"))
+        {
+            handle = canon.trim_start_matches('/').to_owned();
+        }
+    }
+    let description_snippet = text(&cr["descriptionSnippet"]).unwrap_or_default();
+    let avatar_url = cr["thumbnail"]["thumbnails"]
+        .as_array()
+        .and_then(|a| a.last())
+        .and_then(|t| t["url"].as_str())
+        .map(normalize_url);
+    let is_subscribed = cr["subscriptionButton"]["subscribed"]
+        .as_bool()
+        .unwrap_or(false);
+    Some(SearchChannelResult {
+        id,
+        title,
+        handle,
+        subscribers_text,
+        video_count_text,
+        description_snippet,
+        avatar_url,
+        is_subscribed,
+    })
+}
+
+fn parse_search_playlist_renderer(pr: &Value) -> Option<VideoItem> {
+    let pid = pr["playlistId"].as_str()?;
+    let title = text(&pr["title"])?;
+    let bid = if pid.starts_with("VL") {
+        pid.to_owned()
+    } else {
+        format!("VL{pid}")
+    };
+    let byline = pr["longBylineText"]["runs"]
+        .get(0)
+        .or_else(|| pr["shortBylineText"]["runs"].get(0));
+    let channel = byline
+        .and_then(|r| r["text"].as_str())
+        .map(str::to_owned)
+        .or_else(|| text(&pr["shortBylineText"]))
+        .unwrap_or_default();
+    let channel_id = byline
+        .and_then(|r| r["navigationEndpoint"]["browseEndpoint"]["browseId"].as_str())
+        .map(str::to_owned);
+    let count = text(&pr["videoCountText"])
+        .or_else(|| {
+            pr["videoCount"]
+                .as_str()
+                .map(|c| format!("{c} videos"))
+        })
+        .unwrap_or_else(|| "Playlist".to_owned());
+    let thumb = pr["thumbnails"]
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|t| t["thumbnails"].as_array())
+        .and_then(|a| a.last())
+        .and_then(|t| t["url"].as_str())
+        .map(normalize_url)
+        .or_else(|| find_first_thumb_url(&pr["thumbnailRenderer"]))
+        .or_else(|| find_first_thumb_url(&pr["thumbnail"]))
+        .unwrap_or_default();
+    Some(VideoItem {
+        id: bid.clone(),
+        title,
+        channel,
+        channel_id,
+        channel_avatar_url: None,
+        views_text: count,
+        published_text: String::new(),
+        duration_text: "Playlist".to_owned(),
+        thumbnail_url: thumb,
+        is_live: false,
+        watched_percent: None,
+        resume_secs: None,
+        playlist_browse_id: Some(bid),
+        playlist_set_video_id: None,
+        is_new: false,
+        is_members_only: false,
+    })
+}
+
 fn collect_videos(v: &Value, out: &mut Vec<VideoItem>, seen: &mut HashSet<String>) {
     match v {
         Value::Object(map) => {
@@ -5355,6 +5584,12 @@ fn collect_videos(v: &Value, out: &mut Vec<VideoItem>, seen: &mut HashSet<String
             }
             if let Some(vr) = map.get("videoRenderer").or_else(|| map.get("compactVideoRenderer")) {
                 if let Some(item) = parse_video_renderer(vr) {
+                    if seen.insert(item.id.clone()) {
+                        out.push(item);
+                    }
+                }
+            } else if let Some(pr) = map.get("playlistRenderer") {
+                if let Some(item) = parse_search_playlist_renderer(pr) {
                     if seen.insert(item.id.clone()) {
                         out.push(item);
                     }
@@ -6453,6 +6688,109 @@ mod tests {
         assert_eq!(page.items[0].id, "MATCH_VID_1");
         assert_eq!(page.items[0].channel, "Ray Restu Fauzi");
         assert_eq!(page.continuation.as_deref(), Some("SEARCH_CONT_1"));
+    }
+
+    #[test]
+    fn encodes_search_filter_params_and_parses_channels_and_playlists() {
+        assert_eq!(encode_search_params(SearchFilter::default()), None);
+        assert_eq!(
+            encode_search_params(SearchFilter {
+                kind: SearchTypeFilter::Videos,
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("EgIQAQ%3D%3D")
+        );
+        assert_eq!(
+            encode_search_params(SearchFilter {
+                kind: SearchTypeFilter::Channels,
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("EgIQAg%3D%3D")
+        );
+        assert_eq!(
+            encode_search_params(SearchFilter {
+                kind: SearchTypeFilter::Playlists,
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("EgIQAw%3D%3D")
+        );
+        assert_eq!(
+            encode_search_params(SearchFilter {
+                kind: SearchTypeFilter::Live,
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("EgJAAQ%3D%3D")
+        );
+        assert_eq!(
+            encode_search_params(SearchFilter {
+                sort: SearchSortBy::UploadDate,
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("CAI%3D")
+        );
+
+        let resp = json!({
+            "contents": {
+                "twoColumnSearchResultsRenderer": {
+                    "primaryContents": {
+                        "sectionListRenderer": {
+                            "contents": [
+                                {
+                                    "itemSectionRenderer": {
+                                        "contents": [
+                                            {
+                                                "channelRenderer": {
+                                                    "channelId": "UC_YG_1",
+                                                    "title": { "simpleText": "Yan Gustian" },
+                                                    "subscriberCountText": { "simpleText": "@yangustian3656" },
+                                                    "videoCountText": { "simpleText": "11 subscribers" },
+                                                    "descriptionSnippet": { "runs": [{ "text": "Gaming & Arknights" }] },
+                                                    "thumbnail": { "thumbnails": [{ "url": "//yt3.googleusercontent.com/avatar.jpg" }] }
+                                                }
+                                            },
+                                            {
+                                                "playlistRenderer": {
+                                                    "playlistId": "PL_TEST_1",
+                                                    "title": { "simpleText": "Arknights Playlist" },
+                                                    "videoCount": "6",
+                                                    "shortBylineText": { "runs": [{ "text": "Yan Gustian", "navigationEndpoint": { "browseEndpoint": { "browseId": "UC_YG_1" } } }] },
+                                                    "thumbnails": [{ "thumbnails": [{ "url": "https://i.ytimg.com/vi/abc/mqdefault.jpg" }] }]
+                                                }
+                                            },
+                                            {
+                                                "videoRenderer": {
+                                                    "videoId": "VID_1",
+                                                    "title": { "runs": [{ "text": "Sample Video" }] },
+                                                    "lengthText": { "simpleText": "5:21" }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+        let page = parse_search_results(&resp);
+        assert_eq!(page.channels.len(), 1);
+        assert_eq!(page.channels[0].id, "UC_YG_1");
+        assert_eq!(page.channels[0].title, "Yan Gustian");
+        assert_eq!(page.channels[0].handle, "@yangustian3656");
+        assert_eq!(page.channels[0].subscribers_text, "11 subscribers");
+        assert_eq!(
+            page.channels[0].avatar_url.as_deref(),
+            Some("https://yt3.googleusercontent.com/avatar.jpg")
+        );
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].playlist_browse_id.as_deref(), Some("VLPL_TEST_1"));
+        assert_eq!(page.items[1].id, "VID_1");
     }
 
     #[test]

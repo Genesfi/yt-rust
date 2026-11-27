@@ -11,8 +11,8 @@ use crate::innertube::{self, FeedPage, WebConfig};
 use crate::model::{
     AudioTrack, ChannelInfo, ChannelNotificationParams, CommentItem, FeedChip, LiveChatEmote,
     LiveChatMessage, NotificationLevel, NotificationMenuItem, PlaylistOption, PlaylistSummary,
-    PoTokenMode, PreferredQuality, SidebarChannel, SponsorSegment, VideoFormat, VideoItem,
-    WatchData,
+    PoTokenMode, PreferredQuality, SearchChannelResult, SidebarChannel, SponsorSegment,
+    VideoFormat, VideoItem, WatchData,
 };
 use crate::potoken::PoTokenClient;
 use crate::proxy::StreamProxy;
@@ -72,6 +72,7 @@ pub enum Request {
     },
     Search {
         query: String,
+        params: Option<String>,
         continuation: Option<String>,
     },
     SearchSuggest {
@@ -264,6 +265,8 @@ pub enum Response {
     },
     SearchLoaded {
         query: String,
+        params: Option<String>,
+        channels: Vec<SearchChannelResult>,
         items: Vec<VideoItem>,
         continuation: Option<String>,
         append: bool,
@@ -2025,18 +2028,24 @@ impl Backend {
                                     wake();
                                 });
                             }
-                            Request::Search { query, continuation } => {
+                            Request::Search {
+                                query,
+                                params,
+                                continuation,
+                            } => {
                                 let append = continuation.is_some();
                                 match innertube::search(
                                     &http,
                                     &query,
+                                    params.as_deref(),
                                     continuation.as_deref(),
                                     &cfg,
                                     session.as_ref(),
                                 )
                                 .await
                                 {
-                                    Ok(FeedPage {
+                                    Ok(innertube::SearchResultPage {
+                                        channels,
                                         items,
                                         continuation,
                                         visitor_data,
@@ -2047,6 +2056,8 @@ impl Backend {
                                         }
                                         let _ = resp_tx.send(Response::SearchLoaded {
                                             query,
+                                            params,
+                                            channels,
                                             items,
                                             continuation,
                                             append,

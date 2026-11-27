@@ -409,23 +409,8 @@ impl YtApp {
         ctx: &egui::Context,
         resume_video_title: Option<&str>,
     ) -> ShortsUiAction {
-        let drawer_w = 370.0_f32;
-        let has_wide_info =
-            ui.available_width() >= if self.shorts_comments_open { 1040.0 } else { 760.0 };
-        let info_w = if has_wide_info {
-            (ui.available_width() * 0.23).clamp(215.0, 290.0)
-        } else {
-            0.0
-        };
-        let comments_reserve = if self.shorts_comments_open {
-            drawer_w + 16.0
-        } else {
-            0.0
-        };
-        let height_reserve = if has_wide_info { 62.0 } else { 150.0 };
-        let sh = (ui.available_height() - height_reserve).clamp(360.0, 820.0);
-        let sw = (sh * 9.0 / 16.0)
-            .min((ui.available_width() - 160.0 - info_w - comments_reserve).max(220.0));
+        let page_rect = ui.available_rect_before_wrap();
+        let full_rect = ctx.content_rect();
         let mut action = ShortsUiAction::None;
 
         ui.vertical(|ui| {
@@ -488,374 +473,302 @@ impl YtApp {
             });
             ui.add_space(8.0);
 
-            let rail_w = 60.0_f32;
-            let nav_w = 48.0_f32;
-            let total_row_w = (if has_wide_info { info_w + 16.0 } else { 0.0 })
-                + sw
-                + 12.0
-                + rail_w
-                + comments_reserve
-                + 16.0
-                + nav_w;
-            let side_pad = ((ui.available_width() - total_row_w) * 0.5).max(0.0);
+            let body_rect = ui.available_rect_before_wrap();
+            let rail_w = 58.0_f32;
+            let rail_gap = 12.0_f32;
+            let drawer_gap = 14.0_f32;
+            let sh = (body_rect.height() - 12.0).clamp(360.0, 820.0);
+            let max_sw_for_comments = if self.shorts_comments_open {
+                (body_rect.width() - rail_w - rail_gap - drawer_gap - 280.0 - 24.0).max(240.0)
+            } else {
+                (body_rect.width() - rail_w - rail_gap - 24.0).max(240.0)
+            };
+            let sw = (sh * 9.0 / 16.0).min(max_sw_for_comments);
+            let drawer_w = if self.shorts_comments_open {
+                (body_rect.width() - sw - rail_w - rail_gap - drawer_gap - 62.0).clamp(260.0, 340.0)
+            } else {
+                0.0
+            };
 
-            ui.horizontal_top(|ui| {
-                ui.add_space(side_pad);
-
-                if has_wide_info {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(info_w, sh),
-                        Layout::bottom_up(Align::LEFT),
-                        |ui| {
-                            if let Some(w) = self.watch.clone() {
-                                ui.add_space(8.0);
-                                let title_display =
-                                    clamp_two_lines(ui, &w.title, theme::semibold(14.5), info_w);
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(title_display)
-                                            .font(theme::semibold(14.5))
-                                            .color(theme::TEXT),
-                                    )
-                                    .wrap(),
-                                )
-                                .on_hover_text(&w.title);
-
-                                if w.is_members_only {
-                                    ui.add_space(6.0);
-                                    draw_members_badge(ui);
-                                }
-
-                                if let Some(cid) = w.channel_id.clone() {
-                                    ui.add_space(6.0);
-                                    super::cards::draw_subscribe_bell_button(
-                                        ui,
-                                        cid.clone(),
-                                        w.is_subscribed,
-                                        &w.notifications,
-                                        &self.backend.tx,
-                                    );
-                                    ui.add_space(6.0);
-                                    ui.horizontal(|ui| {
-                                        draw_avatar(
-                                            ui,
-                                            w.channel_avatar_url.as_deref(),
-                                            &w.channel,
-                                            32.0,
-                                        );
-                                        ui.add_space(8.0);
-                                        let name_max_w = (info_w - 42.0).max(90.0);
-                                        let ch_display = clamp_two_lines(
-                                            ui,
-                                            &w.channel,
-                                            theme::semibold(13.5),
-                                            name_max_w,
-                                        );
-                                        ui.allocate_ui_with_layout(
-                                            Vec2::new(name_max_w, 34.0),
-                                            Layout::top_down(Align::LEFT),
-                                            |ui| {
-                                                let ch_btn = ui
-                                                    .add(
-                                                        egui::Label::new(
-                                                            RichText::new(ch_display)
-                                                                .font(theme::semibold(13.5))
-                                                                .color(theme::TEXT),
-                                                        )
-                                                        .wrap()
-                                                        .sense(Sense::click()),
-                                                    )
-                                                    .on_hover_text(&w.channel);
-                                                if ch_btn.hovered() {
-                                                    ui.ctx()
-                                                        .set_cursor_icon(CursorIcon::PointingHand);
-                                                }
-                                                if ch_btn.clicked() {
-                                                    action = ShortsUiAction::OpenChannel(
-                                                        cid.clone(),
-                                                        w.channel.clone(),
-                                                    );
-                                                }
-                                            },
-                                        );
-                                    });
-                                }
-                            } else if self.watch_loading {
-                                ui.spinner();
-                            }
-                        },
-                    );
-                    ui.add_space(16.0);
+            // Lock video horizontally to the full window center so opening Sidebar or Comments never shifts it.
+            let min_vid_left = body_rect.left() + 8.0;
+            let max_vid_left = if self.shorts_comments_open {
+                (body_rect.right() - drawer_w - drawer_gap - rail_w - rail_gap - sw - 54.0)
+                    .max(min_vid_left)
+            } else {
+                (body_rect.right() - rail_w - rail_gap - sw - 16.0).max(min_vid_left)
+            };
+            let vid_left = (full_rect.center().x - sw * 0.5).clamp(min_vid_left, max_vid_left);
+            let vid_top = body_rect.top() + ((body_rect.height() - sh) * 0.5).max(0.0);
+            let (slide_offset_y, slide_alpha) = if let Some((dir, started)) = self.shorts_slide_anim {
+                let t = (started.elapsed().as_secs_f32() / 0.24).clamp(0.0, 1.0);
+                if t >= 1.0 {
+                    self.shorts_slide_anim = None;
+                    (0.0, 1.0)
+                } else {
+                    ctx.request_repaint();
+                    let ease = 1.0 - (1.0 - t).powi(3);
+                    ((dir as f32) * (1.0 - ease) * (sh * 0.16), 0.35 + 0.65 * ease)
                 }
+            } else {
+                (0.0, 1.0)
+            };
+            let base_vid_rect = Rect::from_min_size(pos2(vid_left, vid_top), Vec2::new(sw, sh));
+            let vid_rect = base_vid_rect.translate(vec2(0.0, slide_offset_y));
 
-                let player_rect_before = ui.cursor();
-                self.draw_video_surface(ui, ctx, Vec2::new(sw, sh), false, true);
-                let scroll_rect = Rect::from_min_size(player_rect_before.min, Vec2::new(sw, sh));
-                if ui.rect_contains_pointer(scroll_rect) {
-                    let wy = ctx.input(|i| i.smooth_scroll_delta.y);
-                    if wy > 28.0 {
+            let mut vid_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(vid_rect)
+                    .layout(Layout::top_down(Align::LEFT)),
+            );
+            vid_ui.set_clip_rect(vid_ui.clip_rect().intersect(body_rect));
+            if slide_alpha < 0.99 {
+                vid_ui.set_opacity(slide_alpha);
+            }
+            if let Some((cid, cname)) =
+                self.draw_video_surface_inner(&mut vid_ui, ctx, Vec2::new(sw, sh), false, true)
+            {
+                action = ShortsUiAction::OpenChannel(cid, cname);
+            }
+            if ui.rect_contains_pointer(base_vid_rect) {
+                let wy = ctx.input(|i| i.smooth_scroll_delta.y);
+                let cooldown_ok = self
+                    .shorts_last_wheel_at
+                    .is_none_or(|t| t.elapsed() >= Duration::from_millis(320));
+                if cooldown_ok && wy > 24.0 {
+                    self.shorts_last_wheel_at = Some(Instant::now());
+                    action = ShortsUiAction::Step(-1);
+                } else if cooldown_ok && wy < -24.0 {
+                    self.shorts_last_wheel_at = Some(Instant::now());
+                    action = ShortsUiAction::Step(1);
+                }
+            }
+
+            let rail_rect = Rect::from_min_size(
+                pos2(vid_rect.right() + rail_gap, vid_top),
+                Vec2::new(rail_w, sh),
+            );
+            let mut rail_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(rail_rect)
+                    .layout(Layout::top_down(Align::Center)),
+            );
+            if let Some(w) = self.watch.clone() {
+                rail_ui.spacing_mut().item_spacing.y = 0.0;
+                let rail_total_h = 5.0 * 62.0 + 4.0 * 10.0 + 14.0;
+                rail_ui.add_space((sh - rail_total_h).max(4.0));
+
+                let like_lbl = if w.likes_text.is_empty() {
+                    "Like"
+                } else {
+                    w.likes_text.as_str()
+                };
+                let liked = w.is_liked;
+                if shorts_rail_button(
+                    &mut rail_ui,
+                    like_lbl,
+                    if liked { "Unlike" } else { "Like" },
+                    liked,
+                    |painter, c, col| {
+                        theme::draw_thumbs_up(painter, c, 18.0, col, liked);
+                    },
+                ) {
+                    let _ = self.backend.tx.send(Request::SetLike {
+                        video_id: w.id.clone(),
+                        like: !liked,
+                    });
+                }
+                rail_ui.add_space(10.0);
+
+                let dislike_lbl = w
+                    .dislikes_text
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Dislike");
+                if shorts_rail_button(
+                    &mut rail_ui,
+                    dislike_lbl,
+                    if w.is_disliked {
+                        "Remove dislike"
+                    } else {
+                        "Dislike"
+                    },
+                    w.is_disliked,
+                    |painter, c, col| {
+                        theme::draw_icon_centered(
+                            painter,
+                            c,
+                            icon::THUMBS_DOWN,
+                            18.0,
+                            col,
+                        );
+                    },
+                ) {
+                    let _ = self.backend.tx.send(Request::SetDislike {
+                        video_id: w.id.clone(),
+                        dislike: !w.is_disliked,
+                    });
+                }
+                rail_ui.add_space(10.0);
+
+                let c_label = if self.comments.is_empty() {
+                    "Comments".to_owned()
+                } else {
+                    self.comments.len().to_string()
+                };
+                if shorts_rail_button(
+                    &mut rail_ui,
+                    &c_label,
+                    "Comments & Replies",
+                    self.shorts_comments_open,
+                    |painter, c, col| {
+                        theme::draw_comment_icon(painter, c, 18.0, col);
+                    },
+                ) {
+                    self.shorts_comments_open = !self.shorts_comments_open;
+                    if self.shorts_comments_open
+                        && self.comments.is_empty()
+                        && !self.comments_loading
+                    {
+                        if let Some(tok) = w.comments_token.clone() {
+                            self.comments_loading = true;
+                            let _ = self.backend.tx.send(Request::LoadComments {
+                                video_id: w.id.clone(),
+                                continuation: tok,
+                                append: false,
+                            });
+                        }
+                    }
+                }
+                rail_ui.add_space(10.0);
+
+                if shorts_rail_button(
+                    &mut rail_ui,
+                    "Share",
+                    "Copy Short URL",
+                    false,
+                    |painter, c, col| {
+                        theme::draw_share_icon(painter, c, 18.0, col);
+                    },
+                ) {
+                    ctx.copy_text(format!("https://www.youtube.com/shorts/{}", w.id));
+                    self.toast("Copied Shorts URL");
+                }
+                rail_ui.add_space(10.0);
+
+                if shorts_rail_button(
+                    &mut rail_ui,
+                    "Save",
+                    "Download MP4",
+                    false,
+                    |painter, c, col| {
+                        theme::draw_icon_centered(
+                            painter,
+                            c,
+                            icon::DOWNLOAD,
+                            18.0,
+                            col,
+                        );
+                    },
+                ) {
+                    self.start_download(w.id.clone(), w.title.clone(), false);
+                }
+            }
+
+            if self.shorts_comments_open {
+                if let Some(w) = self.watch.clone() {
+                    let drawer_rect = Rect::from_min_size(
+                        pos2(rail_rect.right() + drawer_gap, vid_top),
+                        Vec2::new(drawer_w, sh),
+                    );
+                    let mut dui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(drawer_rect)
+                            .layout(Layout::top_down(Align::LEFT)),
+                    );
+                    Frame::new()
+                        .fill(theme::SURFACE)
+                        .stroke(Stroke::new(1.0, theme::BORDER))
+                        .corner_radius(14)
+                        .inner_margin(Margin::same(12))
+                        .show(&mut dui, |ui| {
+                            let inner_w = (drawer_w - 24.0).max(160.0);
+                            let inner_h = (sh - 24.0).max(200.0);
+                            ui.set_width(inner_w);
+                            ui.set_height(inner_h);
+                            ui.vertical(|ui| {
+                                self.draw_comments_header(ui, &w, true);
+                                ui.separator();
+                                ui.add_space(4.0);
+                                let has_composer =
+                                    self.signed_in && self.comment_create_params.is_some();
+                                let composer_h = if has_composer { 46.0 } else { 0.0 };
+                                let list_h = (inner_h - 46.0 - composer_h).max(80.0);
+                                ScrollArea::vertical()
+                                    .id_salt("shorts_comments_drawer")
+                                    .max_height(list_h)
+                                    .show(ui, |ui| {
+                                        ui.set_width(inner_w - 6.0);
+                                        self.draw_comments_list(ui, &w);
+                                    });
+                                if has_composer {
+                                    ui.separator();
+                                    ui.add_space(4.0);
+                                    self.draw_comment_composer(ui, &w);
+                                }
+                            });
+                        });
+                }
+            }
+
+            // Right-aligned Up/Down navigation arrows, visible smoothly on hover over the right edge
+            let can_prev = self.shorts_idx > 0;
+            let can_next = (!self.shorts_queue.is_empty()
+                && self.shorts_idx + 1 < self.shorts_queue.len())
+                || self
+                    .watch
+                    .as_ref()
+                    .is_some_and(|w| !w.related.is_empty());
+            if can_prev || can_next {
+                let nav_hover_zone = Rect::from_min_max(
+                    pos2((page_rect.right() - 120.0).max(page_rect.left()), body_rect.top()),
+                    page_rect.max,
+                );
+                let nav_hovered = ui.rect_contains_pointer(nav_hover_zone);
+                let nav_alpha = ctx.animate_bool_with_time(
+                    egui::Id::unique("shorts_right_nav_hover"),
+                    nav_hovered,
+                    0.16,
+                );
+                if nav_alpha > 0.02 {
+                    let btn_group_h = if can_prev && can_next { 100.0 } else { 44.0 };
+                    let nav_rect = Rect::from_center_size(
+                        pos2(page_rect.right() - 26.0, body_rect.center().y),
+                        Vec2::new(48.0, btn_group_h),
+                    );
+                    let mut nui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(nav_rect)
+                            .layout(Layout::top_down(Align::Center)),
+                    );
+                    nui.set_opacity(nav_alpha);
+                    if can_prev
+                        && shorts_nav_circle(&mut nui, icon::CHEVRON_UP, "Previous Short (Up)")
+                    {
                         action = ShortsUiAction::Step(-1);
-                    } else if wy < -28.0 {
+                    }
+                    if can_prev && can_next {
+                        nui.add_space(12.0);
+                    }
+                    if can_next
+                        && shorts_nav_circle(&mut nui, icon::CHEVRON_DOWN, "Next Short (Down)")
+                    {
                         action = ShortsUiAction::Step(1);
                     }
                 }
-
-                ui.add_space(12.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(rail_w, sh),
-                    Layout::top_down(Align::Center),
-                    |ui| {
-                        if let Some(w) = self.watch.clone() {
-                            let rail_total_h = 5.0 * 62.0 + 4.0 * 8.0 + 6.0;
-                            ui.add_space((sh - rail_total_h).max(4.0));
-
-                            let like_lbl = if w.likes_text.is_empty() {
-                                "Like"
-                            } else {
-                                w.likes_text.as_str()
-                            };
-                            let liked = w.is_liked;
-                            if shorts_rail_button(
-                                ui,
-                                like_lbl,
-                                if liked { "Unlike" } else { "Like" },
-                                liked,
-                                |painter, c, col| {
-                                    theme::draw_thumbs_up(painter, c, 18.0, col, liked);
-                                },
-                            ) {
-                                let _ = self.backend.tx.send(Request::SetLike {
-                                    video_id: w.id.clone(),
-                                    like: !liked,
-                                });
-                            }
-                            ui.add_space(8.0);
-
-                            let dislike_lbl = w
-                                .dislikes_text
-                                .as_deref()
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or("Dislike");
-                            if shorts_rail_button(
-                                ui,
-                                dislike_lbl,
-                                if w.is_disliked {
-                                    "Remove dislike"
-                                } else {
-                                    "Dislike"
-                                },
-                                w.is_disliked,
-                                |painter, c, col| {
-                                    theme::draw_icon_centered(
-                                        painter,
-                                        c,
-                                        icon::THUMBS_DOWN,
-                                        18.0,
-                                        col,
-                                    );
-                                },
-                            ) {
-                                let _ = self.backend.tx.send(Request::SetDislike {
-                                    video_id: w.id.clone(),
-                                    dislike: !w.is_disliked,
-                                });
-                            }
-                            ui.add_space(8.0);
-
-                            let c_label = if self.comments.is_empty() {
-                                "Comments".to_owned()
-                            } else {
-                                self.comments.len().to_string()
-                            };
-                            if shorts_rail_button(
-                                ui,
-                                &c_label,
-                                "Comments & Replies",
-                                self.shorts_comments_open,
-                                |painter, c, col| {
-                                    theme::draw_comment_icon(painter, c, 18.0, col);
-                                },
-                            ) {
-                                self.shorts_comments_open = !self.shorts_comments_open;
-                                if self.shorts_comments_open
-                                    && self.comments.is_empty()
-                                    && !self.comments_loading
-                                {
-                                    if let Some(tok) = w.comments_token.clone() {
-                                        self.comments_loading = true;
-                                        let _ = self.backend.tx.send(Request::LoadComments {
-                                            video_id: w.id.clone(),
-                                            continuation: tok,
-                                            append: false,
-                                        });
-                                    }
-                                }
-                            }
-                            ui.add_space(8.0);
-
-                            if shorts_rail_button(
-                                ui,
-                                "Share",
-                                "Copy Short URL",
-                                false,
-                                |painter, c, col| {
-                                    theme::draw_share_icon(painter, c, 18.0, col);
-                                },
-                            ) {
-                                ctx.copy_text(format!("https://www.youtube.com/shorts/{}", w.id));
-                                self.toast("Copied Shorts URL");
-                            }
-                            ui.add_space(8.0);
-
-                            if shorts_rail_button(
-                                ui,
-                                "Save",
-                                "Download MP4",
-                                false,
-                                |painter, c, col| {
-                                    theme::draw_icon_centered(
-                                        painter,
-                                        c,
-                                        icon::DOWNLOAD,
-                                        18.0,
-                                        col,
-                                    );
-                                },
-                            ) {
-                                self.start_download(w.id.clone(), w.title.clone(), false);
-                            }
-                        }
-                    },
-                );
-
-                if self.shorts_comments_open {
-                    if let Some(w) = self.watch.clone() {
-                        ui.add_space(14.0);
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(drawer_w, sh),
-                            Layout::top_down(Align::LEFT),
-                            |ui| {
-                                Frame::new()
-                                    .fill(theme::SURFACE)
-                                    .stroke(Stroke::new(1.0, theme::BORDER))
-                                    .corner_radius(14)
-                                    .inner_margin(Margin::same(12))
-                                    .show(ui, |ui| {
-                                        let inner_w = (drawer_w - 24.0).max(160.0);
-                                        let inner_h = (sh - 24.0).max(200.0);
-                                        ui.set_width(inner_w);
-                                        ui.set_height(inner_h);
-                                        ui.vertical(|ui| {
-                                            self.draw_comments_header(ui, &w, true);
-                                            ui.separator();
-                                            ui.add_space(4.0);
-                                            let has_composer = self.signed_in
-                                                && self.comment_create_params.is_some();
-                                            let composer_h = if has_composer { 46.0 } else { 0.0 };
-                                            let list_h = (inner_h - 46.0 - composer_h).max(80.0);
-                                            ScrollArea::vertical()
-                                                .id_salt("shorts_comments_drawer")
-                                                .max_height(list_h)
-                                                .show(ui, |ui| {
-                                                    ui.set_width(inner_w - 6.0);
-                                                    self.draw_comments_list(ui, &w);
-                                                });
-                                            if has_composer {
-                                                ui.separator();
-                                                ui.add_space(4.0);
-                                                self.draw_comment_composer(ui, &w);
-                                            }
-                                        });
-                                    });
-                            },
-                        );
-                    }
-                }
-
-                ui.add_space(14.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(nav_w, sh),
-                    Layout::top_down(Align::Center),
-                    |ui| {
-                        let can_prev = self.shorts_idx > 0;
-                        let can_next = (!self.shorts_queue.is_empty()
-                            && self.shorts_idx + 1 < self.shorts_queue.len())
-                            || self
-                                .watch
-                                .as_ref()
-                                .is_some_and(|w| !w.related.is_empty());
-                        let btn_group_h = if can_prev && can_next { 100.0 } else { 44.0 };
-                        ui.add_space(((sh - btn_group_h) * 0.5).max(8.0));
-                        if can_prev
-                            && shorts_nav_circle(ui, icon::CHEVRON_UP, "Previous Short (Up)")
-                        {
-                            action = ShortsUiAction::Step(-1);
-                        }
-                        if can_prev && can_next {
-                            ui.add_space(12.0);
-                        }
-                        if can_next
-                            && shorts_nav_circle(ui, icon::CHEVRON_DOWN, "Next Short (Down)")
-                        {
-                            action = ShortsUiAction::Step(1);
-                        }
-                    },
-                );
-            });
-
-            if !has_wide_info {
-                if let Some(w) = self.watch.clone() {
-                    ui.add_space(8.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.add_space(side_pad);
-                        if w.is_members_only {
-                            draw_members_badge(ui);
-                            ui.add_space(6.0);
-                        }
-                        if let Some(cid) = w.channel_id.clone() {
-                            draw_avatar(ui, w.channel_avatar_url.as_deref(), &w.channel, 28.0);
-                            ui.add_space(4.0);
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new(&w.channel)
-                                            .font(theme::semibold(13.0))
-                                            .color(theme::TEXT),
-                                    )
-                                    .fill(Color32::TRANSPARENT),
-                                )
-                                .on_hover_text(&w.channel)
-                                .clicked()
-                            {
-                                action =
-                                    ShortsUiAction::OpenChannel(cid.clone(), w.channel.clone());
-                            }
-                            super::cards::draw_subscribe_bell_button(
-                                ui,
-                                cid,
-                                w.is_subscribed,
-                                &w.notifications,
-                                &self.backend.tx,
-                            );
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add_space(side_pad);
-                        ui.set_max_width((sw + rail_w + 16.0).max(240.0));
-                        ui.label(
-                            RichText::new(clamp_two_lines(
-                                ui,
-                                &w.title,
-                                theme::semibold(13.5),
-                                sw + rail_w,
-                            ))
-                            .font(theme::semibold(13.5))
-                            .color(theme::TEXT),
-                        )
-                        .on_hover_text(&w.title);
-                    });
-                }
             }
+
+            ui.allocate_space(Vec2::new(body_rect.width(), body_rect.height().max(sh)));
         });
 
         action
@@ -869,8 +782,22 @@ impl YtApp {
         is_fullscreen: bool,
         is_shorts: bool,
     ) {
+        let _ = self.draw_video_surface_inner(ui, ctx, size, is_fullscreen, is_shorts);
+    }
+
+    fn draw_video_surface_inner(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        size: Vec2,
+        is_fullscreen: bool,
+        is_shorts: bool,
+    ) -> Option<(String, String)> {
+        let mut open_channel: Option<(String, String)> = None;
         let radius = if is_fullscreen || self.theater_mode {
             0.0
+        } else if is_shorts {
+            14.0
         } else {
             12.0
         };
@@ -893,6 +820,16 @@ impl YtApp {
         ui.painter().rect_filled(rect, radius, Color32::BLACK);
 
         if let Some(mpv) = &self.mpv {
+            if is_shorts && (self.watch.is_none() || self.playback.video_h == 0) {
+                if let Some(thumb) = self
+                    .shorts_queue
+                    .get(self.shorts_idx)
+                    .map(|q| q.thumbnail_url.clone())
+                    .filter(|u| !u.is_empty())
+                {
+                    theme::paint_image_cover_rounded(ui, &thumb, rect, radius.round() as u8);
+                }
+            }
             if self.watch.is_some() {
                 ui.painter().add(mpv.paint_callback(rect));
             }
@@ -900,13 +837,26 @@ impl YtApp {
             && self.mpv_error.is_none()
         {
             ctx.request_repaint();
+            if is_shorts {
+                if let Some(thumb) = self
+                    .shorts_queue
+                    .get(self.shorts_idx)
+                    .map(|q| q.thumbnail_url.clone())
+                    .filter(|u| !u.is_empty())
+                {
+                    theme::paint_image_cover_rounded(ui, &thumb, rect, radius.round() as u8);
+                }
+            }
             let label = if self.watch_loading {
                 "Resolving stream..."
             } else {
                 "Loading Shorts..."
             };
             draw_buffering_overlay(ui, ctx, rect, radius, label);
-            return;
+            if is_shorts && radius > 0.5 {
+                paint_rounded_corners_mask(ui.painter(), rect, radius, theme::BG, true);
+            }
+            return open_channel;
         } else {
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(24.0)), |ui| {
                 ui.centered_and_justified(|ui| {
@@ -948,7 +898,7 @@ impl YtApp {
                     });
                 });
             });
-            return;
+            return open_channel;
         }
 
         // Track pointer movement to wake/auto-hide the YouTube-style overlay controls
@@ -1038,9 +988,119 @@ impl YtApp {
             }
         }
 
-        // Overlaid bottom gradient + YouTube controls
+        // Overlaid bottom gradient + YouTube controls + Shorts bottom-left channel/title overlay
         let mut clicked_overlay = false;
         let mut toggled_menu = false;
+        if is_shorts {
+            let base_scrim_h = 148.0_f32.min(rect.height() * 0.45);
+            let base_scrim = Rect::from_min_max(
+                pos2(rect.left(), rect.bottom() - base_scrim_h),
+                rect.max,
+            );
+            paint_vertical_gradient(
+                ui.painter(),
+                base_scrim,
+                Color32::TRANSPARENT,
+                Color32::from_black_alpha(175),
+            );
+            if let Some(w) = self.watch.clone() {
+                let lift_y = overlay_alpha * 54.0;
+                let info_rect = Rect::from_min_max(
+                    pos2(rect.left() + 14.0, (rect.bottom() - 150.0 - lift_y).max(rect.top() + 12.0)),
+                    pos2(rect.right() - 14.0, (rect.bottom() - 12.0 - lift_y).max(rect.top() + 36.0)),
+                );
+                if pointer_pos.is_some_and(|p| info_rect.contains(p)) {
+                    clicked_overlay = true;
+                }
+                let mut iui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(info_rect)
+                        .layout(Layout::bottom_up(Align::LEFT)),
+                );
+                iui.set_clip_rect(iui.clip_rect().intersect(rect));
+                let title_display =
+                    clamp_two_lines(&iui, &w.title, theme::semibold(13.5), info_rect.width());
+                iui.add(
+                    egui::Label::new(
+                        RichText::new(title_display)
+                            .font(theme::semibold(13.5))
+                            .color(Color32::WHITE),
+                    )
+                    .wrap(),
+                )
+                .on_hover_text(&w.title);
+                if w.is_members_only {
+                    iui.add_space(4.0);
+                    draw_members_badge(&mut iui);
+                }
+                iui.add_space(6.0);
+                iui.allocate_ui_with_layout(
+                    Vec2::new(info_rect.width(), 34.0),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        let av_resp = ui
+                            .horizontal(|ui| {
+                                draw_avatar(ui, w.channel_avatar_url.as_deref(), &w.channel, 30.0);
+                            })
+                            .response
+                            .interact(Sense::click());
+                        if av_resp.hovered() {
+                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                        }
+                        if av_resp.clicked() {
+                            if let Some(cid) = w.channel_id.clone() {
+                                open_channel = Some((cid, w.channel.clone()));
+                            }
+                            clicked_overlay = true;
+                        }
+                        let sub_reserve = if !w.is_subscribed {
+                            104.0
+                        } else if w.notifications.level == crate::model::NotificationLevel::Personalized {
+                            134.0
+                        } else {
+                            96.0
+                        };
+                        let name_max_w = (info_rect.width() - 30.0 - 16.0 - sub_reserve).max(70.0);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(name_max_w, 34.0),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                let ch_btn = ui
+                                    .add(
+                                        egui::Label::new(
+                                            RichText::new(&w.channel)
+                                                .font(theme::semibold(13.5))
+                                                .color(Color32::WHITE),
+                                        )
+                                        .truncate()
+                                        .sense(Sense::click()),
+                                    )
+                                    .on_hover_text(&w.channel);
+                                if ch_btn.hovered() && w.channel_id.is_some() {
+                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                }
+                                if ch_btn.clicked() {
+                                    if let Some(cid) = w.channel_id.clone() {
+                                        open_channel = Some((cid, w.channel.clone()));
+                                    }
+                                    clicked_overlay = true;
+                                }
+                            },
+                        );
+                        if let Some(cid) = w.channel_id.clone() {
+                            super::cards::draw_subscribe_bell_button(
+                                ui,
+                                cid,
+                                w.is_subscribed,
+                                &w.notifications,
+                                &self.backend.tx,
+                            );
+                        }
+                    },
+                );
+            }
+        }
         if overlay_alpha > 0.01 {
             let scrim_h = 104.0_f32.min(rect.height() * 0.55);
             let scrim_rect = Rect::from_min_max(
@@ -1055,8 +1115,18 @@ impl YtApp {
             );
             let (interacted, toggled) =
                 self.draw_overlaid_controls(ui, ctx, rect, overlay_alpha, is_shorts);
-            clicked_overlay = interacted;
+            clicked_overlay |= interacted;
             toggled_menu = toggled;
+        }
+
+        if is_shorts && radius > 0.5 {
+            paint_rounded_corners_mask(ui.painter(), rect, radius, theme::BG, true);
+            ui.painter().rect_stroke(
+                rect,
+                radius,
+                Stroke::new(1.0, Color32::from_white_alpha(22)),
+                egui::StrokeKind::Inside,
+            );
         }
 
         // Floating Settings / CC popovers above the bottom-right controls
@@ -1086,6 +1156,7 @@ impl YtApp {
                 self.last_pointer_move = Instant::now();
             }
         }
+        open_channel
     }
 
     fn draw_overlaid_controls(
@@ -4575,7 +4646,7 @@ impl YtApp {
                             ui.painter().add(mpv.paint_callback(vrect));
                         }
                         // Round top corners cleanly over the OpenGL blit using corner masks matching Frame fill
-                        paint_rounded_top_corners_mask(ui.painter(), vrect, 11.0, theme::SURFACE);
+                        paint_rounded_corners_mask(ui.painter(), vrect, 11.0, theme::SURFACE, false);
 
                         let video_hovered =
                             vresp.hovered() || ui.rect_contains_pointer(vrect);
@@ -5745,34 +5816,39 @@ fn paint_vertical_gradient(
     painter.add(egui::Shape::mesh(mesh));
 }
 
-fn paint_rounded_top_corners_mask(
+fn paint_rounded_corners_mask(
     painter: &egui::Painter,
     rect: Rect,
     r: f32,
     bg: Color32,
+    include_bottom: bool,
 ) {
     let steps = 8;
-    for is_right in [false, true] {
+    let corners: &[(bool, bool)] = if include_bottom {
+        &[(false, false), (true, false), (false, true), (true, true)]
+    } else {
+        &[(false, false), (true, false)]
+    };
+    for &(is_right, is_bottom) in corners {
         let mut pts = Vec::with_capacity(steps + 2);
-        let corner = if is_right {
-            rect.right_top()
-        } else {
-            rect.left_top()
+        let corner = match (is_right, is_bottom) {
+            (false, false) => rect.left_top(),
+            (true, false) => rect.right_top(),
+            (false, true) => rect.left_bottom(),
+            (true, true) => rect.right_bottom(),
         };
-        let cx = if is_right {
-            rect.right() - r
-        } else {
-            rect.left() + r
+        let cx = if is_right { rect.right() - r } else { rect.left() + r };
+        let cy = if is_bottom { rect.bottom() - r } else { rect.top() + r };
+        let (a0, a1) = match (is_right, is_bottom) {
+            (false, false) => (std::f32::consts::PI, std::f32::consts::PI * 1.5),
+            (true, false) => (std::f32::consts::PI * 1.5, std::f32::consts::TAU),
+            (true, true) => (0.0, std::f32::consts::FRAC_PI_2),
+            (false, true) => (std::f32::consts::FRAC_PI_2, std::f32::consts::PI),
         };
-        let cy = rect.top() + r;
         pts.push(corner);
         for i in 0..=steps {
             let t = i as f32 / steps as f32;
-            let ang = if is_right {
-                -std::f32::consts::FRAC_PI_2 * (1.0 - t)
-            } else {
-                std::f32::consts::PI + std::f32::consts::FRAC_PI_2 * t
-            };
+            let ang = a0 + (a1 - a0) * t;
             pts.push(pos2(cx + r * ang.cos(), cy + r * ang.sin()));
         }
         painter.add(egui::Shape::convex_polygon(pts, bg, Stroke::NONE));

@@ -4,8 +4,10 @@ use egui::{
 };
 
 use crate::backend::Request;
+use crate::innertube;
 use crate::model::{
-    AmbientMode, ChannelInfo, HwdecMode, PoTokenMode, PreferredQuality, VideoItem, WindowMaterial,
+    AmbientMode, ChannelInfo, HwdecMode, PoTokenMode, PreferredQuality, SearchDateFilter,
+    SearchDurationFilter, SearchFilter, SearchSortBy, SearchTypeFilter, VideoItem, WindowMaterial,
 };
 use crate::theme::{self, icon};
 use crate::ytdlp;
@@ -230,10 +232,14 @@ impl YtApp {
                 Some(q) => {
                     let _ = self.backend.tx.send(Request::Search {
                         query: q.to_owned(),
+                        params: None,
                         continuation: None,
                     });
                     self.active_query = q.to_owned();
                     self.page = Page::Search;
+                    self.search_filter = SearchFilter::default();
+                    self.search_filters_open = false;
+                    self.search_channels.clear();
                     self.search_items.clear();
                     self.search_loading = true;
                     self.home_loading = false;
@@ -1167,6 +1173,554 @@ impl YtApp {
                         });
                     }
                 }
+            });
+        }
+    }
+
+    pub(super) fn draw_search_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut filter_changed = false;
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            for kind in [
+                SearchTypeFilter::All,
+                SearchTypeFilter::Videos,
+                SearchTypeFilter::Channels,
+                SearchTypeFilter::Playlists,
+                SearchTypeFilter::Live,
+            ] {
+                let selected = self.search_filter.kind == kind;
+                let (fill, text_col) = if selected {
+                    (Color32::from_rgb(241, 241, 241), Color32::from_rgb(15, 15, 15))
+                } else {
+                    (theme::CHIP, theme::TEXT)
+                };
+                let resp = ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(kind.label())
+                                .font(theme::medium(13.0))
+                                .color(text_col),
+                        )
+                        .fill(fill)
+                        .corner_radius(CornerRadius::same(8)),
+                    )
+                    .on_hover_cursor(CursorIcon::PointingHand);
+                if resp.clicked() && !selected {
+                    self.search_filter.kind = kind;
+                    if matches!(kind, SearchTypeFilter::Channels | SearchTypeFilter::Playlists) {
+                        self.search_filter.date = SearchDateFilter::Anytime;
+                        self.search_filter.duration = SearchDurationFilter::Any;
+                    }
+                    filter_changed = true;
+                }
+            }
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let adv_count = self.search_filter.active_advanced_count();
+                let filter_label = if adv_count > 0 {
+                    format!("{}  Filters ({adv_count})", icon::SETTINGS)
+                } else {
+                    format!("{}  Filters", icon::SETTINGS)
+                };
+                let (f_fill, f_col) = if self.search_filters_open || adv_count > 0 {
+                    (theme::CHIP_HOVER, Color32::WHITE)
+                } else {
+                    (Color32::TRANSPARENT, theme::TEXT)
+                };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(filter_label)
+                                .font(theme::medium(13.0))
+                                .color(f_col),
+                        )
+                        .fill(f_fill)
+                        .stroke(Stroke::new(1.0, theme::BORDER))
+                        .corner_radius(16),
+                    )
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    self.search_filters_open = !self.search_filters_open;
+                }
+                if !self.search_filter.is_default()
+                    && ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Reset")
+                                    .font(theme::medium(12.5))
+                                    .color(theme::YT_BLUE),
+                            )
+                            .fill(Color32::TRANSPARENT),
+                        )
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                {
+                    self.search_filter = SearchFilter::default();
+                    filter_changed = true;
+                }
+            });
+        });
+
+        if self.search_filters_open {
+            ui.add_space(8.0);
+            Frame::new()
+                .fill(theme::SURFACE)
+                .stroke(Stroke::new(1.0, theme::BORDER))
+                .corner_radius(12)
+                .inner_margin(Margin::symmetric(16, 12))
+                .show(ui, |ui| {
+                    let avail = ui.available_width();
+                    let col_w = ((avail - 36.0) / 4.0).max(125.0);
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(col_w, 10.0),
+                            Layout::top_down(Align::LEFT),
+                            |ui| {
+                                ui.label(
+                                    RichText::new("UPLOAD DATE")
+                                        .font(theme::semibold(11.0))
+                                        .color(theme::TEXT_DIM),
+                                );
+                                ui.add_space(4.0);
+                                for d in [
+                                    SearchDateFilter::Anytime,
+                                    SearchDateFilter::LastHour,
+                                    SearchDateFilter::Today,
+                                    SearchDateFilter::ThisWeek,
+                                    SearchDateFilter::ThisMonth,
+                                    SearchDateFilter::ThisYear,
+                                ] {
+                                    let active = self.search_filter.date == d;
+                                    let resp = ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new(d.label())
+                                                    .font(if active {
+                                                        theme::semibold(12.5)
+                                                    } else {
+                                                        theme::regular(12.5)
+                                                    })
+                                                    .color(if active {
+                                                        Color32::WHITE
+                                                    } else {
+                                                        theme::TEXT_DIM
+                                                    }),
+                                            )
+                                            .fill(if active {
+                                                theme::CHIP
+                                            } else {
+                                                Color32::TRANSPARENT
+                                            })
+                                            .corner_radius(6),
+                                        )
+                                        .on_hover_cursor(CursorIcon::PointingHand);
+                                    if resp.clicked() && !active {
+                                        self.search_filter.date = d;
+                                        if matches!(
+                                            self.search_filter.kind,
+                                            SearchTypeFilter::Channels
+                                                | SearchTypeFilter::Playlists
+                                        ) {
+                                            self.search_filter.kind = SearchTypeFilter::Videos;
+                                        }
+                                        filter_changed = true;
+                                    }
+                                }
+                            },
+                        );
+
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(col_w, 10.0),
+                            Layout::top_down(Align::LEFT),
+                            |ui| {
+                                ui.label(
+                                    RichText::new("TYPE")
+                                        .font(theme::semibold(11.0))
+                                        .color(theme::TEXT_DIM),
+                                );
+                                ui.add_space(4.0);
+                                for t in [
+                                    SearchTypeFilter::All,
+                                    SearchTypeFilter::Videos,
+                                    SearchTypeFilter::Channels,
+                                    SearchTypeFilter::Playlists,
+                                    SearchTypeFilter::Live,
+                                ] {
+                                    let active = self.search_filter.kind == t;
+                                    let resp = ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new(t.label())
+                                                    .font(if active {
+                                                        theme::semibold(12.5)
+                                                    } else {
+                                                        theme::regular(12.5)
+                                                    })
+                                                    .color(if active {
+                                                        Color32::WHITE
+                                                    } else {
+                                                        theme::TEXT_DIM
+                                                    }),
+                                            )
+                                            .fill(if active {
+                                                theme::CHIP
+                                            } else {
+                                                Color32::TRANSPARENT
+                                            })
+                                            .corner_radius(6),
+                                        )
+                                        .on_hover_cursor(CursorIcon::PointingHand);
+                                    if resp.clicked() && !active {
+                                        self.search_filter.kind = t;
+                                        if matches!(
+                                            t,
+                                            SearchTypeFilter::Channels
+                                                | SearchTypeFilter::Playlists
+                                        ) {
+                                            self.search_filter.date = SearchDateFilter::Anytime;
+                                            self.search_filter.duration = SearchDurationFilter::Any;
+                                        }
+                                        filter_changed = true;
+                                    }
+                                }
+                            },
+                        );
+
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(col_w, 10.0),
+                            Layout::top_down(Align::LEFT),
+                            |ui| {
+                                ui.label(
+                                    RichText::new("DURATION")
+                                        .font(theme::semibold(11.0))
+                                        .color(theme::TEXT_DIM),
+                                );
+                                ui.add_space(4.0);
+                                for dur in [
+                                    SearchDurationFilter::Any,
+                                    SearchDurationFilter::Short,
+                                    SearchDurationFilter::Medium,
+                                    SearchDurationFilter::Long,
+                                ] {
+                                    let active = self.search_filter.duration == dur;
+                                    let resp = ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new(dur.label())
+                                                    .font(if active {
+                                                        theme::semibold(12.5)
+                                                    } else {
+                                                        theme::regular(12.5)
+                                                    })
+                                                    .color(if active {
+                                                        Color32::WHITE
+                                                    } else {
+                                                        theme::TEXT_DIM
+                                                    }),
+                                            )
+                                            .fill(if active {
+                                                theme::CHIP
+                                            } else {
+                                                Color32::TRANSPARENT
+                                            })
+                                            .corner_radius(6),
+                                        )
+                                        .on_hover_cursor(CursorIcon::PointingHand);
+                                    if resp.clicked() && !active {
+                                        self.search_filter.duration = dur;
+                                        if matches!(
+                                            self.search_filter.kind,
+                                            SearchTypeFilter::Channels
+                                                | SearchTypeFilter::Playlists
+                                        ) {
+                                            self.search_filter.kind = SearchTypeFilter::Videos;
+                                        }
+                                        filter_changed = true;
+                                    }
+                                }
+                            },
+                        );
+
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(col_w, 10.0),
+                            Layout::top_down(Align::LEFT),
+                            |ui| {
+                                ui.label(
+                                    RichText::new("SORT BY")
+                                        .font(theme::semibold(11.0))
+                                        .color(theme::TEXT_DIM),
+                                );
+                                ui.add_space(4.0);
+                                for s in [
+                                    SearchSortBy::Relevance,
+                                    SearchSortBy::UploadDate,
+                                    SearchSortBy::ViewCount,
+                                    SearchSortBy::Rating,
+                                ] {
+                                    let active = self.search_filter.sort == s;
+                                    let resp = ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new(s.label())
+                                                    .font(if active {
+                                                        theme::semibold(12.5)
+                                                    } else {
+                                                        theme::regular(12.5)
+                                                    })
+                                                    .color(if active {
+                                                        Color32::WHITE
+                                                    } else {
+                                                        theme::TEXT_DIM
+                                                    }),
+                                            )
+                                            .fill(if active {
+                                                theme::CHIP
+                                            } else {
+                                                Color32::TRANSPARENT
+                                            })
+                                            .corner_radius(6),
+                                        )
+                                        .on_hover_cursor(CursorIcon::PointingHand);
+                                    if resp.clicked() && !active {
+                                        self.search_filter.sort = s;
+                                        filter_changed = true;
+                                    }
+                                }
+                            },
+                        );
+                    });
+                });
+        }
+
+        if filter_changed {
+            self.trigger_filtered_search();
+        }
+
+        ui.add_space(10.0);
+
+        let heading = format!("Results for \"{}\"", self.active_query);
+        let channels = self.search_channels.clone();
+        let items = self.search_items.clone();
+        let loading = self.search_loading;
+        let cont = self.search_continuation.clone();
+        let mut grid_action: Option<super::cards::GridAction> = None;
+        let mut open_channel: Option<(String, String)> = None;
+        let mut toggle_sub: Option<(String, bool)> = None;
+        let expand_ch_id = egui::Id::unique(("search_expand_channels", &self.active_query));
+        let mut channels_expanded = ctx
+            .data_mut(|d| d.get_temp::<bool>(expand_ch_id))
+            .unwrap_or(false);
+        let max_inline_channels = if self.search_filter.kind == SearchTypeFilter::All
+            && !items.is_empty()
+            && !channels_expanded
+        {
+            3
+        } else {
+            channels.len()
+        };
+
+        let scroll_out = ScrollArea::vertical()
+            .id_salt(("search_results_scroll", &self.active_query))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&heading).font(theme::bold(20.0)));
+                    if loading {
+                        ui.add_space(8.0);
+                        ui.spinner();
+                    }
+                });
+                ui.add_space(10.0);
+
+                if !channels.is_empty() {
+                    let row_w = (ui.available_width() - 8.0).max(260.0);
+                    let shown_channels = &channels[..channels.len().min(max_inline_channels)];
+                    for ch in shown_channels {
+                        let (row_rect, row_resp) =
+                            ui.allocate_exact_size(Vec2::new(row_w, 82.0), Sense::click());
+                        let hovered = row_resp.hovered() || ui.rect_contains_pointer(row_rect);
+                        if hovered {
+                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                            ui.painter().rect_filled(
+                                row_rect,
+                                12.0,
+                                Color32::from_white_alpha(12),
+                            );
+                        }
+                        let inner = row_rect.shrink2(Vec2::new(12.0, 8.0));
+                        let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+                        let mut sub_btn_clicked = false;
+                        let is_sub = ch.is_subscribed
+                            || self.guide_channels.iter().any(|g| g.browse_id == ch.id);
+                        cui.horizontal_centered(|ui| {
+                            draw_avatar(ui, ch.avatar_url.as_deref(), &ch.title, 60.0);
+                            ui.add_space(14.0);
+                            let info_w = (inner.width() - 208.0).max(120.0);
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(info_w, 60.0),
+                                Layout::top_down(Align::LEFT),
+                                |ui| {
+                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&ch.title)
+                                                .font(theme::semibold(15.5))
+                                                .color(Color32::WHITE),
+                                        )
+                                        .truncate(),
+                                    );
+                                    let mut meta_parts = Vec::new();
+                                    if !ch.handle.is_empty() {
+                                        meta_parts.push(ch.handle.as_str());
+                                    }
+                                    if !ch.subscribers_text.is_empty() {
+                                        meta_parts.push(ch.subscribers_text.as_str());
+                                    }
+                                    if !ch.video_count_text.is_empty() {
+                                        meta_parts.push(ch.video_count_text.as_str());
+                                    }
+                                    if !meta_parts.is_empty() {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(meta_parts.join(" · "))
+                                                    .font(theme::regular(12.2))
+                                                    .color(theme::TEXT_DIM),
+                                            )
+                                            .truncate(),
+                                        );
+                                    }
+                                    if !ch.description_snippet.is_empty() {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&ch.description_snippet)
+                                                    .font(theme::regular(11.8))
+                                                    .color(theme::TEXT_FAINT),
+                                            )
+                                            .truncate(),
+                                        );
+                                    }
+                                },
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let (fill, text_col, label) = if is_sub {
+                                    (theme::CHIP, theme::TEXT, "Subscribed")
+                                } else {
+                                    (
+                                        Color32::from_rgb(241, 241, 241),
+                                        Color32::from_rgb(15, 15, 15),
+                                        "Subscribe",
+                                    )
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new(label)
+                                                .font(theme::semibold(13.0))
+                                                .color(text_col),
+                                        )
+                                        .fill(fill)
+                                        .corner_radius(18),
+                                    )
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .clicked()
+                                {
+                                    sub_btn_clicked = true;
+                                }
+                            });
+                        });
+                        if sub_btn_clicked {
+                            toggle_sub = Some((ch.id.clone(), !is_sub));
+                        } else if row_resp.clicked() {
+                            open_channel = Some((ch.id.clone(), ch.title.clone()));
+                        }
+                        ui.add_space(4.0);
+                    }
+                    if channels.len() > 3
+                        && self.search_filter.kind == SearchTypeFilter::All
+                        && !items.is_empty()
+                    {
+                        ui.horizontal(|ui| {
+                            let label = if channels_expanded {
+                                "Show fewer channels".to_owned()
+                            } else {
+                                format!("Show all {} channels", channels.len())
+                            };
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(label)
+                                            .font(theme::medium(12.5))
+                                            .color(theme::YT_BLUE),
+                                    )
+                                    .fill(theme::CHIP)
+                                    .corner_radius(14),
+                                )
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                channels_expanded = !channels_expanded;
+                                ctx.data_mut(|d| d.insert_temp(expand_ch_id, channels_expanded));
+                            }
+                        });
+                        ui.add_space(6.0);
+                    }
+                    if !items.is_empty() {
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(12.0);
+                    }
+                }
+
+                if channels.is_empty() && items.is_empty() && !loading {
+                    ui.label(
+                        RichText::new("No search results found.")
+                            .font(theme::regular(14.0))
+                            .color(theme::TEXT_DIM),
+                    );
+                } else if !items.is_empty() {
+                    grid_action = super::cards::draw_video_grid_body_with_shorts(
+                        ui,
+                        "",
+                        &items,
+                        loading && channels.is_empty(),
+                        cont.is_some(),
+                        true,
+                        "search_shorts",
+                    );
+                } else if cont.is_some() && !loading {
+                    ui.add_space(8.0);
+                    if ui.button("Load more").clicked() {
+                        grid_action = Some(super::cards::GridAction::LoadMore);
+                    }
+                }
+            });
+
+        if cont.is_some() && !loading && grid_action.is_none() {
+            let remaining = scroll_out.content_size.y
+                - (scroll_out.state.clamped_offset().y + scroll_out.inner_rect.height());
+            if remaining < 450.0 {
+                grid_action = Some(super::cards::GridAction::LoadMore);
+            }
+        }
+
+        if let Some((cid, subscribe)) = toggle_sub {
+            let _ = self.backend.tx.send(Request::SetSubscribe {
+                channel_id: cid,
+                subscribe,
+            });
+        } else if let Some((cid, name)) = open_channel {
+            self.open_channel(cid, name);
+        } else if let Some(act) = grid_action {
+            self.handle_grid_action(ctx, act, |app| {
+                app.search_loading = true;
+                let _ = app.backend.tx.send(Request::Search {
+                    query: app.active_query.clone(),
+                    params: innertube::encode_search_params(app.search_filter),
+                    continuation: cont,
+                });
             });
         }
     }

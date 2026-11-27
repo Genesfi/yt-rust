@@ -108,6 +108,125 @@ pub struct NotificationMenuItem {
     pub is_live: bool,
 }
 
+/// A YouTube channel card returned in global search results (`channelRenderer`).
+#[derive(Clone, Debug, Default)]
+pub struct SearchChannelResult {
+    pub id: String,
+    pub title: String,
+    pub handle: String,
+    pub subscribers_text: String,
+    pub video_count_text: String,
+    pub description_snippet: String,
+    pub avatar_url: Option<String>,
+    pub is_subscribed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SearchTypeFilter {
+    #[default]
+    All,
+    Videos,
+    Channels,
+    Playlists,
+    Live,
+}
+
+impl SearchTypeFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Videos => "Videos",
+            Self::Channels => "Channels",
+            Self::Playlists => "Playlists",
+            Self::Live => "Live",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SearchDateFilter {
+    #[default]
+    Anytime,
+    LastHour,
+    Today,
+    ThisWeek,
+    ThisMonth,
+    ThisYear,
+}
+
+impl SearchDateFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Anytime => "Anytime",
+            Self::LastHour => "Last hour",
+            Self::Today => "Today",
+            Self::ThisWeek => "This week",
+            Self::ThisMonth => "This month",
+            Self::ThisYear => "This year",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SearchDurationFilter {
+    #[default]
+    Any,
+    Short,
+    Medium,
+    Long,
+}
+
+impl SearchDurationFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Any => "Any",
+            Self::Short => "Under 4 min",
+            Self::Medium => "4–20 min",
+            Self::Long => "Over 20 min",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SearchSortBy {
+    #[default]
+    Relevance,
+    UploadDate,
+    ViewCount,
+    Rating,
+}
+
+impl SearchSortBy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Relevance => "Relevance",
+            Self::UploadDate => "Upload date",
+            Self::ViewCount => "View count",
+            Self::Rating => "Rating",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct SearchFilter {
+    pub kind: SearchTypeFilter,
+    pub date: SearchDateFilter,
+    pub duration: SearchDurationFilter,
+    pub sort: SearchSortBy,
+}
+
+impl SearchFilter {
+    pub fn is_default(self) -> bool {
+        self == Self::default()
+    }
+
+    pub fn active_advanced_count(self) -> usize {
+        usize::from(self.date != SearchDateFilter::Anytime)
+            + usize::from(self.duration != SearchDurationFilter::Any)
+            + usize::from(self.sort != SearchSortBy::Relevance)
+    }
+}
+
 /// Channel header info & available tabs returned on `Page::Channel`.
 #[derive(Clone, Debug, Default)]
 pub struct ChannelInfo {

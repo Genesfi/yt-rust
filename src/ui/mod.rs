@@ -18,8 +18,8 @@ use crate::model::{
     AmbientMode, ChannelInfo, ChannelNotificationParams, CommentItem, FeedChip,
     HoverPreviewQuality, HwdecMode, KeyBinding, LastWatched, LiveChatEmote, LiveChatMessage,
     NotificationMenuItem, PlaylistOption, PlaylistSummary, PoTokenMode, PreferredQuality,
-    ShortcutConfig, ShortcutSlot, SidebarChannel, SponsorCategory, SponsorSegment, VideoItem,
-    WatchData, WindowMaterial,
+    SearchChannelResult, SearchFilter, ShortcutConfig, ShortcutSlot, SidebarChannel,
+    SponsorCategory, SponsorSegment, VideoItem, WatchData, WindowMaterial,
 };
 use crate::mpv::{GlProcAddrFn, MpvPlayer, PlaybackState};
 use crate::os_media::OsMedia;
@@ -178,7 +178,6 @@ pub(super) struct PlayerSlot {
     pub muted: bool,
     pub speed: f64,
     pub selected_format_idx: Option<usize>,
-    pub shorts_upgrade_target: Option<(String, usize)>,
     pub selected_audio_idx: usize,
     pub selected_caption_idx: Option<usize>,
     pub used_ytdlp: bool,
@@ -232,7 +231,6 @@ impl PlayerSlot {
             muted: false,
             speed,
             selected_format_idx: None,
-            shorts_upgrade_target: None,
             selected_audio_idx: 0,
             selected_caption_idx: None,
             used_ytdlp: false,
@@ -289,7 +287,6 @@ impl PlayerSlot {
         self.sponsor_segments.clear();
         self.last_skipped_end = -1.0;
         self.seeking_pos = None;
-        self.shorts_upgrade_target = None;
         self.selected_audio_idx = 0;
         self.selected_caption_idx = None;
         self.player_menu = PlayerMenu::None;
@@ -375,6 +372,7 @@ pub struct YtApp {
     pub(super) search_input: String,
     pub(super) active_query: String,
     pub(super) search_suggestions: Vec<String>,
+    pub(super) search_history: Vec<String>,
     pub(super) last_suggest_query: String,
     pub(super) last_suggest_edit: Option<Instant>,
     pub(super) search_popup_open: bool,
@@ -431,7 +429,10 @@ pub struct YtApp {
     pub(super) channel_search_input: String,
     pub(super) channel_search_active: String,
 
+    pub(super) search_channels: Vec<SearchChannelResult>,
     pub(super) search_items: Vec<VideoItem>,
+    pub(super) search_filter: SearchFilter,
+    pub(super) search_filters_open: bool,
     pub(super) search_continuation: Option<String>,
     pub(super) search_loading: bool,
 
@@ -452,7 +453,6 @@ pub struct YtApp {
     pub(super) watch_loading: bool,
     pub(super) watch: Option<WatchData>,
     pub(super) selected_format_idx: Option<usize>,
-    pub(super) shorts_upgrade_target: Option<(String, usize)>,
     pub(super) selected_audio_idx: usize,
     pub(super) selected_caption_idx: Option<usize>,
     pub(super) used_ytdlp: bool,
@@ -487,6 +487,8 @@ pub struct YtApp {
     pub(super) shorts_slot: Box<PlayerSlot>,
     pub(super) shorts_queue: Vec<VideoItem>,
     pub(super) shorts_idx: usize,
+    pub(super) shorts_slide_anim: Option<(i8, Instant)>,
+    pub(super) shorts_last_wheel_at: Option<Instant>,
     pub(super) shorts_comments_open: bool,
     pub(super) shorts_grid_view: bool,
     pub(super) shorts_paused_video: bool,
@@ -655,6 +657,7 @@ impl YtApp {
         let mut history = Vec::new();
         let mut saved = Vec::new();
         let mut resume_positions = HashMap::new();
+        let mut search_history: Vec<String> = Vec::new();
 
         if let Some(storage) = cc.storage {
             if let Some(v) = storage.get_string("volume").and_then(|s| s.parse().ok()) {
@@ -771,6 +774,11 @@ impl YtApp {
                     resume_positions = parsed;
                 }
             }
+            if let Some(sh) = storage.get_string("search_history") {
+                if let Ok(parsed) = serde_json::from_str::<Vec<String>>(&sh) {
+                    search_history = parsed;
+                }
+            }
         }
 
         if let Some(p) = &mpv {
@@ -828,6 +836,7 @@ impl YtApp {
             search_input: String::new(),
             active_query: String::new(),
             search_suggestions: Vec::new(),
+            search_history,
             last_suggest_query: String::new(),
             last_suggest_edit: None,
             search_popup_open: false,
@@ -876,7 +885,10 @@ impl YtApp {
             channel_loading: false,
             channel_search_input: String::new(),
             channel_search_active: String::new(),
+            search_channels: Vec::new(),
             search_items: Vec::new(),
+            search_filter: SearchFilter::default(),
+            search_filters_open: false,
             search_continuation: None,
             search_loading: false,
             history,
@@ -895,7 +907,6 @@ impl YtApp {
             watch_loading: false,
             watch: None,
             selected_format_idx: None,
-            shorts_upgrade_target: None,
             selected_audio_idx: 0,
             selected_caption_idx: None,
             used_ytdlp: false,
@@ -924,6 +935,8 @@ impl YtApp {
             live_chat_emote_picker_open: false,
             shorts_queue: Vec::new(),
             shorts_idx: 0,
+            shorts_slide_anim: None,
+            shorts_last_wheel_at: None,
             shorts_comments_open: false,
             shorts_grid_view: false,
             shorts_paused_video: false,
@@ -1444,10 +1457,6 @@ impl YtApp {
         std::mem::swap(&mut self.muted, &mut slot.muted);
         std::mem::swap(&mut self.speed, &mut slot.speed);
         std::mem::swap(&mut self.selected_format_idx, &mut slot.selected_format_idx);
-        std::mem::swap(
-            &mut self.shorts_upgrade_target,
-            &mut slot.shorts_upgrade_target,
-        );
         std::mem::swap(&mut self.selected_audio_idx, &mut slot.selected_audio_idx);
         std::mem::swap(
             &mut self.selected_caption_idx,
@@ -1798,6 +1807,7 @@ impl YtApp {
             let next_i = self.shorts_idx - 1;
             if let Some(item) = self.shorts_queue.get(next_i).cloned() {
                 self.shorts_idx = next_i;
+                self.shorts_slide_anim = Some((-1, Instant::now()));
                 let list = self.shorts_queue.clone();
                 self.open_short(item, list);
             }
@@ -1806,6 +1816,7 @@ impl YtApp {
                 let next_i = self.shorts_idx + 1;
                 if let Some(item) = self.shorts_queue.get(next_i).cloned() {
                     self.shorts_idx = next_i;
+                    self.shorts_slide_anim = Some((1, Instant::now()));
                     let list = self.shorts_queue.clone();
                     self.open_short(item, list);
                 }
@@ -1816,6 +1827,7 @@ impl YtApp {
                 .and_then(|w| w.related.first())
                 .cloned()
             {
+                self.shorts_slide_anim = Some((1, Instant::now()));
                 self.open_short(next, Vec::new());
             }
         }
@@ -1889,33 +1901,12 @@ impl YtApp {
         self.selected_audio_idx = 0;
         self.selected_caption_idx = None;
         self.used_ytdlp = used_ytdlp;
-        self.shorts_upgrade_target = None;
 
+        // Play Shorts directly at the resolved quality (avoid jarring 2x-3x reload stutters).
         let is_hls_master = data.hls_url.as_deref() == Some(selected_video_url.as_str());
-        let mut initial_video_url = selected_video_url;
-        let mut initial_audio_url = selected_audio_url;
-        let mut initial_format_idx = selected_format_idx;
-        if is_shorts && !is_hls_master && !data.is_live {
-            if let Some(hd_idx) = selected_format_idx {
-                let hd_h = data.video_formats.get(hd_idx).map_or(0, |f| f.height);
-                if hd_h > 480 {
-                    if let Some(fast_idx) = pick_fast_short_format(&data.video_formats) {
-                        if fast_idx != hd_idx {
-                            let fast_fmt = &data.video_formats[fast_idx];
-                            initial_video_url =
-                                self.backend.proxy_url(&fast_fmt.url, fast_fmt.content_length);
-                            initial_audio_url = if fast_fmt.has_audio {
-                                None
-                            } else {
-                                self.selected_audio_stream(&data)
-                            };
-                            initial_format_idx = Some(fast_idx);
-                            self.shorts_upgrade_target = Some((data.id.clone(), hd_idx));
-                        }
-                    }
-                }
-            }
-        }
+        let initial_video_url = selected_video_url;
+        let initial_audio_url = selected_audio_url;
+        let initial_format_idx = selected_format_idx;
         self.selected_format_idx = initial_format_idx;
 
         let start_at = if data.is_live || is_shorts {
@@ -2073,7 +2064,6 @@ impl YtApp {
         self.sponsor_segments.clear();
         self.last_skipped_end = -1.0;
         self.seeking_pos = None;
-        self.shorts_upgrade_target = None;
         self.selected_format_idx = None;
         self.selected_audio_idx = 0;
         self.selected_caption_idx = None;
@@ -2162,7 +2152,6 @@ impl YtApp {
         self.sponsor_segments.clear();
         self.last_skipped_end = -1.0;
         self.seeking_pos = None;
-        self.shorts_upgrade_target = None;
         self.selected_audio_idx = 0;
         self.selected_caption_idx = None;
         self.player_menu = PlayerMenu::None;
@@ -2242,20 +2231,44 @@ impl YtApp {
             }
             return;
         }
+        self.search_history
+            .retain(|h| !h.eq_ignore_ascii_case(&q));
+        self.search_history.insert(0, q.clone());
+        self.search_history.truncate(15);
+
         self.active_query = q.clone();
         self.page = Page::Search;
+        self.search_filter = SearchFilter::default();
+        self.search_filters_open = false;
+        self.search_channels.clear();
         self.search_items.clear();
         self.search_continuation = None;
         self.search_loading = true;
         self.last_error = None;
         let _ = self.backend.tx.send(Request::Search {
             query: q,
+            params: innertube::encode_search_params(self.search_filter),
+            continuation: None,
+        });
+    }
+
+    pub(super) fn trigger_filtered_search(&mut self) {
+        if self.active_query.trim().is_empty() {
+            return;
+        }
+        self.search_channels.clear();
+        self.search_items.clear();
+        self.search_continuation = None;
+        self.search_loading = true;
+        self.last_error = None;
+        let _ = self.backend.tx.send(Request::Search {
+            query: self.active_query.clone(),
+            params: innertube::encode_search_params(self.search_filter),
             continuation: None,
         });
     }
 
     pub(super) fn switch_quality(&mut self, idx: usize) {
-        self.shorts_upgrade_target = None;
         self.switch_quality_inner(idx, true);
     }
 
@@ -2707,17 +2720,21 @@ impl YtApp {
                 }
             }
             NavEntry::Search { query } => {
-                if self.active_query == query && !self.search_items.is_empty() {
+                if self.active_query == query
+                    && (!self.search_items.is_empty() || !self.search_channels.is_empty())
+                {
                     self.page = Page::Search;
                 } else if !query.is_empty() {
                     self.search_input = query.clone();
                     self.active_query = query.clone();
                     self.page = Page::Search;
+                    self.search_channels.clear();
                     self.search_items.clear();
                     self.search_continuation = None;
                     self.search_loading = true;
                     let _ = self.backend.tx.send(Request::Search {
                         query,
+                        params: innertube::encode_search_params(self.search_filter),
                         continuation: None,
                     });
                 }
@@ -3052,21 +3069,38 @@ impl YtApp {
                 }
                 Response::SearchLoaded {
                     query,
+                    params,
+                    channels,
                     mut items,
                     continuation,
                     append,
                 } => {
-                    if query == self.active_query {
+                    if query == self.active_query
+                        && params == innertube::encode_search_params(self.search_filter)
+                    {
                         self.search_loading = false;
                         self.ingest_resume_metadata(&mut items);
                         self.ingest_and_request_avatars(&mut items);
+                        for ch in &channels {
+                            if let Some(url) = &ch.avatar_url {
+                                self.channel_avatars
+                                    .entry(ch.id.clone())
+                                    .or_insert_with(|| url.clone());
+                            }
+                        }
                         if append {
+                            for ch in channels {
+                                if !self.search_channels.iter().any(|x| x.id == ch.id) {
+                                    self.search_channels.push(ch);
+                                }
+                            }
                             for it in items {
                                 if !self.search_items.iter().any(|x| x.id == it.id) {
                                     self.search_items.push(it);
                                 }
                             }
                         } else {
+                            self.search_channels = channels;
                             self.search_items = items;
                         }
                         self.search_continuation = continuation;
@@ -3455,6 +3489,11 @@ impl YtApp {
                     if let Some(ci) = &mut self.channel_info {
                         if ci.id == channel_id {
                             ci.is_subscribed = subscribed;
+                        }
+                    }
+                    for ch in &mut self.search_channels {
+                        if ch.id == channel_id {
+                            ch.is_subscribed = subscribed;
                         }
                     }
                     self.toast(if subscribed {
@@ -4306,18 +4345,6 @@ impl YtApp {
                 }
             }
         }
-        if let Some((ref target_vid, hd_idx)) = self.shorts_upgrade_target {
-            if self.watch.as_ref().is_some_and(|w| w.id == *target_vid)
-                && self.playback.time_pos >= 1.2
-                && !self.playback.paused
-                && !self.playback.buffering
-                && self.playback.cache_duration >= 1.2
-            {
-                self.shorts_upgrade_target = None;
-                self.switch_quality_inner(hd_idx, false);
-                return;
-            }
-        }
         let is_live = self.watch.as_ref().is_some_and(|w| w.is_live);
         let is_remote_watch = self
             .watch
@@ -4865,6 +4892,9 @@ impl eframe::App for YtApp {
         if let Ok(r) = serde_json::to_string(&self.resume_positions) {
             storage.set_string("resume_positions", r);
         }
+        if let Ok(sh) = serde_json::to_string(&self.search_history) {
+            storage.set_string("search_history", sh);
+        }
     }
 
     fn on_exit(&mut self, gl: Option<&glow::Context>) {
@@ -4995,23 +5025,7 @@ impl eframe::App for YtApp {
                     Page::Playlists => self.draw_playlists_library_page(ui),
                     Page::Playlist => self.draw_playlist_page(ui, &ctx),
                     Page::Channel => self.draw_channel_page(ui, &ctx),
-                    Page::Search => {
-                        let heading = format!("Results for \"{}\"", self.active_query);
-                        let items = self.search_items.clone();
-                        let loading = self.search_loading;
-                        let cont = self.search_continuation.clone();
-                        if let Some(act) =
-                            draw_video_grid(ui, &heading, &items, loading, cont.is_some())
-                        {
-                            self.handle_grid_action(&ctx, act, |app| {
-                                app.search_loading = true;
-                                let _ = app.backend.tx.send(Request::Search {
-                                    query: app.active_query.clone(),
-                                    continuation: cont,
-                                });
-                            });
-                        }
-                    }
+                    Page::Search => self.draw_search_page(ui, &ctx),
                     Page::History => {
                         if self.signed_in && self.sync_history {
                             let items = self.remote_history.clone();
@@ -5404,27 +5418,9 @@ pub(super) fn parse_sleep_timer_input(raw: &str) -> Option<Duration> {
     (secs >= 10).then(|| Duration::from_secs(secs.min(24 * 3600)))
 }
 
-fn pick_fast_short_format(formats: &[crate::model::VideoFormat]) -> Option<usize> {
-    formats
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| f.height > 0 && f.height <= 480 && !f.url.is_empty())
-        .max_by_key(|(_, f)| {
-            (
-                f.height >= 360,
-                f.has_audio,
-                f.mime.contains("avc1"),
-                f.height,
-                std::cmp::Reverse(f.bitrate),
-            )
-        })
-        .map(|(i, _)| i)
-}
-
 #[cfg(test)]
 mod ui_tests {
-    use super::{parse_sleep_timer_input, pick_fast_short_format, shuffle_vec};
-    use crate::model::VideoFormat;
+    use super::{parse_sleep_timer_input, shuffle_vec};
     use std::time::Duration;
 
     #[test]
@@ -5446,29 +5442,5 @@ mod ui_tests {
         assert_eq!(parse_sleep_timer_input("45 menit"), Some(Duration::from_secs(2700)));
         assert_eq!(parse_sleep_timer_input("0"), None);
         assert_eq!(parse_sleep_timer_input("abc"), None);
-    }
-
-    #[test]
-    fn picks_fast_low_format_for_cold_shorts() {
-        let fmt = |height: u32, mime: &str, has_audio: bool, bitrate: u64| VideoFormat {
-            itag: 0,
-            url: "https://example.com/v".into(),
-            mime: mime.into(),
-            width: height,
-            height,
-            fps: 30,
-            bitrate,
-            content_length: 0,
-            has_audio,
-        };
-        let formats = [
-            fmt(720, "video/mp4; codecs=\"avc1\"", false, 1_500_000),
-            fmt(480, "video/mp4; codecs=\"avc1\"", false, 700_000),
-            fmt(360, "video/mp4; codecs=\"avc1\"", true, 450_000),
-        ];
-        // Prefers the 360p muxed stream for instant single-connection startup.
-        assert_eq!(pick_fast_short_format(&formats), Some(2));
-        // Without a muxed stream, falls back to 480p H.264.
-        assert_eq!(pick_fast_short_format(&formats[..2]), Some(1));
     }
 }

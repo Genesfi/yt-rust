@@ -214,12 +214,18 @@ impl YtApp {
                                     .color(theme::TEXT_FAINT),
                             ),
                     );
-                    if edit_resp.gained_focus() && !self.search_input.trim().is_empty() {
+                    if edit_resp.gained_focus()
+                        && (!self.search_input.trim().is_empty() || !self.search_history.is_empty())
+                    {
                         self.search_popup_open = true;
                     }
                     if edit_resp.changed() {
                         let q = self.search_input.trim().to_owned();
-                        if q.is_empty() || innertube::extract_video_id(&q).is_some() {
+                        if q.is_empty() {
+                            self.search_suggestions.clear();
+                            self.last_suggest_edit = None;
+                            self.search_popup_open = !self.search_history.is_empty();
+                        } else if innertube::extract_video_id(&q).is_some() {
                             self.search_suggestions.clear();
                             self.search_popup_open = false;
                             self.last_suggest_edit = None;
@@ -245,7 +251,6 @@ impl YtApp {
                         self.submit_search();
                     }
                     if self.search_popup_open
-                        && !self.search_suggestions.is_empty()
                         && !edit_resp.has_focus()
                         && ui.input(|i| i.key_pressed(Key::Escape))
                     {
@@ -275,12 +280,29 @@ impl YtApp {
                         if clr.clicked() {
                             self.search_input.clear();
                             self.search_suggestions.clear();
-                            self.search_popup_open = false;
+                            self.search_popup_open = !self.search_history.is_empty();
                         }
                     }
 
-                    if self.search_popup_open && !self.search_suggestions.is_empty() {
+                    let show_history_mode = self.search_input.trim().is_empty();
+                    let popup_items: Vec<String> = if show_history_mode {
+                        self.search_history.iter().take(12).cloned().collect()
+                    } else if !self.search_suggestions.is_empty() {
+                        self.search_suggestions.clone()
+                    } else {
+                        let ql = self.search_input.trim().to_ascii_lowercase();
+                        self.search_history
+                            .iter()
+                            .filter(|h| h.to_ascii_lowercase().contains(&ql))
+                            .take(8)
+                            .cloned()
+                            .collect()
+                    };
+                    let showing_history = show_history_mode || self.search_suggestions.is_empty();
+
+                    if self.search_popup_open && !popup_items.is_empty() {
                         let mut picked_suggestion = None;
+                        let mut remove_history_entry: Option<String> = None;
                         let popup_pos = pos2(pill_rect.left() + 6.0, pill_rect.bottom() + 6.0);
                         let popup_w = (pill_rect.width() - 12.0).max(200.0);
                         let area_resp = egui::Area::new(egui::Id::unique("search_suggest_popup"))
@@ -300,24 +322,95 @@ impl YtApp {
                                     .inner_margin(Margin::symmetric(6, 6))
                                     .show(ui, |ui| {
                                         ui.set_width(popup_w - 12.0);
-                                        for s in &self.search_suggestions {
-                                            let row = ui.add_sized(
-                                                Vec2::new(popup_w - 16.0, 32.0),
-                                                egui::Button::new(
-                                                    RichText::new(format!("{}  {s}", icon::SEARCH))
-                                                        .font(theme::regular(13.0))
-                                                        .color(theme::TEXT),
-                                                )
-                                                .fill(Color32::TRANSPARENT)
-                                                .corner_radius(8),
+                                        let row_ico = if showing_history {
+                                            icon::HISTORY
+                                        } else {
+                                            icon::SEARCH
+                                        };
+                                        for (idx, s) in popup_items.iter().enumerate() {
+                                            let row_w = ui.available_width();
+                                            let (r, resp) = ui.allocate_exact_size(
+                                                Vec2::new(row_w, 36.0),
+                                                Sense::click(),
                                             );
-                                            if row.clicked() {
+                                            let row_hov = resp.hovered() || ui.rect_contains_pointer(r);
+                                            if row_hov {
+                                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                                ui.painter().rect_filled(
+                                                    r,
+                                                    8.0,
+                                                    Color32::from_white_alpha(18),
+                                                );
+                                            }
+                                            theme::draw_icon_centered(
+                                                ui.painter(),
+                                                pos2(r.left() + 18.0, r.center().y),
+                                                row_ico,
+                                                14.0,
+                                                theme::TEXT_DIM,
+                                            );
+                                            let text_right_pad = if showing_history { 42.0 } else { 14.0 };
+                                            let text_rect = Rect::from_min_max(
+                                                pos2(r.left() + 38.0, r.top()),
+                                                pos2((r.right() - text_right_pad).max(r.left() + 60.0), r.bottom()),
+                                            );
+                                            ui.painter().with_clip_rect(text_rect).text(
+                                                pos2(text_rect.left(), r.center().y),
+                                                egui::Align2::LEFT_CENTER,
+                                                s,
+                                                theme::regular(13.0),
+                                                theme::TEXT,
+                                            );
+                                            let mut rm_clicked = false;
+                                            if showing_history {
+                                                let x_rect = Rect::from_center_size(
+                                                    pos2(r.right() - 20.0, r.center().y),
+                                                    Vec2::splat(26.0),
+                                                );
+                                                let x_resp = ui
+                                                    .interact(
+                                                        x_rect,
+                                                        ui.scope_id().with(("rm_search_hist", idx, s.as_str())),
+                                                        Sense::click(),
+                                                    )
+                                                    .on_hover_text("Remove from search history")
+                                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                                if x_resp.hovered() {
+                                                    ui.painter().circle_filled(
+                                                        x_rect.center(),
+                                                        13.0,
+                                                        Color32::from_white_alpha(24),
+                                                    );
+                                                }
+                                                theme::draw_icon_centered(
+                                                    ui.painter(),
+                                                    x_rect.center(),
+                                                    icon::X,
+                                                    11.5,
+                                                    if x_resp.hovered() {
+                                                        Color32::WHITE
+                                                    } else {
+                                                        theme::TEXT_DIM
+                                                    },
+                                                );
+                                                if x_resp.clicked() {
+                                                    rm_clicked = true;
+                                                }
+                                            }
+                                            if rm_clicked {
+                                                remove_history_entry = Some(s.clone());
+                                            } else if resp.clicked() {
                                                 picked_suggestion = Some(s.clone());
                                             }
                                         }
                                     });
                             });
-                        if let Some(s) = picked_suggestion {
+                        if let Some(rem) = remove_history_entry {
+                            self.search_history.retain(|h| h != &rem);
+                            if self.search_history.is_empty() && show_history_mode {
+                                self.search_popup_open = false;
+                            }
+                        } else if let Some(s) = picked_suggestion {
                             self.search_input = s;
                             self.search_popup_open = false;
                             self.submit_search();

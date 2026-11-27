@@ -654,6 +654,18 @@ pub(super) fn draw_video_grid_body(
     loading: bool,
     has_more: bool,
 ) -> Option<GridAction> {
+    draw_video_grid_body_with_shorts(ui, heading, items, loading, has_more, false, heading)
+}
+
+pub(super) fn draw_video_grid_body_with_shorts(
+    ui: &mut egui::Ui,
+    heading: &str,
+    items: &[VideoItem],
+    loading: bool,
+    has_more: bool,
+    split_shorts_shelf: bool,
+    shorts_shelf_salt: &str,
+) -> Option<GridAction> {
     let mut action = None;
     if !heading.is_empty() || loading {
         ui.horizontal(|ui| {
@@ -679,14 +691,14 @@ pub(super) fn draw_video_grid_body(
 
     draw_feed_grid_body_inner(
         ui,
-        heading,
+        shorts_shelf_salt,
         items,
         None,
         loading,
         has_more,
         false,
         false,
-        false,
+        split_shorts_shelf,
         &mut action,
     );
     action

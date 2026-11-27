@@ -24,9 +24,9 @@ Powered by [`eframe`](https://crates.io/crates/eframe) / [`egui`](https://crates
 | :---: | :---: | :---: |
 | ![Watch Page with Expanded Sidebar](assets/screenshots/watch-sidebar.jpg) | ![Livestream and Live Chat](assets/screenshots/live-chat.jpg) | ![Comments Sort and Replies](assets/screenshots/comments-replies.png) |
 
-| Channel Page, Search & Floating PiP | Sticky Channel Tabs & Video Grid | Mini-Player Hover Controls & Queue |
+| Search Filters, Channels & Shorts Shelf | Sticky Channel Tabs & Video Grid | Mini-Player Hover Controls & Queue |
 | :---: | :---: | :---: |
-| ![Channel Page and Floating PiP](assets/screenshots/channel-page-pip.jpg) | ![Sticky Channel Tabs and Grid](assets/screenshots/channel-sticky-pip.jpg) | ![Mini-Player Hover Controls and Queue](assets/screenshots/mini-player-queue.jpg) |
+| ![Search Filters, Channels and Shorts Shelf](assets/screenshots/search-filters-shorts.jpg) | ![Sticky Channel Tabs and Grid](assets/screenshots/channel-sticky-pip.jpg) | ![Mini-Player Hover Controls and Queue](assets/screenshots/mini-player-queue.jpg) |
 
 ---
 
@@ -41,8 +41,9 @@ Powered by [`eframe`](https://crates.io/crates/eframe) / [`egui`](https://crates
 - **Parallel HTTP Range Prefetch Proxy (`src/proxy.rs`)**: Prevents single-connection throttling during 1080p+ and 4K adaptive streaming, with instant latest-seek cursor prioritization.
 - **DVR Live Streams**: Pinned live-edge scrubber with `-MM:SS` rewind hover timestamps and clickable `● Live` resync badge.
 
-### Shorts, Windows PiP, Sleep Timer & PO Token Resilience
-- **Full YouTube Shorts Experience**: Horizontal Shorts shelf on Home with drag-scroll & cards, plus a dedicated vertical 9:16 **Shorts Reel** viewer supporting keyboard/scroll/button stepping, **Grid View**, Like/Dislike, Comments drawer, Subscribe bell, Share, and Save.
+### Shorts, Search Filters, Windows PiP & Sleep Timer
+- **Polished YouTube Shorts Reel & Shelves**: Horizontal 9:16 **Shorts** shelves on Home and Search results, plus a center-locked rounded vertical **Shorts Reel** viewer (stays centered when opening Sidebar or Comments) with overlaid channel/subscribe header, aligned action rail, right-edge hover navigation arrows, smooth slide transitions with portrait thumbnail buffering preview, wheel debounce, single-pass quality selection, **Grid View**, Like/Dislike, Comments drawer, Share, and Save.
+- **Full YouTube Search & Filters**: Filter tabs (`All`, `Videos`, `Channels`, `Playlists`, `Live`), multi-column Search **Filters** drawer (Upload date, Type, Duration, Sort by), channel & playlist cards, separated Search Shorts shelf, and left-aligned search history + live autocomplete suggestions.
 - **Borderless Windows Floating PiP**: Pop any playing video out into a borderless, always-on-top Windows overlay showing only edge-to-edge video playback with hover-only minimal controls (drag anywhere to move, bottom-right resize handle, scroll wheel volume, double-click / `Esc` to restore).
 - **Sleep Timer**: Accessible from player controls and settings menu with quick presets (**Off**, **10 min**, **15 min**, **20 min**, **30 min**, **45 min**, **60 min**, **End of video**) plus freeform manual input (`2h`, `1:30`, `90m`, `2 jam`, etc.) that pauses all active and background players upon expiry.
 - **On-Demand BotGuard PO Token (`src/potoken.rs`)**: Hidden WebView2 (`tao` + `wry`) PO Token minter with **Auto (When blocked)** / **Always On** / **Off** modes — spawns on demand with 0 MB idle overhead when normal clients succeed, and automatically injects `--extractor-args` PO tokens when `yt-dlp` fallback encounters bot checks or `403`.
