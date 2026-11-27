@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke};
@@ -13,6 +14,52 @@ pub const TEXT_DIM: Color32 = Color32::from_rgb(170, 170, 170);
 pub const TEXT_FAINT: Color32 = Color32::from_rgb(113, 113, 113);
 pub const YT_RED: Color32 = Color32::from_rgb(255, 0, 51);
 pub const YT_BLUE: Color32 = Color32::from_rgb(62, 166, 255);
+
+static BACKDROP_ACRYLIC: AtomicBool = AtomicBool::new(false);
+static BACKDROP_AMBIENT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_backdrop_flags(acrylic: bool, ambient: bool) {
+    BACKDROP_ACRYLIC.store(acrylic, Ordering::Relaxed);
+    BACKDROP_AMBIENT.store(ambient, Ordering::Relaxed);
+}
+
+pub fn is_translucent() -> bool {
+    BACKDROP_ACRYLIC.load(Ordering::Relaxed) || BACKDROP_AMBIENT.load(Ordering::Relaxed)
+}
+
+pub fn panel_bg() -> Color32 {
+    if is_translucent() {
+        Color32::TRANSPARENT
+    } else {
+        BG
+    }
+}
+
+pub fn chrome_bg() -> Color32 {
+    if BACKDROP_ACRYLIC.load(Ordering::Relaxed) {
+        Color32::from_rgba_unmultiplied(16, 16, 20, 115)
+    } else if BACKDROP_AMBIENT.load(Ordering::Relaxed) {
+        Color32::from_rgba_unmultiplied(15, 15, 19, 130)
+    } else {
+        BG
+    }
+}
+
+pub fn card_fill() -> Color32 {
+    if is_translucent() {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 14)
+    } else {
+        SURFACE
+    }
+}
+
+pub fn card_stroke() -> Color32 {
+    if is_translucent() {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 26)
+    } else {
+        BORDER
+    }
+}
 
 static MEDIUM: LazyLock<FontFamily> = LazyLock::new(|| FontFamily::Name("medium".into()));
 static SEMIBOLD: LazyLock<FontFamily> = LazyLock::new(|| FontFamily::Name("semibold".into()));
@@ -524,6 +571,29 @@ pub fn draw_fullscreen_icon(
     }
 }
 
+/// Crisp refresh / reload circular arrow icon centered at `c`.
+pub fn draw_refresh_icon(painter: &egui::Painter, c: egui::Pos2, s: f32, color: Color32) {
+    let r = s * 0.36;
+    let stroke = Stroke::new((s * 0.12).max(1.4), color);
+    let steps = 16;
+    let start = -0.35_f32;
+    let sweep = std::f32::consts::TAU * 0.76;
+    let pts: Vec<egui::Pos2> = (0..=steps)
+        .map(|k| {
+            let a = start + sweep * (k as f32 / steps as f32);
+            egui::pos2(c.x + r * a.cos(), c.y + r * a.sin())
+        })
+        .collect();
+    painter.add(egui::Shape::line(pts, stroke));
+    let tip = egui::pos2(c.x + r * start.cos(), c.y + r * start.sin());
+    let head = vec![
+        egui::pos2(tip.x + s * 0.10, tip.y - s * 0.22),
+        egui::pos2(tip.x + s * 0.16, tip.y + s * 0.08),
+        egui::pos2(tip.x - s * 0.16, tip.y + s * 0.04),
+    ];
+    painter.add(egui::Shape::convex_polygon(head, color, Stroke::NONE));
+}
+
 /// Crisp YouTube Shorts badge outline + inner play glyph centered at `c`.
 pub fn draw_shorts_icon(painter: &egui::Painter, c: egui::Pos2, s: f32, color: Color32) {
     let r = egui::Rect::from_center_size(c, egui::vec2(s * 0.66, s * 0.88));
@@ -539,6 +609,74 @@ pub fn draw_shorts_icon(painter: &egui::Painter, c: egui::Pos2, s: f32, color: C
         egui::pos2(c.x - s * 0.10, c.y + s * 0.16),
     ];
     painter.add(egui::Shape::convex_polygon(tri, color, Stroke::NONE));
+}
+
+/// Crisp anti-aliased crescent moon + sparkle star icon for Sleep Timer (Lucide MoonStar silhouette).
+pub fn draw_sleep_timer_icon(
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    size: f32,
+    color: Color32,
+) {
+    let ppp = ctx.pixels_per_point();
+    let px = (((size * ppp).round() as usize) + 1 & !1).clamp(16, 128);
+    let key = egui::Id::unique(("sleep_moon_star_icon", px));
+    let tex = ctx
+        .data_mut(|d| d.get_temp::<egui::TextureHandle>(key))
+        .unwrap_or_else(|| {
+            let mut pixels = vec![Color32::TRANSPARENT; px * px];
+            // Sample on a normalized 24x24 grid with 4x4 supersampling.
+            let scale = 24.0 / px as f32;
+            let in_shape = |u: f32, v: f32| -> bool {
+                // Smooth solid crescent moon (outer disk minus offset upper-right cutout)
+                let dx1 = u - 10.6;
+                let dy1 = v - 13.0;
+                let r1_sq = dx1 * dx1 + dy1 * dy1;
+                let dx2 = u - 14.9;
+                let dy2 = v - 9.0;
+                let r2_sq = dx2 * dx2 + dy2 * dy2;
+                let in_moon = r1_sq <= 7.8 * 7.8 && r2_sq >= 6.1 * 6.1;
+                // Crisp 4-point concave sparkle star at upper-right (17.6, 6.2)
+                let sx = (u - 17.6).abs();
+                let sy = (v - 6.2).abs();
+                let in_star = sx.sqrt() + sy.sqrt() <= 1.68;
+                in_moon || in_star
+            };
+            for y in 0..px {
+                for x in 0..px {
+                    let mut hits = 0u32;
+                    for sy in 0..4 {
+                        for sx in 0..4 {
+                            let u = (x as f32 + (sx as f32 + 0.5) * 0.25) * scale;
+                            let v = (y as f32 + (sy as f32 + 0.5) * 0.25) * scale;
+                            if in_shape(u, v) {
+                                hits += 1;
+                            }
+                        }
+                    }
+                    if hits > 0 {
+                        let a = ((hits as f32 / 16.0) * 255.0).round() as u8;
+                        pixels[y * px + x] = Color32::from_white_alpha(a);
+                    }
+                }
+            }
+            let img = egui::ColorImage {
+                size: [px, px],
+                source_size: egui::Vec2::splat(px as f32),
+                pixels,
+            };
+            let tex = ctx.load_texture(
+                format!("sleep-moon-star-{px}"),
+                img,
+                egui::TextureOptions::LINEAR,
+            );
+            ctx.data_mut(|d| d.insert_temp(key, tex.clone()));
+            tex
+        });
+    let rect = egui::Rect::from_center_size(center, egui::Vec2::splat(size));
+    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    painter.image(tex.id(), rect, uv, color);
 }
 
 /// Generate a crisp 64x64 YouTube-rs RGBA icon for the window titlebar & Windows taskbar.

@@ -11,6 +11,7 @@ use super::YtApp;
 
 pub(super) enum GridAction {
     Open(VideoItem),
+    OpenInSecondTab(VideoItem),
     OpenChannel { channel_id: String, name: String },
     PlayNext(VideoItem),
     AddQueue(VideoItem),
@@ -348,6 +349,7 @@ pub(super) fn draw_video_grid_with_flags(
         ui,
         heading,
         items,
+        None,
         loading,
         has_more,
         show_remove_history,
@@ -362,10 +364,21 @@ pub(super) fn draw_home_mixed_grid(
     ui: &mut egui::Ui,
     heading: &str,
     items: &[VideoItem],
+    prioritized_shorts: &[VideoItem],
     loading: bool,
     has_more: bool,
 ) -> Option<GridAction> {
-    draw_feed_grid_inner(ui, heading, items, loading, has_more, false, false, true)
+    draw_feed_grid_inner(
+        ui,
+        heading,
+        items,
+        Some(prioritized_shorts),
+        loading,
+        has_more,
+        false,
+        false,
+        true,
+    )
 }
 
 pub(super) fn draw_shorts_portrait_grid(
@@ -406,7 +419,7 @@ pub(super) fn draw_shorts_portrait_grid(
             for row in items.chunks(cols) {
                 ui.horizontal_top(|ui| {
                     for (idx, item) in row.iter().enumerate() {
-                        draw_short_portrait_card(ui, item, card_w, thumb_h, &mut action);
+                        draw_short_portrait_card(ui, item, card_w, thumb_h, false, &mut action);
                         if idx + 1 < row.len() {
                             ui.add_space(spacing);
                         }
@@ -422,6 +435,7 @@ fn draw_feed_grid_inner(
     ui: &mut egui::Ui,
     heading: &str,
     items: &[VideoItem],
+    prioritized_shorts: Option<&[VideoItem]>,
     loading: bool,
     has_more: bool,
     show_remove_history: bool,
@@ -458,10 +472,14 @@ fn draw_feed_grid_inner(
         let card_w = ((avail - spacing * (cols as f32 - 1.0)) / cols as f32).max(180.0);
         let thumb_h = card_w * 9.0 / 16.0;
 
-        let (regulars, shorts): (Vec<&VideoItem>, Vec<&VideoItem>) = if split_shorts_shelf {
+        let (regulars, fallback_shorts): (Vec<&VideoItem>, Vec<&VideoItem>) = if split_shorts_shelf {
             items.iter().partition(|it| !it.is_short())
         } else {
             (items.iter().collect(), Vec::new())
+        };
+        let shorts: Vec<&VideoItem> = match prioritized_shorts {
+            Some(ov) if !ov.is_empty() => ov.iter().collect(),
+            _ => fallback_shorts,
         };
 
         let split_at = if !shorts.is_empty() {
@@ -529,12 +547,28 @@ fn draw_feed_grid_inner(
     action
 }
 
+#[derive(Clone, Default)]
+struct ShortsShelfDrag {
+    scroll_x: f32,
+    dragging: bool,
+    drag_dist: f32,
+    suppress_click: bool,
+}
+
 fn draw_shorts_shelf(
     ui: &mut egui::Ui,
     id_salt: &str,
     shorts: &[&VideoItem],
     action: &mut Option<GridAction>,
 ) {
+    let drag_id = egui::Id::unique(("shorts_shelf_drag", id_salt));
+    let mut drag_state = ui
+        .ctx()
+        .data_mut(|d| d.get_temp::<ShortsShelfDrag>(drag_id))
+        .unwrap_or_default();
+    let mut step_left = false;
+    let mut step_right = false;
+
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         let (irec, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
@@ -561,6 +595,12 @@ fn draw_shorts_shelf(
                 {
                     *action = Some(GridAction::Open((*first).clone()));
                 }
+                if icon_circle_button(ui, icon::CHEVRON_RIGHT, 15.0, "Scroll Shorts right") {
+                    step_right = true;
+                }
+                if icon_circle_button(ui, icon::CHEVRON_LEFT, 15.0, "Scroll Shorts left") {
+                    step_left = true;
+                }
             });
         }
     });
@@ -568,18 +608,80 @@ fn draw_shorts_shelf(
 
     let card_w = 172.0;
     let thumb_h = 304.0;
-    ScrollArea::horizontal()
-        .id_salt(("home_shorts_shelf", id_salt))
-        .show(ui, |ui| {
+    let drag_blocked = drag_state.suppress_click || (drag_state.dragging && drag_state.drag_dist >= 6.0);
+    let mut sa = ScrollArea::horizontal().id_salt(("home_shorts_shelf", id_salt));
+    if drag_state.dragging || step_left || step_right {
+        sa = sa.horizontal_scroll_offset(drag_state.scroll_x);
+    }
+    let shelf_out = ui.scope(|ui| {
+        sa.show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 for (idx, item) in shorts.iter().enumerate() {
-                    draw_short_portrait_card(ui, item, card_w, thumb_h, action);
+                    draw_short_portrait_card(ui, item, card_w, thumb_h, drag_blocked, action);
                     if idx + 1 < shorts.len() {
                         ui.add_space(12.0);
                     }
                 }
             });
+        })
+    });
+    let scroll_out = shelf_out.inner;
+    let shelf_rect = shelf_out.response.rect;
+    let max_scroll = (scroll_out.content_size.x - scroll_out.inner_rect.width()).max(0.0);
+
+    let hovered_shelf = ui.rect_contains_pointer(shelf_rect);
+    let (primary_down, primary_pressed, secondary_down, delta_x, wheel_y) =
+        ui.ctx().input(|i| {
+            (
+                i.pointer.primary_down(),
+                i.pointer.primary_pressed(),
+                i.pointer.secondary_down(),
+                i.pointer.delta().x,
+                i.smooth_scroll_delta.y,
+            )
         });
+
+    if !drag_state.dragging && !step_left && !step_right {
+        drag_state.scroll_x = scroll_out.state.clamped_offset().x;
+    }
+    if step_left {
+        drag_state.scroll_x = (drag_state.scroll_x - 380.0).clamp(0.0, max_scroll);
+    }
+    if step_right {
+        drag_state.scroll_x = (drag_state.scroll_x + 380.0).clamp(0.0, max_scroll);
+    }
+
+    if hovered_shelf && primary_pressed {
+        drag_state.dragging = true;
+        drag_state.drag_dist = 0.0;
+        drag_state.suppress_click = false;
+    }
+    if drag_state.dragging && primary_down {
+        drag_state.drag_dist += delta_x.abs();
+        drag_state.scroll_x =
+            (scroll_out.state.clamped_offset().x - delta_x).clamp(0.0, max_scroll);
+        if drag_state.drag_dist >= 6.0 {
+            drag_state.suppress_click = true;
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        }
+        if delta_x.abs() > 0.1 {
+            ui.ctx().request_repaint();
+        }
+    } else if !primary_down {
+        drag_state.dragging = false;
+        drag_state.drag_dist = 0.0;
+        drag_state.suppress_click = false;
+    }
+
+    if hovered_shelf && secondary_down {
+        drag_state.scroll_x =
+            (scroll_out.state.clamped_offset().x - delta_x).clamp(0.0, max_scroll);
+    }
+    if hovered_shelf && wheel_y.abs() > 0.1 && drag_state.dragging {
+        drag_state.scroll_x = (drag_state.scroll_x - wheel_y).clamp(0.0, max_scroll);
+    }
+
+    ui.ctx().data_mut(|d| d.insert_temp(drag_id, drag_state));
 }
 
 fn draw_short_portrait_card(
@@ -587,9 +689,10 @@ fn draw_short_portrait_card(
     item: &VideoItem,
     card_w: f32,
     thumb_h: f32,
+    drag_blocked: bool,
     action: &mut Option<GridAction>,
 ) {
-    let card_h = thumb_h + 70.0;
+    let card_h = thumb_h + 76.0;
     let (card_rect, card_resp) =
         ui.allocate_exact_size(Vec2::new(card_w, card_h), Sense::click());
     let hovered = card_resp.hovered() || ui.rect_contains_pointer(card_rect);
@@ -598,7 +701,7 @@ fn draw_short_portrait_card(
         hovered,
         0.15,
     );
-    if hovered {
+    if hovered && !drag_blocked {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
     if hover_t > 0.01 {
@@ -618,6 +721,40 @@ fn draw_short_portrait_card(
             ui.allocate_exact_size(Vec2::new(card_w, thumb_h), Sense::hover());
         ui.painter().rect_filled(thumb_rect, 12.0, Color32::BLACK);
         theme::paint_image_cover_rounded(ui, &item.thumbnail_url, thumb_rect, 12);
+
+        // Top-left badges ("New", "Members only") matching YouTube Shorts shelf
+        let mut badge_y = thumb_rect.top() + 8.0;
+        if item.is_new {
+            let galley = ui.painter().layout_no_wrap(
+                "New".to_owned(),
+                theme::semibold(10.5),
+                Color32::WHITE,
+            );
+            let pad = vec2(7.0, 2.5);
+            let bsz = galley.size() + pad * 2.0;
+            let brect = Rect::from_min_size(pos2(thumb_rect.left() + 8.0, badge_y), bsz);
+            ui.painter()
+                .rect_filled(brect, 5.0, Color32::from_black_alpha(195));
+            ui.painter()
+                .galley(brect.min + pad, galley, Color32::WHITE);
+            badge_y += bsz.y + 5.0;
+        }
+        if item.is_members_only {
+            let text_col = Color32::from_rgb(72, 232, 148);
+            let galley = ui.painter().layout_no_wrap(
+                "Members only".to_owned(),
+                theme::semibold(10.0),
+                text_col,
+            );
+            let pad = vec2(6.5, 2.5);
+            let bsz = galley.size() + pad * 2.0;
+            let brect = Rect::from_min_size(pos2(thumb_rect.left() + 8.0, badge_y), bsz);
+            ui.painter()
+                .rect_filled(brect, 5.0, Color32::from_rgba_unmultiplied(12, 46, 30, 225));
+            ui.painter()
+                .galley(brect.min + pad, galley, text_col);
+        }
+
         if hover_t > 0.02 {
             ui.painter().circle_filled(
                 thumb_rect.center(),
@@ -633,29 +770,32 @@ fn draw_short_portrait_card(
             );
         }
 
-        ui.add_space(8.0);
+        ui.add_space(7.0);
         ui.horizontal_top(|ui| {
+            let text_w = (card_w - 30.0).max(90.0);
             ui.vertical(|ui| {
-                ui.set_max_width((card_w - 30.0).max(90.0));
-                ui.set_max_height(56.0);
+                ui.set_max_width(text_w);
+                ui.spacing_mut().item_spacing.y = 3.0;
+                let clamped = clamp_two_lines(ui, &item.title, theme::semibold(13.0), text_w - 2.0);
                 ui.add(
                     egui::Label::new(
-                        RichText::new(&item.title)
-                            .font(theme::semibold(13.2))
+                        RichText::new(clamped)
+                            .font(theme::semibold(13.0))
                             .color(theme::TEXT),
                     )
                     .wrap(),
                 );
-                let sub = if !item.views_text.is_empty() {
-                    item.views_text.clone()
-                } else {
-                    item.channel.clone()
+                let sub = match (item.channel.is_empty(), item.views_text.is_empty()) {
+                    (false, false) => format!("{} · {}", item.channel, item.views_text),
+                    (false, true) => item.channel.clone(),
+                    (true, false) => item.views_text.clone(),
+                    (true, true) => String::new(),
                 };
                 if !sub.is_empty() {
                     ui.add(
                         egui::Label::new(
                             RichText::new(sub)
-                                .font(theme::regular(11.8))
+                                .font(theme::regular(11.5))
                                 .color(theme::TEXT_DIM),
                         )
                         .truncate(),
@@ -711,7 +851,8 @@ fn draw_short_portrait_card(
     } else {
         card_resp
     };
-    if card_hover_resp.clicked() && !child_clicked_override && action.is_none() {
+    if card_hover_resp.clicked() && !child_clicked_override && !drag_blocked && action.is_none()
+    {
         *action = Some(GridAction::Open(item.clone()));
     }
 }
@@ -729,7 +870,7 @@ fn draw_video_card_row(
     ui.horizontal_top(|ui| {
         for (col_idx, item) in row.iter().enumerate() {
             let item = *item;
-            let card_h = thumb_h + 92.0;
+            let card_h = thumb_h + if item.is_members_only { 108.0 } else { 92.0 };
             let (card_rect, card_resp) =
                 ui.allocate_exact_size(Vec2::new(card_w, card_h), Sense::click());
             let hovered = card_resp.hovered() || ui.rect_contains_pointer(card_rect);
@@ -831,6 +972,10 @@ fn draw_video_card_row(
                                 .truncate(),
                             );
                         }
+                        if item.is_members_only {
+                            ui.add_space(3.0);
+                            draw_members_badge(ui);
+                        }
                     });
 
                     ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
@@ -926,7 +1071,14 @@ fn draw_video_card_row(
                 card_resp
             };
 
-            if card_hover_resp.clicked() && !child_clicked_override && action.is_none() {
+            if card_hover_resp.middle_clicked()
+                && !child_clicked_override
+                && action.is_none()
+                && !item.is_short()
+                && item.playlist_browse_id.is_none()
+            {
+                *action = Some(GridAction::OpenInSecondTab(item.clone()));
+            } else if card_hover_resp.clicked() && !child_clicked_override && action.is_none() {
                 *action = Some(GridAction::Open(item.clone()));
             }
             if col_idx + 1 < row.len() {
@@ -942,6 +1094,15 @@ pub(super) fn draw_video_context_menu(
     action: &mut Option<GridAction>,
     show_play_next: bool,
 ) {
+    if !item.is_short()
+        && item.playlist_browse_id.is_none()
+        && ui
+            .button(format!("{}  Open in 2nd Player Tab", icon::PLAY))
+            .clicked()
+    {
+        *action = Some(GridAction::OpenInSecondTab(item.clone()));
+        ui.close();
+    }
     if show_play_next
         && ui
             .button(format!("{}  Play Next", icon::PLAY))
@@ -1043,20 +1204,6 @@ pub(super) fn icon_circle_button(
     resp.on_hover_text(tooltip).clicked()
 }
 
-pub(super) fn settings_card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
-    Frame::new()
-        .fill(theme::SURFACE)
-        .stroke(Stroke::new(1.0, theme::BORDER))
-        .corner_radius(12)
-        .inner_margin(Margin::same(16))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).font(theme::semibold(15.5)));
-            ui.add_space(10.0);
-            add(ui);
-        });
-}
-
 pub(super) fn draw_avatar(ui: &mut egui::Ui, url: Option<&str>, name: &str, size: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     if let Some(u) = url {
@@ -1150,6 +1297,57 @@ fn draw_thumbnail_with_hover(
         ui.painter().rect_filled(badge_rect, 4.0, bg);
         ui.painter()
             .galley(badge_rect.min + pad, galley, Color32::WHITE);
+    }
+}
+
+pub(super) fn draw_members_badge(ui: &mut egui::Ui) {
+    let green = Color32::from_rgb(45, 212, 128);
+    Frame::new()
+        .fill(Color32::from_rgba_unmultiplied(15, 157, 88, 38))
+        .corner_radius(4)
+        .inner_margin(Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                theme::draw_icon(ui, icon::SPARKLES, 10.5, green);
+                ui.label(
+                    RichText::new("Members only")
+                        .font(theme::semibold(10.5))
+                        .color(green),
+                );
+            });
+        });
+}
+
+pub(super) fn clamp_two_lines(
+    ui: &egui::Ui,
+    text: &str,
+    font: egui::FontId,
+    max_w: f32,
+) -> String {
+    let galley = ui
+        .painter()
+        .layout(text.to_owned(), font.clone(), theme::TEXT, max_w);
+    if galley.rows.len() <= 2 {
+        return text.to_owned();
+    }
+    let two_line_chars: usize = galley.rows[..2]
+        .iter()
+        .map(|r| r.glyphs.len())
+        .sum();
+    let mut out: String = text.chars().take(two_line_chars.saturating_sub(2)).collect();
+    while !out.is_empty() {
+        let cand = format!("{out}…");
+        let g = ui.painter().layout(cand, font.clone(), theme::TEXT, max_w);
+        if g.rows.len() <= 2 {
+            break;
+        }
+        out.pop();
+    }
+    if out.is_empty() {
+        "…".to_owned()
+    } else {
+        format!("{out}…")
     }
 }
 

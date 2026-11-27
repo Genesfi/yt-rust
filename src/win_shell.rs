@@ -298,6 +298,65 @@ mod imp {
         ) -> Hresult;
     }
 
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: Hwnd,
+            attr: u32,
+            val: *const c_void,
+            size: u32,
+        ) -> Hresult;
+        fn DwmExtendFrameIntoClientArea(hwnd: Hwnd, margins: *const Margins) -> Hresult;
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegGetValueW(
+            hkey: isize,
+            sub_key: *const u16,
+            value: *const u16,
+            flags: u32,
+            pdw_type: *mut u32,
+            pv_data: *mut c_void,
+            pcb_data: *mut u32,
+        ) -> i32;
+    }
+
+    #[repr(C)]
+    struct Margins {
+        left: i32,
+        right: i32,
+        top: i32,
+        bottom: i32,
+    }
+
+    pub fn windows_backdrop_supported() -> bool {
+        const HKEY_LOCAL_MACHINE: isize = -2147483646; // 0x80000002
+        const RRF_RT_REG_SZ: u32 = 0x0000_0002;
+        let sub = wide_z(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
+        let val = wide_z("CurrentBuildNumber");
+        let mut buf = [0u16; 16];
+        let mut size = std::mem::size_of_val(&buf) as u32;
+        let rc = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                sub.as_ptr(),
+                val.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr() as *mut c_void,
+                &mut size,
+            )
+        };
+        if rc != 0 {
+            return false;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..len])
+            .parse::<u32>()
+            .is_ok_and(|b| b >= 22621)
+    }
+
     fn wide_z(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
@@ -603,6 +662,7 @@ mod imp {
         icon_play: Hicon,
         icon_pause: Hicon,
         icon_next: Hicon,
+        last_material: Option<(crate::model::WindowMaterial, bool)>,
     }
 
     impl WinShell {
@@ -739,6 +799,7 @@ mod imp {
                 icon_play: create_glyph_icon(GlyphKind::Play),
                 icon_pause: create_glyph_icon(GlyphKind::Pause),
                 icon_next: create_glyph_icon(GlyphKind::Next),
+                last_material: None,
             };
             shell.ensure_taskbar_buttons(true);
             Some(shell)
@@ -861,6 +922,70 @@ mod imp {
                 SetForegroundWindow(self.app_hwnd);
             }
         }
+
+        pub fn sync_window_material(
+            &mut self,
+            material: crate::model::WindowMaterial,
+            pip_mode: bool,
+        ) {
+            use crate::model::WindowMaterial;
+            if self.last_material == Some((material, pip_mode)) {
+                return;
+            }
+            self.last_material = Some((material, pip_mode));
+            if !windows_backdrop_supported() {
+                return;
+            }
+            const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+            const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
+            const DWMSBT_NONE: i32 = 1;
+            const DWMSBT_MAINWINDOW: i32 = 2;
+            const DWMSBT_TRANSIENTWINDOW: i32 = 3;
+            const DWMSBT_TABBEDWINDOW: i32 = 4;
+
+            let active = material != WindowMaterial::None && !pip_mode;
+            let kind = if !active {
+                DWMSBT_NONE
+            } else {
+                match material {
+                    WindowMaterial::None => DWMSBT_NONE,
+                    WindowMaterial::Mica => DWMSBT_MAINWINDOW,
+                    WindowMaterial::Acrylic => DWMSBT_TRANSIENTWINDOW,
+                    WindowMaterial::MicaAlt => DWMSBT_TABBEDWINDOW,
+                }
+            };
+            let dark: i32 = 1;
+            let margins = if active {
+                Margins {
+                    left: -1,
+                    right: -1,
+                    top: -1,
+                    bottom: -1,
+                }
+            } else {
+                Margins {
+                    left: 0,
+                    right: 0,
+                    top: 0,
+                    bottom: 0,
+                }
+            };
+            unsafe {
+                let _ = DwmSetWindowAttribute(
+                    self.app_hwnd,
+                    DWMWA_USE_IMMERSIVE_DARK_MODE,
+                    &dark as *const i32 as *const c_void,
+                    std::mem::size_of::<i32>() as u32,
+                );
+                let _ = DwmExtendFrameIntoClientArea(self.app_hwnd, &margins);
+                let _ = DwmSetWindowAttribute(
+                    self.app_hwnd,
+                    DWMWA_SYSTEMBACKDROP_TYPE,
+                    &kind as *const i32 as *const c_void,
+                    std::mem::size_of::<i32>() as u32,
+                );
+            }
+        }
     }
 
     impl Drop for WinShell {
@@ -916,7 +1041,19 @@ mod imp {
         }
 
         pub fn restore_main_window(&self) {}
+
+        pub fn sync_window_material(
+            &mut self,
+            _material: crate::model::WindowMaterial,
+            _pip_mode: bool,
+        ) {
+        }
+    }
+
+    pub fn windows_backdrop_supported() -> bool {
+        false
     }
 }
 
 pub use imp::WinShell;
+pub use imp::windows_backdrop_supported;

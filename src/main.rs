@@ -8,6 +8,7 @@ mod login;
 mod model;
 mod mpv;
 mod os_media;
+mod potoken;
 mod proxy;
 mod sponsorblock;
 mod theme;
@@ -126,18 +127,26 @@ fn main() -> eframe::Result {
             login::child_main(dir.into());
             return Ok(());
         }
+        if flag == potoken::FLAG {
+            potoken::child_main(dir.into());
+            return Ok(());
+        }
     }
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let dir = data_dir();
     install_crash_diagnostics(&dir);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1320.0, 840.0])
+        .with_min_inner_size([840.0, 540.0])
+        .with_title("YouTube — yt-rust")
+        .with_icon(Arc::new(theme::generate_app_icon()));
+    if cfg!(windows) {
+        viewport = viewport.with_transparent(true);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1320.0, 840.0])
-            .with_min_inner_size([840.0, 540.0])
-            .with_title("YouTube — yt-rust")
-            .with_icon(Arc::new(theme::generate_app_icon())),
+        viewport,
         renderer: eframe::Renderer::Glow,
         persistence_path: Some(dir.join("app.ron")),
         multisampling: 0,

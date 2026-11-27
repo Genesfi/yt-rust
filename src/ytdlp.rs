@@ -328,7 +328,7 @@ async fn probe_stream_ok(http: &reqwest::Client, url: &str, ua: Option<&str>) ->
     }
 }
 
-fn is_auth_required_error(stderr: &str) -> bool {
+pub fn is_auth_required_error(stderr: &str) -> bool {
     let lc = stderr.to_ascii_lowercase();
     lc.contains("sign in to confirm")
         || lc.contains("confirm your age")
@@ -340,6 +340,15 @@ fn is_auth_required_error(stderr: &str) -> bool {
         || lc.contains("requires payment")
 }
 
+pub fn needs_potoken_retry(err: &str) -> bool {
+    let lc = err.to_ascii_lowercase();
+    is_auth_required_error(err)
+        || lc.contains("requested format is not available")
+        || lc.contains("po token")
+        || lc.contains("potoken")
+        || lc.contains("403")
+}
+
 /// Fallback stream resolution using yt-dlp when InnerTube direct URLs fail.
 /// Tries without account cookies first so normal public playback avoids sending cookies,
 /// and retries with `--cookies` only when YouTube requires authentication/age verification.
@@ -349,6 +358,7 @@ pub async fn resolve_video(
     cookie: Option<&str>,
     video_id: &str,
     max_height: u32,
+    po_token: Option<&crate::potoken::PoTokens>,
 ) -> anyhow::Result<YtdlpStreams> {
     let (bin_res, runtime) = tokio::join!(
         ensure_ytdlp(http, data_dir),
@@ -356,6 +366,7 @@ pub async fn resolve_video(
     );
     let bin = bin_res?;
     let cookie_owned = cookie.filter(|c| !c.trim().is_empty()).map(str::to_owned);
+    let pot_owned = po_token.cloned();
 
     let mut used_cookie = false;
     let first_res = {
@@ -363,7 +374,20 @@ pub async fn resolve_video(
         let rt = runtime.clone();
         let dir = data_dir.to_owned();
         let vid = video_id.to_owned();
-        tokio::task::spawn_blocking(move || run_ytdlp(&bin, rt.as_deref(), &dir, None, &vid, max_height, false)).await?
+        let pot = pot_owned.clone();
+        tokio::task::spawn_blocking(move || {
+            run_ytdlp(
+                &bin,
+                rt.as_deref(),
+                &dir,
+                None,
+                &vid,
+                max_height,
+                false,
+                pot.as_ref(),
+            )
+        })
+        .await?
     };
 
     let streams = match first_res {
@@ -378,8 +402,18 @@ pub async fn resolve_video(
                     let dir = data_dir.to_owned();
                     let vid = video_id.to_owned();
                     let c = c.clone();
+                    let pot = pot_owned.clone();
                     tokio::task::spawn_blocking(move || {
-                        run_ytdlp(&bin, rt.as_deref(), &dir, Some(&c), &vid, max_height, false)
+                        run_ytdlp(
+                            &bin,
+                            rt.as_deref(),
+                            &dir,
+                            Some(&c),
+                            &vid,
+                            max_height,
+                            false,
+                            pot.as_ref(),
+                        )
                     })
                     .await??
                 } else {
@@ -400,6 +434,7 @@ pub async fn resolve_video(
         let data_dir_retry = data_dir.to_owned();
         let cookie_retry = if used_cookie { cookie_owned } else { None };
         let vid_retry = video_id.to_owned();
+        let pot_retry = pot_owned.clone();
         if let Ok(Ok(alt)) = tokio::task::spawn_blocking(move || {
             run_ytdlp(
                 &bin,
@@ -409,6 +444,7 @@ pub async fn resolve_video(
                 &vid_retry,
                 max_height,
                 true,
+                pot_retry.as_ref(),
             )
         })
         .await
@@ -461,6 +497,7 @@ fn run_ytdlp(
     video_id: &str,
     max_height: u32,
     prefer_alt_clients: bool,
+    po_token: Option<&crate::potoken::PoTokens>,
 ) -> anyhow::Result<YtdlpStreams> {
     let _jar = cookie
         .map(|c| TempCookieJar::create(data_dir, c))
@@ -472,14 +509,32 @@ fn run_ytdlp(
     let hls_sel = format!(
         "bestvideo[height<={max_height}][protocol^=m3u8]+bestaudio/best[height<={max_height}][protocol^=m3u8]/bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best"
     );
+    let pot_arg = po_token.map(|pot| {
+        format!(
+            "youtube:player_client=web,web_safari,tv;po_token=web.player+{},web.gvs+{}",
+            pot.player, pot.stream
+        )
+    });
     let mut out = if prefer_alt_clients {
+        let arg = pot_arg
+            .as_deref()
+            .unwrap_or("youtube:player_client=web_safari,tv,android_vr");
         invoke_ytdlp_json(
             bin,
             runtime,
             jar_path,
             video_id,
             &hls_sel,
-            &["--extractor-args", "youtube:player_client=web_safari,tv,android_vr"],
+            &["--extractor-args", arg],
+        )?
+    } else if let Some(ref arg) = pot_arg {
+        invoke_ytdlp_json(
+            bin,
+            runtime,
+            jar_path,
+            video_id,
+            &selector,
+            &["--extractor-args", arg],
         )?
     } else {
         invoke_ytdlp_json(bin, runtime, jar_path, video_id, &selector, &[])?
@@ -487,13 +542,16 @@ fn run_ytdlp(
     if !out.status.success() && !prefer_alt_clients {
         let err = String::from_utf8_lossy(&out.stderr);
         if err.contains("Requested format is not available") {
+            let arg = pot_arg
+                .as_deref()
+                .unwrap_or("youtube:player_client=web_safari,tv,android_vr");
             out = invoke_ytdlp_json(
                 bin,
                 runtime,
                 jar_path,
                 video_id,
                 &hls_sel,
-                &["--extractor-args", "youtube:player_client=web_safari,tv,android_vr"],
+                &["--extractor-args", arg],
             )?;
         }
     }

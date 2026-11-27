@@ -20,7 +20,7 @@ impl YtApp {
             .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(theme::BG)
+                    .fill(theme::chrome_bg())
                     .inner_margin(Margin::symmetric(16, 10)),
             )
             .show(ui, |ui| {
@@ -59,7 +59,9 @@ impl YtApp {
 
                     ui.add_space(6.0);
 
-                    if (!self.nav_back.is_empty() || self.page == Page::Watch)
+                    if (!self.nav_back.is_empty()
+                        || self.page == Page::Watch
+                        || self.page == Page::Shorts)
                         && icon_circle_button(ui, icon::CHEVRON_LEFT, 18.0, "Back (Mouse Back / Alt+Left)")
                     {
                         self.nav_go_back();
@@ -77,6 +79,7 @@ impl YtApp {
                     if !self.nav_back.is_empty()
                         || !self.nav_forward.is_empty()
                         || self.page == Page::Watch
+                        || self.page == Page::Shorts
                     {
                         ui.add_space(4.0);
                     }
@@ -424,6 +427,13 @@ impl YtApp {
                                                 .backend
                                                 .tx
                                                 .send(Request::MarkNotificationsSeen { params: p });
+                                        } else {
+                                            for n in &self.notifications {
+                                                if let Some(vid) = &n.video_id {
+                                                    self.seen_fallback_notif_ids.insert(vid.clone());
+                                                }
+                                            }
+                                            self.unread_notifications = 0;
                                         }
                                     }
                                 }

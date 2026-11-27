@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -11,8 +11,10 @@ use crate::innertube::{self, FeedPage, WebConfig};
 use crate::model::{
     AudioTrack, ChannelInfo, ChannelNotificationParams, CommentItem, FeedChip, LiveChatEmote,
     LiveChatMessage, NotificationLevel, NotificationMenuItem, PlaylistOption, PlaylistSummary,
-    PreferredQuality, SidebarChannel, SponsorSegment, VideoFormat, VideoItem, WatchData,
+    PoTokenMode, PreferredQuality, SidebarChannel, SponsorSegment, VideoFormat, VideoItem,
+    WatchData,
 };
+use crate::potoken::PoTokenClient;
 use crate::proxy::StreamProxy;
 use crate::{login, mpv, sponsorblock, ytdlp};
 
@@ -180,6 +182,11 @@ pub enum Request {
     DownloadLibmpv,
     ResolveChannelAvatars {
         channel_ids: Vec<String>,
+    },
+    SetPoTokenMode(PoTokenMode),
+    LoadAmbientArt {
+        key: String,
+        url: String,
     },
 }
 
@@ -385,6 +392,12 @@ pub enum Response {
     SignedOut,
     SessionRevoked,
     LibmpvDownloaded(Result<PathBuf, String>),
+    AmbientArtReady {
+        key: String,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
     Error(String),
 }
 
@@ -447,6 +460,7 @@ async fn load_guide_and_backfill_thumbs(
     cfg: WebConfig,
     session: Session,
     thumb_cache: Arc<Mutex<ThumbDiskCache>>,
+    latest_guide_channels: Arc<Mutex<Vec<SidebarChannel>>>,
     data_dir: PathBuf,
     resp_tx: Sender<Response>,
     wake: Arc<dyn Fn() + Send + Sync>,
@@ -455,6 +469,7 @@ async fn load_guide_and_backfill_thumbs(
     else {
         return;
     };
+    *latest_guide_channels.lock().unwrap() = channels.clone();
 
     let mut missing = Vec::new();
     {
@@ -596,7 +611,12 @@ impl Backend {
                     let _ = proxy_tx.send(proxy.clone());
 
                     let thumb_cache = Arc::new(Mutex::new(ThumbDiskCache::load(&dir_clone)));
+                    let latest_guide_channels: Arc<Mutex<Vec<SidebarChannel>>> =
+                        Arc::new(Mutex::new(Vec::new()));
+                    let latest_home_items: Arc<Mutex<Vec<VideoItem>>> =
+                        Arc::new(Mutex::new(Vec::new()));
                     ytdlp::remove_leftover_cookies(&dir_clone);
+                    let _ = std::fs::remove_file(dir_clone.join("notif_debug.json"));
                     let mut session = Session::load(&dir_clone);
                     let mut cfg = innertube::fetch_web_config(&http, session.as_ref()).await;
 
@@ -624,27 +644,64 @@ impl Backend {
                             cfg.clone(),
                             s.clone(),
                             thumb_cache.clone(),
+                            latest_guide_channels.clone(),
                             dir_clone.clone(),
                             resp_tx.clone(),
                             wake.clone(),
                         ));
-                        let http_n = http.clone();
-                        let cfg_n = cfg.clone();
-                        let s_n = s.clone();
-                        let tx_n = resp_tx.clone();
-                        let wake_n = wake.clone();
+                        let http_sub = http.clone();
+                        let cfg_sub = cfg.clone();
+                        let s_sub = s.clone();
+                        let tx_sub = resp_tx.clone();
+                        let wake_sub = wake.clone();
+                        let guide_sub = latest_guide_channels.clone();
+                        let home_sub = latest_home_items.clone();
+                        let tc_sub = thumb_cache.clone();
                         tokio::spawn(async move {
-                            if let Ok(unseen) =
-                                innertube::fetch_unseen_notification_count(&http_n, &cfg_n, &s_n)
-                                    .await
-                            {
-                                let _ = tx_n.send(Response::NotificationsCountLoaded(unseen));
-                                wake_n();
+                            let (sub_res, unseen_res) = tokio::join!(
+                                innertube::subscriptions_feed(&http_sub, None, &cfg_sub, &s_sub),
+                                innertube::fetch_unseen_notification_count(
+                                    &http_sub, &cfg_sub, &s_sub
+                                ),
+                            );
+                            let native_unseen = unseen_res.unwrap_or(0);
+                            if native_unseen > 0 {
+                                let _ = tx_sub.send(Response::NotificationsCountLoaded(native_unseen));
+                                wake_sub();
+                            }
+                            if let Ok(page) = sub_res {
+                                if native_unseen == 0 {
+                                    let guide_snap = guide_sub.lock().unwrap().clone();
+                                    let home_snap = home_sub.lock().unwrap().clone();
+                                    let av_snap = tc_sub.lock().unwrap().channel_avatars.clone();
+                                    let seed = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map_or(1, |d| d.as_secs());
+                                    let (_, fb_unseen) = innertube::build_subscription_notifications(
+                                        &page.items,
+                                        &guide_snap,
+                                        &home_snap,
+                                        &av_snap,
+                                        seed,
+                                    );
+                                    if fb_unseen > 0 {
+                                        let _ = tx_sub
+                                            .send(Response::NotificationsCountLoaded(fb_unseen));
+                                    }
+                                }
+                                let _ = tx_sub.send(Response::SubscriptionsLoaded {
+                                    items: page.items,
+                                    continuation: page.continuation,
+                                    append: false,
+                                });
+                                wake_sub();
                             }
                         });
                     }
 
                     let shared_session = Arc::new(Mutex::new(session));
+                    let potoken = Arc::new(PoTokenClient::new(&dir_clone));
+                    let po_token_mode = Arc::new(AtomicU8::new(PoTokenMode::Auto.as_u8()));
                     {
                         let rot_http = http.clone();
                         let rot_sess = shared_session.clone();
@@ -663,6 +720,8 @@ impl Backend {
                         let wake = wake.clone();
                         let data_dir = dir_clone.clone();
                         let thumb_cache = thumb_cache.clone();
+                        let potoken = potoken.clone();
+                        let po_token_mode = po_token_mode.clone();
 
                         match req {
                             Request::LoadHome {
@@ -688,6 +747,9 @@ impl Backend {
                                     }) => {
                                         if visitor_data.is_some() {
                                             cfg.visitor_data = visitor_data;
+                                        }
+                                        if !append {
+                                            *latest_home_items.lock().unwrap() = items.clone();
                                         }
                                         let _ = resp_tx.send(Response::HomeLoaded {
                                             items,
@@ -1651,6 +1713,7 @@ impl Backend {
                                     continue;
                                 };
                                 let cfg_clone = cfg.clone();
+                                let guide_snap = latest_guide_channels.clone();
                                 tokio::spawn(async move {
                                     match innertube::create_playlist(
                                         &http,
@@ -1670,6 +1733,7 @@ impl Backend {
                                                 cfg_clone,
                                                 s,
                                                 thumb_cache,
+                                                guide_snap,
                                                 data_dir,
                                                 resp_tx.clone(),
                                                 wake.clone(),
@@ -1731,21 +1795,114 @@ impl Backend {
                                     continue;
                                 };
                                 let cfg_clone = cfg.clone();
+                                let guide_snap = latest_guide_channels.clone();
+                                let home_snap = latest_home_items.clone();
+                                let tc_snap = thumb_cache.clone();
+                                let dir_save = dir_clone.clone();
                                 tokio::spawn(async move {
-                                    match innertube::fetch_notifications_menu(&http, &cfg_clone, &s)
-                                        .await
-                                    {
-                                        Ok((items, unseen_count, seen_params)) => {
+                                    let menu_res = innertube::fetch_notifications_menu(
+                                        &http, &cfg_clone, &s,
+                                    )
+                                    .await;
+                                    match menu_res {
+                                        Ok((items, unseen_count, seen_params))
+                                            if !items.is_empty() =>
+                                        {
                                             let _ = resp_tx.send(Response::NotificationsLoaded {
                                                 items,
                                                 unseen_count,
                                                 seen_params,
                                             });
                                         }
-                                        Err(e) => {
-                                            let _ = resp_tx.send(Response::Error(format!(
-                                                "Notifications load failed: {e:#}"
-                                            )));
+                                        native_empty_or_err => {
+                                            let sub_res = innertube::subscriptions_feed(
+                                                &http, None, &cfg_clone, &s,
+                                            )
+                                            .await;
+                                            match sub_res {
+                                                Ok(page) => {
+                                                    let guide = guide_snap.lock().unwrap().clone();
+                                                    let home = home_snap.lock().unwrap().clone();
+                                                    let av_map = tc_snap
+                                                        .lock()
+                                                        .unwrap()
+                                                        .channel_avatars
+                                                        .clone();
+                                                    let seed = std::time::SystemTime::now()
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .map_or(1, |d| d.as_nanos() as u64);
+                                                    let (mut items, unseen_count) =
+                                                        innertube::build_subscription_notifications(
+                                                            &page.items,
+                                                            &guide,
+                                                            &home,
+                                                            &av_map,
+                                                            seed,
+                                                        );
+                                                    let missing_cids: Vec<String> = items
+                                                        .iter()
+                                                        .filter(|n| n.channel_avatar_url.is_none())
+                                                        .filter_map(|n| n.channel_id.clone())
+                                                        .collect();
+                                                    if !missing_cids.is_empty() {
+                                                        let fetched =
+                                                            innertube::fetch_channel_avatars(
+                                                                &http,
+                                                                missing_cids,
+                                                                &cfg_clone,
+                                                                Some(&s),
+                                                            )
+                                                            .await;
+                                                        if !fetched.is_empty() {
+                                                            for n in &mut items {
+                                                                if n.channel_avatar_url.is_none() {
+                                                                    if let Some(cid) =
+                                                                        &n.channel_id
+                                                                    {
+                                                                        if let Some(av) =
+                                                                            fetched.get(cid)
+                                                                        {
+                                                                            n.channel_avatar_url =
+                                                                                Some(av.clone());
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            let mut tc = tc_snap.lock().unwrap();
+                                                            for (cid, av) in fetched {
+                                                                tc.channel_avatars.insert(cid, av);
+                                                            }
+                                                            tc.save(&dir_save);
+                                                        }
+                                                    }
+                                                    let _ = resp_tx.send(
+                                                        Response::NotificationsLoaded {
+                                                            items,
+                                                            unseen_count,
+                                                            seen_params: None,
+                                                        },
+                                                    );
+                                                }
+                                                Err(sub_err) => {
+                                                    if let Ok((items, unseen_count, seen_params)) =
+                                                        native_empty_or_err
+                                                    {
+                                                        let _ = resp_tx.send(
+                                                            Response::NotificationsLoaded {
+                                                                items,
+                                                                unseen_count,
+                                                                seen_params,
+                                                            },
+                                                        );
+                                                    } else {
+                                                        let _ = resp_tx.send(Response::Error(
+                                                            format!(
+                                                                "Notifications load failed: {sub_err:#}"
+                                                            ),
+                                                        ));
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     wake();
@@ -1925,6 +2082,9 @@ impl Backend {
                                         }
                                     });
 
+                                    let po_cli = potoken.clone();
+                                    let po_mode =
+                                        PoTokenMode::from_u8(po_token_mode.load(Ordering::Relaxed));
                                     match resolve_watch(
                                         &http,
                                         &data_dir,
@@ -1933,6 +2093,8 @@ impl Backend {
                                         &cfg_clone,
                                         sess_clone.as_ref(),
                                         proxy_clone.as_ref(),
+                                        &po_cli,
+                                        po_mode,
                                     )
                                     .await
                                     {
@@ -1984,6 +2146,9 @@ impl Backend {
                                         Some(_) => PreferredQuality::Best4K,
                                         None => quality,
                                     };
+                                    let po_cli = potoken.clone();
+                                    let po_mode =
+                                        PoTokenMode::from_u8(po_token_mode.load(Ordering::Relaxed));
                                     match resolve_watch(
                                         &http,
                                         &data_dir,
@@ -1992,6 +2157,8 @@ impl Backend {
                                         &cfg_clone,
                                         sess_clone.as_ref(),
                                         proxy_clone.as_ref(),
+                                        &po_cli,
+                                        po_mode,
                                     )
                                     .await
                                     {
@@ -2111,6 +2278,7 @@ impl Backend {
                                                 if visitor_data.is_some() {
                                                     cfg.visitor_data = visitor_data;
                                                 }
+                                                *latest_home_items.lock().unwrap() = items.clone();
                                                 let _ = resp_tx.send(Response::HomeLoaded {
                                                     items,
                                                     chips,
@@ -2125,10 +2293,32 @@ impl Backend {
                                                     cfg.clone(),
                                                     s.clone(),
                                                     thumb_cache.clone(),
+                                                    latest_guide_channels.clone(),
                                                     data_dir.clone(),
                                                     resp_tx.clone(),
                                                     wake.clone(),
                                                 ));
+                                                let http_sub = http.clone();
+                                                let cfg_sub = cfg.clone();
+                                                let s_sub = s.clone();
+                                                let tx_sub = resp_tx.clone();
+                                                let wake_sub = wake.clone();
+                                                tokio::spawn(async move {
+                                                    if let Ok(page) = innertube::subscriptions_feed(
+                                                        &http_sub, None, &cfg_sub, &s_sub,
+                                                    )
+                                                    .await
+                                                    {
+                                                        let _ = tx_sub.send(
+                                                            Response::SubscriptionsLoaded {
+                                                                items: page.items,
+                                                                continuation: page.continuation,
+                                                                append: false,
+                                                            },
+                                                        );
+                                                        wake_sub();
+                                                    }
+                                                });
                                             }
                                         }
                                         login::Outcome::Cancelled => {}
@@ -2195,6 +2385,42 @@ impl Backend {
                                     if !resolved.is_empty() {
                                         let _ = resp_tx
                                             .send(Response::ChannelAvatarsResolved(resolved));
+                                        wake();
+                                    }
+                                });
+                            }
+                            Request::SetPoTokenMode(mode) => {
+                                po_token_mode.store(mode.as_u8(), Ordering::Relaxed);
+                                if mode == PoTokenMode::Off {
+                                    potoken.close_if_running();
+                                }
+                            }
+                            Request::LoadAmbientArt { key, url } => {
+                                tokio::spawn(async move {
+                                    let Ok(resp) = http
+                                        .get(&url)
+                                        .timeout(std::time::Duration::from_secs(10))
+                                        .send()
+                                        .await
+                                    else {
+                                        return;
+                                    };
+                                    let Ok(bytes) = resp.bytes().await else {
+                                        return;
+                                    };
+                                    let ok = tokio::task::spawn_blocking(move || {
+                                        blur_ambient_art(&bytes)
+                                    })
+                                    .await
+                                    .ok()
+                                    .flatten();
+                                    if let Some((width, height, rgba)) = ok {
+                                        let _ = resp_tx.send(Response::AmbientArtReady {
+                                            key,
+                                            width,
+                                            height,
+                                            rgba,
+                                        });
                                         wake();
                                     }
                                 });
@@ -2413,6 +2639,95 @@ fn apply_ytdlp_streams(
     (v_url, a_url, fmt_idx)
 }
 
+async fn mint_po_tokens_if_needed(
+    http: &reqwest::Client,
+    cfg: &WebConfig,
+    session: Option<&Session>,
+    potoken: &PoTokenClient,
+    video_id: &str,
+) -> Option<crate::potoken::PoTokens> {
+    let vd = match cfg.visitor_data.as_deref().filter(|s| !s.is_empty()) {
+        Some(v) => v.to_owned(),
+        None => innertube::fetch_web_config(http, session)
+            .await
+            .visitor_data
+            .unwrap_or_default(),
+    };
+    if vd.is_empty() {
+        log::warn!("potoken: visitor_data unavailable, skipping mint");
+        return None;
+    }
+    match potoken.mint(&vd, video_id).await {
+        Ok(toks) => {
+            log::info!("potoken: minted BotGuard PO tokens for {video_id}");
+            Some(toks)
+        }
+        Err(e) => {
+            log::warn!("potoken: mint failed for {video_id}: {e:#}");
+            None
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_ytdlp_with_potoken(
+    http: &reqwest::Client,
+    data_dir: &Path,
+    video_id: &str,
+    max_height: u32,
+    cfg: &WebConfig,
+    session: Option<&Session>,
+    potoken: &PoTokenClient,
+    po_mode: PoTokenMode,
+    blocked_hint: bool,
+) -> anyhow::Result<ytdlp::YtdlpStreams> {
+    let cookie = session.map(|s| s.cookie.as_str());
+    let eager_pot = match po_mode {
+        PoTokenMode::On => mint_po_tokens_if_needed(http, cfg, session, potoken, video_id).await,
+        PoTokenMode::Auto if blocked_hint => {
+            mint_po_tokens_if_needed(http, cfg, session, potoken, video_id).await
+        }
+        _ => None,
+    };
+
+    let res = ytdlp::resolve_video(
+        http,
+        data_dir,
+        cookie,
+        video_id,
+        max_height,
+        eager_pot.as_ref(),
+    )
+    .await;
+
+    match res {
+        Ok(s) => Ok(s),
+        Err(err) => {
+            let msg = format!("{err:#}");
+            if po_mode == PoTokenMode::Auto
+                && eager_pot.is_none()
+                && ytdlp::needs_potoken_retry(&msg)
+            {
+                if let Some(pot) =
+                    mint_po_tokens_if_needed(http, cfg, session, potoken, video_id).await
+                {
+                    return ytdlp::resolve_video(
+                        http,
+                        data_dir,
+                        cookie,
+                        video_id,
+                        max_height,
+                        Some(&pot),
+                    )
+                    .await;
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn resolve_watch(
     http: &reqwest::Client,
     data_dir: &PathBuf,
@@ -2421,6 +2736,8 @@ async fn resolve_watch(
     cfg: &WebConfig,
     session: Option<&Session>,
     proxy: Option<&StreamProxy>,
+    potoken: &PoTokenClient,
+    po_mode: PoTokenMode,
 ) -> anyhow::Result<Response> {
     let wrap = |url: &str, len: u64| -> String {
         let is_hls = url.contains(".m3u8") || url.contains("/manifest/hls");
@@ -2437,6 +2754,9 @@ async fn resolve_watch(
             // play with synced audio via master HLS manifest and native libmpv `vid` track switching.
             if data.is_live || !had_direct_formats {
                 if let Some(hls) = data.hls_url.clone() {
+                    if po_mode == PoTokenMode::Auto {
+                        potoken.close_if_running();
+                    }
                     let hint_idx = if quality != PreferredQuality::Best4K {
                         pick_format_index(&data.video_formats, quality.max_height())
                     } else {
@@ -2452,6 +2772,9 @@ async fn resolve_watch(
                 }
             }
             if let Some(idx) = pick_format_index(&data.video_formats, quality.max_height()) {
+                if po_mode == PoTokenMode::Auto {
+                    potoken.close_if_running();
+                }
                 let fmt = &data.video_formats[idx];
                 let video_url = wrap(&fmt.url, fmt.content_length);
                 let audio = if fmt.has_audio {
@@ -2470,6 +2793,9 @@ async fn resolve_watch(
                 });
             }
             if let Some(hls) = data.hls_url.clone() {
+                if po_mode == PoTokenMode::Auto {
+                    potoken.close_if_running();
+                }
                 return Ok(Response::WatchReady {
                     selected_video_url: hls,
                     selected_audio_url: None,
@@ -2478,12 +2804,16 @@ async fn resolve_watch(
                     used_ytdlp: false,
                 });
             }
-            let yt = ytdlp::resolve_video(
+            let yt = resolve_ytdlp_with_potoken(
                 http,
                 data_dir,
-                session.map(|s| s.cookie.as_str()),
                 video_id,
                 quality.max_height(),
+                cfg,
+                session,
+                potoken,
+                po_mode,
+                false,
             )
             .await?;
             let (selected_video_url, selected_audio_url, fmt_idx) =
@@ -2497,14 +2827,21 @@ async fn resolve_watch(
             })
         }
         Err(inner_err) => {
-            log::warn!("InnerTube watch failed ({inner_err:#}), falling back to yt-dlp");
+            let inner_msg = format!("{inner_err:#}");
+            let blocked_hint = ytdlp::is_auth_required_error(&inner_msg)
+                || inner_msg.contains("UNPLAYABLE");
+            log::warn!("InnerTube watch failed ({inner_msg}), falling back to yt-dlp");
             let (yt_res, next_opt) = tokio::join!(
-                ytdlp::resolve_video(
+                resolve_ytdlp_with_potoken(
                     http,
                     data_dir,
-                    session.map(|s| s.cookie.as_str()),
                     video_id,
                     quality.max_height(),
+                    cfg,
+                    session,
+                    potoken,
+                    po_mode,
+                    blocked_hint,
                 ),
                 innertube::fetch_next_watch_fallback(http, video_id, cfg, session),
             );
@@ -2538,6 +2875,7 @@ async fn resolve_watch(
                 live_chat_token: None,
                 related: Vec::new(),
                 is_live: false,
+                is_members_only: false,
                 resume_secs: None,
             });
             if let Some(t) = yt.title.as_deref().filter(|s| !s.is_empty()) {
@@ -2581,6 +2919,100 @@ pub fn pick_format_index(formats: &[VideoFormat], max_height: u32) -> Option<usi
         .position(|f| f.height <= max_height && !f.has_audio)
         .or_else(|| formats.iter().position(|f| f.height <= max_height))
         .or_else(|| Some(formats.len() - 1))
+}
+
+fn blur_ambient_art(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    const N: u32 = 64;
+    let img = image::load_from_memory(bytes).ok()?.to_rgb8();
+    let small = image::imageops::resize(&img, N, N, image::imageops::FilterType::Triangle);
+
+    let mut sum = [0.0f32; 3];
+    let mut best = (0.0f32, [120.0f32, 90.0, 210.0]);
+    for p in small.pixels() {
+        let rgb = [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0];
+        sum[0] += rgb[0];
+        sum[1] += rgb[1];
+        sum[2] += rgb[2];
+        let max_c = rgb[0].max(rgb[1]).max(rgb[2]);
+        let min_c = rgb[0].min(rgb[1]).min(rgb[2]);
+        let sat = if max_c > 0.001 {
+            (max_c - min_c) / max_c
+        } else {
+            0.0
+        };
+        let score = sat * max_c * (1.0 - (max_c - 0.65).abs() * 0.4);
+        if score > best.0 {
+            best = (score, [p[0] as f32, p[1] as f32, p[2] as f32]);
+        }
+    }
+    let count = (N * N) as f32;
+    let tint = if best.0 > 0.08 {
+        best.1
+    } else {
+        [
+            (sum[0] / count * 255.0).max(56.0),
+            (sum[1] / count * 255.0).max(56.0),
+            (sum[2] / count * 255.0).max(72.0),
+        ]
+    };
+
+    let mut px: Vec<[f32; 3]> = small
+        .pixels()
+        .map(|p| {
+            let r = p[0] as f32;
+            let g = p[1] as f32;
+            let b = p[2] as f32;
+            let luma = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
+            let dark = (1.0 - (luma / 0.45).clamp(0.0, 1.0)).powi(2);
+            [
+                r + (tint[0] - r) * dark * 0.42,
+                g + (tint[1] - g) * dark * 0.42,
+                b + (tint[2] - b) * dark * 0.42,
+            ]
+        })
+        .collect();
+
+    let n = N as usize;
+    let box_pass = |src: &[[f32; 3]], horizontal: bool| -> Vec<[f32; 3]> {
+        let r = 5isize;
+        let d = (2 * r + 1) as f32;
+        let mut out = vec![[0.0f32; 3]; src.len()];
+        for y in 0..n {
+            for x in 0..n {
+                let mut acc = [0.0f32; 3];
+                for o in -r..=r {
+                    let (sx, sy) = if horizontal {
+                        ((x as isize + o).clamp(0, n as isize - 1) as usize, y)
+                    } else {
+                        (x, (y as isize + o).clamp(0, n as isize - 1) as usize)
+                    };
+                    let p = src[sy * n + sx];
+                    acc[0] += p[0];
+                    acc[1] += p[1];
+                    acc[2] += p[2];
+                }
+                out[y * n + x] = [acc[0] / d, acc[1] / d, acc[2] / d];
+            }
+        }
+        out
+    };
+    for _ in 0..3 {
+        let h = box_pass(&px, true);
+        px = box_pass(&h, false);
+    }
+
+    let rgba: Vec<u8> = px
+        .into_iter()
+        .flat_map(|p| {
+            [
+                p[0].clamp(0.0, 255.0) as u8,
+                p[1].clamp(0.0, 255.0) as u8,
+                p[2].clamp(0.0, 255.0) as u8,
+                255,
+            ]
+        })
+        .collect();
+    Some((N, N, rgba))
 }
 
 #[cfg(test)]

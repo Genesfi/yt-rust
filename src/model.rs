@@ -35,6 +35,12 @@ pub struct VideoItem {
     /// Playlist item instance ID (`playlistVideoRenderer.setVideoId`) for remove/reorder actions.
     #[serde(default)]
     pub playlist_set_video_id: Option<String>,
+    /// True if YouTube marks this upload as "New" or it was recently published.
+    #[serde(default)]
+    pub is_new: bool,
+    /// True if this video/Short is Members-only.
+    #[serde(default)]
+    pub is_members_only: bool,
 }
 
 impl VideoItem {
@@ -350,6 +356,7 @@ pub struct WatchData {
     pub live_chat_token: Option<String>,
     pub related: Vec<VideoItem>,
     pub is_live: bool,
+    pub is_members_only: bool,
     pub resume_secs: Option<f64>,
 }
 
@@ -412,6 +419,115 @@ impl PreferredQuality {
         Self::P720,
         Self::P480,
     ];
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PoTokenMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl PoTokenMode {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::On, Self::Off];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (When blocked)",
+            Self::On => "Always On",
+            Self::Off => "Off",
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Auto => 1,
+            Self::On => 2,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Off,
+            2 => Self::On,
+            _ => Self::Auto,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum WindowMaterial {
+    #[default]
+    None,
+    Acrylic,
+    Mica,
+    MicaAlt,
+}
+
+impl WindowMaterial {
+    pub const ALL: [Self; 4] = [Self::None, Self::Acrylic, Self::Mica, Self::MicaAlt];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "Solid Dark",
+            Self::Acrylic => "Acrylic",
+            Self::Mica => "Mica",
+            Self::MicaAlt => "Mica Alt",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Acrylic => "acrylic",
+            Self::Mica => "mica",
+            Self::MicaAlt => "mica_alt",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|m| m.key() == s.trim())
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AmbientMode {
+    #[default]
+    SoftBlur,
+    TiledBlur,
+    Off,
+}
+
+impl AmbientMode {
+    pub const ALL: [Self; 3] = [Self::SoftBlur, Self::TiledBlur, Self::Off];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::SoftBlur => "Soft Blur",
+            Self::TiledBlur => "Tiled Repeat",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::SoftBlur => "soft",
+            Self::TiledBlur => "tiled",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|m| m.key() == s.trim())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -705,7 +821,7 @@ impl SponsorSegment {
     }
 }
 
-/// Persisted snapshot of the most recent active video for crash-safe / restart resume.
+/// Persisted snapshot of active watch tab(s) for crash-safe / restart resume.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LastWatched {
     pub id: String,
@@ -714,6 +830,10 @@ pub struct LastWatched {
     pub thumbnail_url: String,
     pub position_secs: f64,
     pub duration_secs: f64,
+    #[serde(default)]
+    pub second_tab: Option<Box<LastWatched>>,
+    #[serde(default)]
+    pub active_tab: u8,
 }
 
 #[cfg(test)]

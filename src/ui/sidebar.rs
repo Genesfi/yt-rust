@@ -23,7 +23,7 @@ impl YtApp {
             .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(theme::BG)
+                    .fill(theme::chrome_bg())
                     .inner_margin(Margin::symmetric(8, 6)),
             )
             .show(ui, |ui| {
@@ -102,16 +102,26 @@ impl YtApp {
                             }
                         }
 
-                        if self.watch.is_some()
+                        let has_playing = self.watch.is_some()
+                            || self.bg_player_tab.as_ref().is_some_and(|b| b.watch.is_some());
+                        let playing_lbl = if self.bg_player_tab.is_some() {
+                            "Now Playing (2)"
+                        } else {
+                            "Now Playing"
+                        };
+                        if has_playing
                             && sidebar_item(
                                 ui,
                                 icon::PLAY,
-                                "Now Playing",
+                                playing_lbl,
                                 "Playing",
                                 self.page == Page::Watch,
                                 expand_t,
                             )
                         {
+                            if self.watch.is_none() && self.bg_player_tab.is_some() {
+                                self.switch_player_tab();
+                            }
                             self.page = Page::Watch;
                         }
 

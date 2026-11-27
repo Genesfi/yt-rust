@@ -21,6 +21,8 @@ const CONSENT_COOKIE: &str = "SOCS=CAISAiAD";
 pub struct WebConfig {
     pub client_version: String,
     pub visitor_data: Option<String>,
+    pub gl: String,
+    pub delegated_session_id: Option<String>,
 }
 
 impl Default for WebConfig {
@@ -28,6 +30,8 @@ impl Default for WebConfig {
         Self {
             client_version: FALLBACK_WEB_VERSION.to_owned(),
             visitor_data: None,
+            gl: "US".to_owned(),
+            delegated_session_id: None,
         }
     }
 }
@@ -77,7 +81,7 @@ pub fn extract_video_id(input: &str) -> Option<String> {
     None
 }
 
-/// Scrape live INNERTUBE_CLIENT_VERSION and VISITOR_DATA from www.youtube.com.
+/// Scrape live INNERTUBE_CLIENT_VERSION, VISITOR_DATA, and GL from www.youtube.com.
 pub async fn fetch_web_config(
     http: &reqwest::Client,
     session: Option<&Session>,
@@ -85,11 +89,12 @@ pub async fn fetch_web_config(
     let mut req = http
         .get(ORIGIN)
         .header("User-Agent", WEB_UA)
-        .header("Accept-Language", "en-US,en;q=0.9")
         .timeout(Duration::from_secs(10));
     req = match session {
         Some(s) => s.sign(req, ORIGIN),
-        None => req.header("Cookie", CONSENT_COOKIE),
+        None => req
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Cookie", CONSENT_COOKIE),
     };
     let Ok(resp) = req.send().await else {
         return WebConfig::default();
@@ -101,10 +106,17 @@ pub async fn fetch_web_config(
     let client_version = extract_json_str(&html, "\"INNERTUBE_CLIENT_VERSION\":\"")
         .unwrap_or_else(|| FALLBACK_WEB_VERSION.to_owned());
     let visitor_data = extract_json_str(&html, "\"VISITOR_DATA\":\"");
+    let gl = extract_json_str(&html, "\"GL\":\"")
+        .or_else(|| extract_json_str(&html, "\"gl\":\""))
+        .filter(|g| g.len() == 2)
+        .unwrap_or_else(|| "US".to_owned());
+    let delegated_session_id = extract_json_str(&html, "\"DELEGATED_SESSION_ID\":\"");
 
     WebConfig {
         client_version,
         visitor_data,
+        gl,
+        delegated_session_id,
     }
 }
 
@@ -117,12 +129,17 @@ fn extract_json_str(haystack: &str, needle: &str) -> Option<String> {
 }
 
 fn web_context(cfg: &WebConfig) -> Value {
+    let gl = if cfg.gl.is_empty() { "US" } else { cfg.gl.as_str() };
     let mut client = json!({
         "clientName": "WEB",
         "clientVersion": cfg.client_version,
         "hl": "en",
-        "gl": "US",
+        "gl": gl,
+        "platform": "DESKTOP",
         "userAgent": WEB_UA,
+        "mainAppWebInfo": {
+            "graftUrl": "/",
+        },
     });
     if let Some(vd) = cfg.visitor_data.as_deref().filter(|v| !v.is_empty()) {
         client["visitorData"] = json!(vd);
@@ -143,6 +160,7 @@ async fn post_web(
         .post(url)
         .header("User-Agent", WEB_UA)
         .header("Origin", ORIGIN)
+        .header("X-Origin", ORIGIN)
         .header("Referer", format!("{ORIGIN}/"))
         .header("X-YouTube-Client-Name", "1")
         .header("X-YouTube-Client-Version", &cfg.client_version)
@@ -151,6 +169,13 @@ async fn post_web(
 
     if let Some(s) = session {
         req = s.sign(req, ORIGIN);
+        if let Some(page_id) = cfg
+            .delegated_session_id
+            .as_deref()
+            .filter(|p| !p.is_empty())
+        {
+            req = req.header("X-Goog-PageId", page_id);
+        }
     } else {
         req = req.header("Cookie", CONSENT_COOKIE);
     }
@@ -1556,6 +1581,8 @@ fn collect_videos_with_channel_items(
                                     resume_secs: None,
                                     playlist_browse_id: Some(bid),
                                     playlist_set_video_id: None,
+                                    is_new: false,
+                                    is_members_only: false,
                                 });
                             }
                         }
@@ -1606,6 +1633,8 @@ fn collect_videos_with_channel_items(
                                 resume_secs: None,
                                 playlist_browse_id: Some(bid),
                                 playlist_set_video_id: None,
+                                is_new: false,
+                                is_members_only: false,
                             });
                         }
                     }
@@ -2096,7 +2125,42 @@ fn extract_notification_targets(val: &Value) -> (Option<String>, Option<String>)
                         *cid = Some(id.to_owned());
                     }
                 }
-                for child in map.values() {
+                if vid.is_none() || cid.is_none() {
+                    if let Some(url_path) = map
+                        .get("commandMetadata")
+                        .and_then(|cm| cm.get("webCommandMetadata"))
+                        .and_then(|w| w.get("url"))
+                        .and_then(|s| s.as_str())
+                        .or_else(|| map.get("urlEndpoint").and_then(|u| u.get("url")).and_then(|s| s.as_str()))
+                    {
+                        if vid.is_none() {
+                            let full = if url_path.starts_with('/') {
+                                format!("{ORIGIN}{url_path}")
+                            } else {
+                                url_path.to_owned()
+                            };
+                            if let Some(id) = extract_video_id(&full) {
+                                *vid = Some(id);
+                            }
+                        }
+                        if cid.is_none() {
+                            if let Some(pos) = url_path.find("/channel/UC") {
+                                let rest = &url_path[pos + "/channel/".len()..];
+                                let uc: String = rest
+                                    .chars()
+                                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                                    .collect();
+                                if uc.starts_with("UC") && uc.len() >= 12 {
+                                    *cid = Some(uc);
+                                }
+                            }
+                        }
+                    }
+                }
+                for (k, child) in map {
+                    if k == "menu" || k == "contextualMenu" || k == "recordNotificationInteractionsEndpoint" {
+                        continue;
+                    }
                     if vid.is_some() && cid.is_some() {
                         return;
                     }
@@ -2137,6 +2201,16 @@ pub fn parse_notifications_menu(v: &Value) -> (Vec<NotificationMenuItem>, u32, O
         }
         match val {
             Value::Object(map) => {
+                // Never inspect overflow/contextual menus inside notification items:
+                // those contain Hide / Turn-off-channel `recordNotificationInteractionsEndpoint`
+                // actions rather than a menu-level mark-seen endpoint.
+                if map.contains_key("contextualMenu")
+                    || map.contains_key("menuRenderer")
+                    || map.contains_key("menuServiceItemRenderer")
+                    || map.contains_key("menuNavigationItemRenderer")
+                {
+                    return;
+                }
                 if let Some(req) = map
                     .get("recordNotificationInteractionsEndpoint")
                     .and_then(|e| e.get("serializedInteractionsRequest"))
@@ -2158,6 +2232,44 @@ pub fn parse_notifications_menu(v: &Value) -> (Vec<NotificationMenuItem>, u32, O
         }
     }
 
+    fn section_header_text(v: &Value) -> Option<String> {
+        let hdr = v
+            .get("notificationSectionHeaderRenderer")
+            .or_else(|| v.get("multiPageMenuNotificationSectionHeaderRenderer"))
+            .or_else(|| v.get("header").and_then(|h| h.get("notificationSectionHeaderRenderer")))
+            .or_else(|| {
+                v.get("header")
+                    .and_then(|h| h.get("multiPageMenuNotificationSectionHeaderRenderer"))
+            })
+            .or_else(|| v.get("itemSectionHeaderRenderer"))
+            .or_else(|| v.get("header"));
+        if let Some(h) = hdr {
+            for k in ["headerText", "title", "text", "label"] {
+                if let Some(t) = h.get(k).and_then(text).filter(|s| !s.trim().is_empty()) {
+                    return Some(t);
+                }
+            }
+        }
+        for k in ["headerText", "sectionTitle", "title"] {
+            if let Some(t) = v.get(k).and_then(text).filter(|s| !s.trim().is_empty()) {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    fn build_entity_map(v: &Value) -> HashMap<String, Value> {
+        let mut map = HashMap::new();
+        if let Some(muts) = v["frameworkUpdates"]["entityBatchUpdate"]["mutations"].as_array() {
+            for m in muts {
+                if let (Some(k), Some(p)) = (m["entityKey"].as_str(), m.get("payload")) {
+                    map.insert(k.to_owned(), p.clone());
+                }
+            }
+        }
+        map
+    }
+
     fn push_notification_renderer(
         nr: &serde_json::Map<String, Value>,
         section: Option<&str>,
@@ -2167,6 +2279,15 @@ pub fn parse_notifications_menu(v: &Value) -> (Vec<NotificationMenuItem>, u32, O
         let message = nr
             .get("shortMessage")
             .and_then(text)
+            .or_else(|| nr.get("message").and_then(text))
+            .or_else(|| nr.get("title").and_then(text))
+            .or_else(|| nr.get("headline").and_then(text))
+            .or_else(|| {
+                nr.get("metadata")
+                    .and_then(|m| m.get("contentViewModel"))
+                    .and_then(|c| c.get("text"))
+                    .and_then(text)
+            })
             .or_else(|| {
                 nr.get("accessibility")
                     .and_then(|a| a.get("accessibilityData"))
@@ -2178,23 +2299,52 @@ pub fn parse_notifications_menu(v: &Value) -> (Vec<NotificationMenuItem>, u32, O
         let sent_time_text = nr
             .get("sentTimeText")
             .and_then(text)
+            .or_else(|| nr.get("sentTime").and_then(text))
+            .or_else(|| nr.get("publishedTimeText").and_then(text))
             .unwrap_or_default();
         let channel_avatar_url = nr
             .get("thumbnail")
-            .and_then(|t| t["thumbnails"].as_array())
+            .or_else(|| nr.get("channelThumbnail"))
+            .and_then(|t| {
+                t["thumbnails"]
+                    .as_array()
+                    .or_else(|| t["sources"].as_array())
+            })
             .and_then(|a| a.last().or_else(|| a.first()))
             .and_then(|t| t["url"].as_str())
             .map(normalize_url);
         let video_thumbnail_url = nr
             .get("videoThumbnail")
-            .and_then(|t| t["thumbnails"].as_array())
+            .and_then(|t| {
+                t["thumbnails"]
+                    .as_array()
+                    .or_else(|| t["sources"].as_array())
+            })
             .and_then(|a| a.last().or_else(|| a.first()))
             .and_then(|t| t["url"].as_str())
             .map(normalize_url);
-        let nav = nr.get("navigationEndpoint").unwrap_or(&Value::Null);
-        let (video_id, channel_id) = extract_notification_targets(nav);
-        let read = nr.get("read").and_then(|b| b.as_bool()).unwrap_or(true);
-        if !message.is_empty() && (video_id.is_some() || channel_id.is_some()) {
+        let nav = nr
+            .get("navigationEndpoint")
+            .or_else(|| nr.get("onTap"))
+            .or_else(|| nr.get("command"))
+            .or_else(|| nr.get("serviceEndpoint"));
+        let (mut video_id, mut channel_id) = nav
+            .map(extract_notification_targets)
+            .unwrap_or((None, None));
+        if video_id.is_none() && channel_id.is_none() {
+            let nr_val = Value::Object(nr.clone());
+            (video_id, channel_id) = extract_notification_targets(&nr_val);
+        }
+        let read = nr
+            .get("read")
+            .and_then(|b| b.as_bool())
+            .or_else(|| {
+                nr.get("readState")
+                    .and_then(|s| s.as_str())
+                    .map(|s| !s.contains("UNREAD"))
+            })
+            .unwrap_or(true);
+        if !message.is_empty() {
             let dedup_key = nr
                 .get("notificationId")
                 .and_then(|s| s.as_str())
@@ -2222,9 +2372,95 @@ pub fn parse_notifications_menu(v: &Value) -> (Vec<NotificationMenuItem>, u32, O
         }
     }
 
+    fn push_notification_view_model(
+        vm: &Value,
+        section: Option<&str>,
+        entities: &HashMap<String, Value>,
+        items: &mut Vec<NotificationMenuItem>,
+        seen_keys: &mut HashSet<String>,
+    ) {
+        let mut entity_payload: Option<&Value> = None;
+        for ek in ["entityKey", "notificationKey", "key"] {
+            if let Some(k) = vm[ek].as_str() {
+                if let Some(p) = entities.get(k) {
+                    entity_payload = Some(p);
+                    break;
+                }
+            }
+        }
+        let message = text(&vm["shortMessage"])
+            .or_else(|| text(&vm["title"]))
+            .or_else(|| text(&vm["message"]))
+            .or_else(|| text(&vm["headline"]))
+            .or_else(|| text(&vm["metadata"]["contentViewModel"]["text"]))
+            .or_else(|| text(&vm["metadata"]["contentText"]))
+            .or_else(|| {
+                vm["accessibilityText"]
+                    .as_str()
+                    .or_else(|| vm["accessibility"]["accessibilityData"]["label"].as_str())
+                    .or_else(|| vm["rendererContext"]["accessibilityContext"]["label"].as_str())
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                entity_payload.and_then(|p| {
+                    text(&p["shortMessage"])
+                        .or_else(|| text(&p["title"]))
+                        .or_else(|| text(&p["message"]))
+                })
+            })
+            .unwrap_or_default();
+        if message.is_empty() {
+            return;
+        }
+        let sent_time_text = text(&vm["sentTimeText"])
+            .or_else(|| text(&vm["sentTime"]))
+            .or_else(|| text(&vm["publishedTimeText"]))
+            .or_else(|| text(&vm["subtitle"]))
+            .unwrap_or_default();
+        let channel_avatar_url = find_first_thumb_url(&vm["channelAvatar"])
+            .or_else(|| find_first_thumb_url(&vm["leadingImage"]))
+            .or_else(|| find_first_thumb_url(&vm["thumbnail"]));
+        let video_thumbnail_url = find_first_thumb_url(&vm["videoThumbnail"])
+            .or_else(|| find_first_thumb_url(&vm["trailingImage"]));
+        let (video_id, channel_id) = extract_notification_targets(vm);
+        let read = vm["read"]
+            .as_bool()
+            .or_else(|| {
+                vm["readState"]
+                    .as_str()
+                    .map(|s| !s.contains("UNREAD"))
+            })
+            .unwrap_or(true);
+        let dedup_key = vm["notificationId"]
+            .as_str()
+            .or_else(|| vm["entityKey"].as_str())
+            .map(|id| format!("id:{id}"))
+            .unwrap_or_else(|| {
+                format!(
+                    "{}:{}:{}",
+                    video_id.as_deref().unwrap_or(""),
+                    channel_id.as_deref().unwrap_or(""),
+                    message
+                )
+            });
+        if seen_keys.insert(dedup_key) {
+            items.push(NotificationMenuItem {
+                message,
+                sent_time_text,
+                section: section.map(str::to_owned),
+                channel_avatar_url,
+                video_thumbnail_url,
+                video_id,
+                channel_id,
+                read,
+            });
+        }
+    }
+
     fn walk_notifications(
         val: &Value,
         current_section: Option<&str>,
+        entities: &HashMap<String, Value>,
         items: &mut Vec<NotificationMenuItem>,
         unseen_hint: &mut Option<u32>,
         seen_keys: &mut HashSet<String>,
@@ -2240,22 +2476,57 @@ pub fn parse_notifications_menu(v: &Value) -> (Vec<NotificationMenuItem>, u32, O
                 }
                 if let Some(sec) = map
                     .get("multiPageMenuNotificationSectionRenderer")
+                    .or_else(|| map.get("multiPageMenuSectionRenderer"))
                     .and_then(|x| x.as_object())
                 {
-                    let sec_title = sec
-                        .get("notificationSectionHeaderRenderer")
-                        .and_then(|h| h.get("title").or_else(|| h.get("text")))
-                        .and_then(text)
-                        .or_else(|| sec.get("sectionTitle").and_then(text))
-                        .filter(|s| !s.trim().is_empty());
-                    let next_sec = sec_title.as_deref().or(current_section);
-                    if let Some(arr) = sec.get("items").and_then(|x| x.as_array()) {
-                        for entry in arr {
-                            walk_notifications(entry, next_sec, items, unseen_hint, seen_keys);
+                    let sec_val = Value::Object(sec.clone());
+                    let sec_title = section_header_text(&sec_val);
+                    let mut active_sec: Option<String> =
+                        sec_title.or_else(|| current_section.map(str::to_owned));
+                    for list_key in ["items", "contents"] {
+                        if let Some(arr) = sec.get(list_key).and_then(|x| x.as_array()) {
+                            for entry in arr {
+                                if let Some(hdr) = section_header_text(entry) {
+                                    if entry.get("notificationSectionHeaderRenderer").is_some()
+                                        || entry
+                                            .get("multiPageMenuNotificationSectionHeaderRenderer")
+                                            .is_some()
+                                        || entry.get("itemSectionHeaderRenderer").is_some()
+                                    {
+                                        active_sec = Some(hdr);
+                                        continue;
+                                    }
+                                }
+                                walk_notifications(
+                                    entry,
+                                    active_sec.as_deref(),
+                                    entities,
+                                    items,
+                                    unseen_hint,
+                                    seen_keys,
+                                );
+                            }
                         }
                     }
                     if let Some(cont) = sec.get("continuation") {
-                        walk_notifications(cont, next_sec, items, unseen_hint, seen_keys);
+                        walk_notifications(
+                            cont,
+                            active_sec.as_deref(),
+                            entities,
+                            items,
+                            unseen_hint,
+                            seen_keys,
+                        );
+                    }
+                    if let Some(conts) = sec.get("continuations") {
+                        walk_notifications(
+                            conts,
+                            active_sec.as_deref(),
+                            entities,
+                            items,
+                            unseen_hint,
+                            seen_keys,
+                        );
                     }
                     return;
                 }
@@ -2263,23 +2534,74 @@ pub fn parse_notifications_menu(v: &Value) -> (Vec<NotificationMenuItem>, u32, O
                     push_notification_renderer(nr, current_section, items, seen_keys);
                     return;
                 }
+                if let Some(nvm) = map.get("notificationViewModel") {
+                    push_notification_view_model(nvm, current_section, entities, items, seen_keys);
+                    return;
+                }
                 for child in map.values() {
-                    walk_notifications(child, current_section, items, unseen_hint, seen_keys);
+                    walk_notifications(
+                        child,
+                        current_section,
+                        entities,
+                        items,
+                        unseen_hint,
+                        seen_keys,
+                    );
                 }
             }
             Value::Array(arr) => {
                 for child in arr {
-                    walk_notifications(child, current_section, items, unseen_hint, seen_keys);
+                    walk_notifications(
+                        child,
+                        current_section,
+                        entities,
+                        items,
+                        unseen_hint,
+                        seen_keys,
+                    );
                 }
             }
             _ => {}
         }
     }
 
-    walk_notifications(v, None, &mut items, &mut unseen_hint, &mut seen_keys);
+    let entities = build_entity_map(v);
+    walk_notifications(v, None, &entities, &mut items, &mut unseen_hint, &mut seen_keys);
     extract_seen_params(v, &mut seen_params);
     let unread_fallback = items.iter().filter(|n| !n.read).count() as u32;
     (items, unseen_hint.unwrap_or(unread_fallback), seen_params)
+}
+
+fn find_notification_continuation(v: &Value) -> Option<String> {
+    match v {
+        Value::Object(map) => {
+            if let Some(tok) = map
+                .get("nextContinuationData")
+                .or_else(|| map.get("reloadContinuationData"))
+                .and_then(|c| c.get("continuation"))
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                return Some(tok.to_owned());
+            }
+            if let Some(tok) = map
+                .get("continuationCommand")
+                .and_then(|c| c.get("token"))
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                return Some(tok.to_owned());
+            }
+            for child in map.values() {
+                if let Some(tok) = find_notification_continuation(child) {
+                    return Some(tok);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => arr.iter().find_map(find_notification_continuation),
+        _ => None,
+    }
 }
 
 pub async fn fetch_notifications_menu(
@@ -2295,7 +2617,325 @@ pub async fn fetch_notifications_menu(
         Some(session),
     )
     .await?;
-    Ok(parse_notifications_menu(&v))
+    let (mut items, unseen, mut seen_params) = parse_notifications_menu(&v);
+    if items.len() < 8 {
+        if let Some(tok) = find_notification_continuation(&v) {
+            if let Ok(v2) = post_web(
+                http,
+                "notification/get_notification_menu",
+                json!({
+                    "notificationsMenuRequestType": "NOTIFICATIONS_MENU_REQUEST_TYPE_INBOX",
+                    "ctoken": tok,
+                }),
+                cfg,
+                Some(session),
+            )
+            .await
+            {
+                let (more, _, sp2) = parse_notifications_menu(&v2);
+                items.extend(more);
+                if seen_params.is_none() {
+                    seen_params = sp2;
+                }
+            }
+        }
+    }
+    Ok((items, unseen, seen_params))
+}
+
+/// Approximate age in minutes parsed from YouTube relative publish text (English & Indonesian).
+pub fn publish_age_minutes(published: &str) -> Option<u64> {
+    let low = published.trim().to_ascii_lowercase();
+    if low.is_empty() {
+        return None;
+    }
+    if low.contains("just now") || low.contains("baru saja") || low.contains("sedang") {
+        return Some(0);
+    }
+    if low.contains("today") || low.contains("hari ini") {
+        return Some(60);
+    }
+    if low.contains("yesterday") || low.contains("kemarin") {
+        return Some(24 * 60);
+    }
+    let tokens: Vec<&str> = low.split_whitespace().collect();
+    for (i, tok) in tokens.iter().enumerate() {
+        let num = tok
+            .trim_matches(|c: char| !c.is_ascii_digit())
+            .parse::<u64>()
+            .ok();
+        let Some(n) = num else {
+            continue;
+        };
+        let unit = tokens.get(i + 1).copied().unwrap_or("");
+        if unit.starts_with("second") || unit.starts_with("sec") || unit.starts_with("detik") {
+            return Some(0);
+        }
+        if unit.starts_with("minute") || unit.starts_with("min") || unit.starts_with("menit") {
+            return Some(n.max(1));
+        }
+        if unit.starts_with("hour") || unit.starts_with("hr") || unit.starts_with("jam") {
+            return Some(n * 60);
+        }
+        if unit.starts_with("day") || unit.starts_with("hari") {
+            return Some(n * 24 * 60);
+        }
+        if unit.starts_with("week") || unit.starts_with("minggu") {
+            return Some(n * 7 * 24 * 60);
+        }
+        if unit.starts_with("month") || unit.starts_with("bulan") {
+            return Some(n * 30 * 24 * 60);
+        }
+        if unit.starts_with("year") || unit.starts_with("tahun") {
+            return Some(n * 365 * 24 * 60);
+        }
+    }
+    None
+}
+
+fn seeded_shuffle<T>(slice: &mut [T], seed: u64) {
+    if slice.len() <= 1 {
+        return;
+    }
+    let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
+    if state == 0 {
+        state = 0x517c_c1b7_2722_0a95;
+    }
+    for i in (1..slice.len()).rev() {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let j = ((state >> 33) as usize) % (i + 1);
+        slice.swap(i, j);
+    }
+}
+
+/// Build live + recent upload notifications from the user's subscribed channels when
+/// InnerTube's notification menu returns empty.
+pub fn build_subscription_notifications(
+    sub_items: &[VideoItem],
+    guide_channels: &[SidebarChannel],
+    home_items: &[VideoItem],
+    avatar_map: &HashMap<String, String>,
+    seed: u64,
+) -> (Vec<NotificationMenuItem>, u32) {
+    let mut sub_channel_ids: HashSet<&str> = HashSet::new();
+    let mut sub_channel_names: HashSet<String> = HashSet::new();
+    let mut guide_avatars: HashMap<&str, &str> = HashMap::new();
+
+    for ch in guide_channels {
+        if !ch.browse_id.is_empty() {
+            sub_channel_ids.insert(ch.browse_id.as_str());
+            if let Some(av) = ch.avatar_url.as_deref().filter(|u| !u.is_empty()) {
+                guide_avatars.insert(ch.browse_id.as_str(), av);
+            }
+        }
+        let low = ch.name.trim().to_ascii_lowercase();
+        if !low.is_empty() {
+            sub_channel_names.insert(low);
+        }
+    }
+    for it in sub_items {
+        if let Some(cid) = it.channel_id.as_deref().filter(|s| !s.is_empty()) {
+            sub_channel_ids.insert(cid);
+        }
+        let low = it.channel.trim().to_ascii_lowercase();
+        if !low.is_empty() && low != "unknown" {
+            sub_channel_names.insert(low);
+        }
+    }
+
+    let mut seen_video_ids: HashSet<&str> = HashSet::new();
+    let mut candidates: Vec<&VideoItem> = Vec::new();
+    for it in sub_items {
+        if it.playlist_browse_id.is_none() && seen_video_ids.insert(it.id.as_str()) {
+            candidates.push(it);
+        }
+    }
+    for it in home_items {
+        if it.playlist_browse_id.is_some() {
+            continue;
+        }
+        let is_sub = it
+            .channel_id
+            .as_deref()
+            .is_some_and(|cid| sub_channel_ids.contains(cid))
+            || sub_channel_names.contains(&it.channel.trim().to_ascii_lowercase());
+        if is_sub && seen_video_ids.insert(it.id.as_str()) {
+            candidates.push(it);
+        }
+    }
+
+    let mut live_tier: Vec<(&VideoItem, Option<u64>)> = Vec::new();
+    let mut recent_tier: Vec<(&VideoItem, Option<u64>)> = Vec::new();
+    let mut older_tier: Vec<(&VideoItem, Option<u64>)> = Vec::new();
+
+    for it in candidates {
+        let age_mins = publish_age_minutes(&it.published_text);
+        if it.is_live {
+            live_tier.push((it, age_mins));
+        } else if it.is_new || age_mins.is_some_and(|m| m <= 48 * 60) {
+            recent_tier.push((it, age_mins));
+        } else {
+            older_tier.push((it, age_mins));
+        }
+    }
+
+    // Add randomized variety within each recency tier on refresh while keeping
+    // fresh uploads (< 48h) and live streams clearly prioritized.
+    seeded_shuffle(&mut live_tier, seed);
+    seeded_shuffle(&mut recent_tier, seed.wrapping_add(1));
+    // Bias recent uploads toward fresher times cleanly while preserving variety across refreshes.
+    recent_tier.sort_by_key(|(_, age)| match age {
+        Some(m) if *m <= 6 * 60 => 0_u8,
+        Some(m) if *m <= 24 * 60 => 1_u8,
+        _ => 2_u8,
+    });
+    seeded_shuffle(&mut older_tier, seed.wrapping_add(2));
+
+    let max_items = 16usize;
+    let mut per_channel_counts: HashMap<String, usize> = HashMap::new();
+    let mut picked_video_ids: HashSet<&str> = HashSet::new();
+    let mut picked: Vec<(&VideoItem, Option<u64>, bool)> = Vec::new();
+
+    fn push_diverse<'a>(
+        tier: &[(&'a VideoItem, Option<u64>)],
+        is_important: bool,
+        max_per_ch: usize,
+        max_items: usize,
+        per_channel_counts: &mut HashMap<String, usize>,
+        picked_video_ids: &mut HashSet<&'a str>,
+        picked: &mut Vec<(&'a VideoItem, Option<u64>, bool)>,
+    ) {
+        for &(it, age) in tier {
+            if picked.len() >= max_items {
+                break;
+            }
+            if picked_video_ids.contains(it.id.as_str()) {
+                continue;
+            }
+            let ch_key = it
+                .channel_id
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| it.channel.trim().to_ascii_lowercase());
+            let count = per_channel_counts.get(&ch_key).copied().unwrap_or(0);
+            if count < max_per_ch {
+                per_channel_counts.insert(ch_key, count + 1);
+                picked_video_ids.insert(it.id.as_str());
+                picked.push((it, age, is_important));
+            }
+        }
+    }
+
+    push_diverse(
+        &live_tier,
+        true,
+        2,
+        max_items,
+        &mut per_channel_counts,
+        &mut picked_video_ids,
+        &mut picked,
+    );
+    push_diverse(
+        &recent_tier,
+        true,
+        1,
+        max_items,
+        &mut per_channel_counts,
+        &mut picked_video_ids,
+        &mut picked,
+    );
+    push_diverse(
+        &recent_tier,
+        true,
+        2,
+        max_items,
+        &mut per_channel_counts,
+        &mut picked_video_ids,
+        &mut picked,
+    );
+    push_diverse(
+        &older_tier,
+        false,
+        1,
+        max_items,
+        &mut per_channel_counts,
+        &mut picked_video_ids,
+        &mut picked,
+    );
+    push_diverse(
+        &older_tier,
+        false,
+        2,
+        max_items,
+        &mut per_channel_counts,
+        &mut picked_video_ids,
+        &mut picked,
+    );
+
+    let mut out = Vec::with_capacity(picked.len());
+    let mut unseen = 0_u32;
+    for (it, age_mins, is_important) in picked {
+        let ch_name = if it.channel.trim().is_empty() {
+            "Subscribed channel"
+        } else {
+            it.channel.trim()
+        };
+        let message = if it.is_live {
+            format!("🔴 {ch_name} is live: {}", it.title)
+        } else if it.is_members_only {
+            format!("New members-only video: {ch_name}: {}", it.title)
+        } else if it.is_short() {
+            format!("{ch_name} uploaded a Short: {}", it.title)
+        } else {
+            format!("{ch_name} uploaded: {}", it.title)
+        };
+        let sent_time_text = if it.is_live {
+            if !it.views_text.trim().is_empty() {
+                format!("Live now · {}", it.views_text.trim())
+            } else {
+                "Live now".to_owned()
+            }
+        } else if !it.published_text.trim().is_empty() {
+            it.published_text.trim().to_owned()
+        } else if it.is_new {
+            "New upload".to_owned()
+        } else {
+            String::new()
+        };
+        let channel_avatar_url = it
+            .channel_avatar_url
+            .clone()
+            .or_else(|| {
+                it.channel_id
+                    .as_deref()
+                    .and_then(|cid| guide_avatars.get(cid).copied().map(str::to_owned))
+            })
+            .or_else(|| {
+                it.channel_id
+                    .as_deref()
+                    .and_then(|cid| avatar_map.get(cid).cloned())
+            });
+        let video_thumbnail_url = (!it.thumbnail_url.is_empty()).then(|| it.thumbnail_url.clone());
+        let read = !it.is_live && !it.is_new && age_mins.is_none_or(|m| m > 48 * 60);
+        if !read {
+            unseen += 1;
+        }
+        out.push(NotificationMenuItem {
+            message,
+            sent_time_text,
+            section: Some(if is_important {
+                "Important".to_owned()
+            } else {
+                "Other notifications".to_owned()
+            }),
+            channel_avatar_url,
+            video_thumbnail_url,
+            video_id: Some(it.id.clone()),
+            channel_id: it.channel_id.clone(),
+            read,
+        });
+    }
+    (out, unseen)
 }
 
 pub async fn fetch_unseen_notification_count(
@@ -2919,6 +3559,7 @@ pub async fn fetch_next_watch_fallback(
         comments_token,
         live_chat_token,
         related,
+        is_members_only,
     ) = parse_next_metadata(&next, video_id);
     let resume_secs = as_secs_f64(&next["currentVideoEndpoint"]["watchEndpoint"]["startTimeSeconds"])
         .filter(|&s| s > 2.0);
@@ -2951,6 +3592,7 @@ pub async fn fetch_next_watch_fallback(
         live_chat_token,
         related,
         is_live: is_next_live(&next),
+        is_members_only,
         resume_secs,
     })
 }
@@ -3015,6 +3657,7 @@ pub async fn watch(
         comments_token,
         live_chat_token,
         related,
+        is_members_only,
     ) = if let Some(ref n) = next {
         parse_next_metadata(n, video_id)
     } else {
@@ -3034,6 +3677,7 @@ pub async fn watch(
             None,
             None,
             Vec::new(),
+            false,
         )
     };
 
@@ -3156,6 +3800,7 @@ pub async fn watch(
         live_chat_token,
         related,
         is_live,
+        is_members_only,
         resume_secs,
     })
 }
@@ -3904,6 +4549,7 @@ fn parse_next_metadata(
     Option<String>,
     Option<String>,
     Vec<VideoItem>,
+    bool,
 ) {
     let contents = &next["contents"]["twoColumnWatchNextResults"]["results"]["results"]["contents"];
     let mut views_text = String::new();
@@ -3916,11 +4562,15 @@ fn parse_next_metadata(
     let mut subscribers_text = String::new();
     let mut avatar_url = None;
     let mut comments_token = None;
+    let mut is_members_only = false;
 
     if let Some(arr) = contents.as_array() {
         for item in arr {
             let p = &item["videoPrimaryInfoRenderer"];
             if p.is_object() {
+                if !is_members_only {
+                    is_members_only = detect_video_badges(&p["badges"]).1;
+                }
                 if let Some(v) = text(&p["viewCount"]["videoViewCountRenderer"]["shortViewCountText"])
                     .or_else(|| text(&p["viewCount"]["videoViewCountRenderer"]["viewCount"]))
                 {
@@ -4111,6 +4761,7 @@ fn parse_next_metadata(
         comments_token,
         live_chat_token,
         related,
+        is_members_only,
     )
 }
 
@@ -4148,8 +4799,14 @@ fn pick_thumb(v: &Value, video_id: &str) -> String {
         if let Some(best) = arr
             .iter()
             .filter_map(|t| Some((t["width"].as_u64().unwrap_or(0), t["url"].as_str()?)))
-            .filter(|(w, _)| *w >= 320)
+            .filter(|(w, _)| *w >= 480)
             .min_by_key(|(w, _)| *w)
+            .or_else(|| {
+                arr.iter()
+                    .filter_map(|t| Some((t["width"].as_u64().unwrap_or(0), t["url"].as_str()?)))
+                    .filter(|(w, _)| *w >= 320)
+                    .min_by_key(|(w, _)| *w)
+            })
             .or_else(|| {
                 arr.iter()
                     .filter_map(|t| Some((t["width"].as_u64().unwrap_or(0), t["url"].as_str()?)))
@@ -4159,7 +4816,51 @@ fn pick_thumb(v: &Value, video_id: &str) -> String {
             return normalize_url(best.1);
         }
     }
-    format!("https://i.ytimg.com/vi/{video_id}/mqdefault.jpg")
+    format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
+}
+
+/// Pick highest-resolution thumbnail for vertical Shorts cards, searching `sources`/`thumbnails` arrays.
+fn pick_short_thumb(root: &Value, video_id: &str) -> String {
+    fn collect_sources<'a>(v: &'a Value, out: &mut Vec<(u64, &'a str)>, depth: u8) {
+        if depth > 6 {
+            return;
+        }
+        match v {
+            Value::Object(map) => {
+                for key in ["sources", "thumbnails"] {
+                    if let Some(arr) = map.get(key).and_then(Value::as_array) {
+                        for t in arr {
+                            if let Some(u) = t.get("url").and_then(Value::as_str) {
+                                if !u.is_empty() {
+                                    let w = t.get("width").and_then(Value::as_u64).unwrap_or(0);
+                                    let h = t.get("height").and_then(Value::as_u64).unwrap_or(0);
+                                    out.push((w.max(1) * h.max(1), u));
+                                }
+                            }
+                        }
+                    }
+                }
+                for (k, child) in map {
+                    if k.contains("avatar") || k.contains("Avatar") || k.contains("channel") {
+                        continue;
+                    }
+                    collect_sources(child, out, depth + 1);
+                }
+            }
+            Value::Array(arr) => {
+                for child in arr {
+                    collect_sources(child, out, depth + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut candidates = Vec::new();
+    collect_sources(root, &mut candidates, 0);
+    if let Some((_, url)) = candidates.into_iter().max_by_key(|(area, _)| *area) {
+        return normalize_url(url);
+    }
+    format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
 }
 
 fn extract_chip_continuation(cr: &Value) -> Option<String> {
@@ -4251,13 +4952,113 @@ fn collect_chips(v: &Value) -> Vec<FeedChip> {
     out
 }
 
+fn is_recent_publish_text(published: &str) -> bool {
+    publish_age_minutes(published).is_some_and(|m| m <= 2 * 24 * 60)
+}
+
+fn detect_video_badges(v: &Value) -> (bool, bool) {
+    let mut is_new = false;
+    let mut is_members = false;
+    fn walk(v: &Value, is_new: &mut bool, is_members: &mut bool) {
+        match v {
+            Value::Object(map) => {
+                if let Some(style) = map.get("style").and_then(Value::as_str) {
+                    if style.contains("MEMBERS_ONLY") {
+                        *is_members = true;
+                    }
+                }
+                if let Some(style) = map.get("badgeStyle").and_then(Value::as_str) {
+                    if style.contains("MEMBERS") {
+                        *is_members = true;
+                    }
+                }
+                if let Some(ico) = map.get("iconType").and_then(Value::as_str) {
+                    if ico.contains("SPONSORSHIP") || ico.contains("MEMBERS_ONLY") {
+                        *is_members = true;
+                    }
+                }
+                for key in ["label", "text", "content", "accessibilityLabel", "accessibilityText"] {
+                    if let Some(s) = map.get(key).and_then(Value::as_str) {
+                        let low = s.trim().to_ascii_lowercase();
+                        if low == "new" || low == "baru" {
+                            *is_new = true;
+                        } else if low.contains("members only")
+                            || low.contains("members-only")
+                            || low.contains("member-only")
+                            || low.contains("khusus pelanggan")
+                            || low.contains("khusus member")
+                            || low.contains("khusus anggota")
+                        {
+                            *is_members = true;
+                        }
+                    }
+                }
+                for (k, child) in map {
+                    if k == "navigationEndpoint" || k == "onTap" || k == "menu" {
+                        continue;
+                    }
+                    walk(child, is_new, is_members);
+                }
+            }
+            Value::Array(arr) => {
+                for child in arr {
+                    walk(child, is_new, is_members);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(v, &mut is_new, &mut is_members);
+    (is_new, is_members)
+}
+
+fn has_shorts_indicator(v: &Value) -> bool {
+    match v {
+        Value::Object(map) => {
+            if map.contains_key("reelWatchEndpoint") {
+                return true;
+            }
+            if let Some(t) = map.get("thumbnailOverlayTimeStatusRenderer") {
+                if t["style"].as_str() == Some("SHORTS") {
+                    return true;
+                }
+            }
+            if let Some(u) = map.get("url").and_then(Value::as_str) {
+                if u.starts_with("/shorts/") {
+                    return true;
+                }
+            }
+            if let Some(b) = map.get("thumbnailBadgeViewModel") {
+                if b["badgeStyle"].as_str().is_some_and(|s| s.contains("SHORTS"))
+                    || b["text"].as_str().is_some_and(|s| s.eq_ignore_ascii_case("SHORTS"))
+                {
+                    return true;
+                }
+            }
+            map.values().any(has_shorts_indicator)
+        }
+        Value::Array(arr) => arr.iter().any(has_shorts_indicator),
+        _ => false,
+    }
+}
+
+fn is_ad_container(map: &serde_json::Map<String, Value>) -> bool {
+    map.contains_key("adSlotRenderer")
+        || map.contains_key("displayAdRenderer")
+        || map.contains_key("promotedSparklesWebRenderer")
+        || map.contains_key("promotedSparklesTextSearchRenderer")
+        || map.contains_key("searchPyvRenderer")
+        || map.contains_key("brandVideoSingletonRenderer")
+}
+
 fn parse_shorts_entry(
     map: &serde_json::Map<String, Value>,
     default_channel: &str,
     default_channel_id: Option<&str>,
 ) -> Option<VideoItem> {
     if let Some(sl) = map.get("shortsLockupViewModel") {
-        let vid = sl["onTap"]["innertubeCommand"]["reelWatchEndpoint"]["videoId"]
+        let ep = &sl["onTap"]["innertubeCommand"]["reelWatchEndpoint"];
+        let vid = ep["videoId"]
             .as_str()
             .or_else(|| {
                 sl["entityId"]
@@ -4276,17 +5077,25 @@ fn parse_shorts_entry(
             .as_str()
             .unwrap_or("")
             .to_owned();
-        let thumb = sl["thumbnail"]["sources"]
-            .as_array()
-            .and_then(|a| a.last())
-            .and_then(|s| s["url"].as_str())
-            .map(normalize_url)
-            .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{vid}/mqdefault.jpg"));
+        let header_r = &ep["overlay"]["reelPlayerOverlayRenderer"]["reelPlayerHeaderSupportedRenderers"]
+            ["reelPlayerHeaderRenderer"];
+        let channel = text(&header_r["channelTitleText"])
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| default_channel.to_owned());
+        let channel_id = header_r["channelNavigationEndpoint"]["browseEndpoint"]["browseId"]
+            .as_str()
+            .filter(|s| s.starts_with("UC"))
+            .map(str::to_owned)
+            .or_else(|| find_first_uc_browse_id(sl))
+            .or_else(|| default_channel_id.map(str::to_owned));
+        let (badge_new, is_members_only) = detect_video_badges(sl);
+        let is_new = badge_new || is_recent_publish_text(&views);
+        let thumb = pick_short_thumb(sl, vid);
         return Some(VideoItem {
             id: vid.to_owned(),
             title,
-            channel: default_channel.to_owned(),
-            channel_id: default_channel_id.map(str::to_owned),
+            channel,
+            channel_id,
             channel_avatar_url: None,
             views_text: views,
             published_text: String::new(),
@@ -4297,6 +5106,8 @@ fn parse_shorts_entry(
             resume_secs: None,
             playlist_browse_id: None,
             playlist_set_video_id: None,
+            is_new,
+            is_members_only,
         });
     }
     if let Some(ri) = map.get("reelItemRenderer") {
@@ -4314,12 +5125,21 @@ fn parse_shorts_entry(
             })
             .unwrap_or_else(|| "Short".to_owned());
         let views = text(&ri["viewCountText"]).unwrap_or_default();
-        let thumb = pick_thumb(&ri["thumbnail"]["thumbnails"], vid);
+        let channel = text(&ri["shortBylineText"])
+            .or_else(|| text(&ri["longBylineText"]))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| default_channel.to_owned());
+        let channel_id = find_first_uc_browse_id(&ri["shortBylineText"])
+            .or_else(|| find_first_uc_browse_id(&ri["longBylineText"]))
+            .or_else(|| default_channel_id.map(str::to_owned));
+        let (badge_new, is_members_only) = detect_video_badges(ri);
+        let is_new = badge_new || is_recent_publish_text(&views);
+        let thumb = pick_short_thumb(ri, vid);
         return Some(VideoItem {
             id: vid.to_owned(),
             title,
-            channel: default_channel.to_owned(),
-            channel_id: default_channel_id.map(str::to_owned),
+            channel,
+            channel_id,
             channel_avatar_url: None,
             views_text: views,
             published_text: String::new(),
@@ -4330,6 +5150,8 @@ fn parse_shorts_entry(
             resume_secs: None,
             playlist_browse_id: None,
             playlist_set_video_id: None,
+            is_new,
+            is_members_only,
         });
     }
     None
@@ -4342,11 +5164,21 @@ pub async fn shorts_feed(
 ) -> anyhow::Result<Vec<VideoItem>> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    // 1. Grab Shorts shelves from authenticated Home feed first when signed in
-    if session.is_some() {
-        if let Ok(home) = home_feed(http, None, None, cfg, session).await {
+    // 1. Prioritize Shorts from Subscriptions first when signed in
+    if let Some(sess) = session {
+        if let Ok(subs) = subscriptions_feed(http, None, cfg, sess).await {
+            for mut it in subs.items {
+                if it.is_short() && seen.insert(it.id.clone()) {
+                    if is_recent_publish_text(&it.published_text) {
+                        it.is_new = true;
+                    }
+                    out.push(it);
+                }
+            }
+        }
+        if let Ok(home) = home_feed(http, None, None, cfg, Some(sess)).await {
             for it in home.items {
-                if it.duration_text == "Short" && seen.insert(it.id.clone()) {
+                if it.is_short() && seen.insert(it.id.clone()) {
                     out.push(it);
                 }
             }
@@ -4408,15 +5240,20 @@ pub async fn fetch_shorts_sequence(
                 continue;
             }
             let thumb = pick_thumb(&ep["thumbnail"]["thumbnails"], vid);
-            let title = text(&ep["overlay"]["reelPlayerOverlayRenderer"]["reelPlayerHeaderSupportedRenderers"]["reelPlayerHeaderRenderer"]["reelTitleText"])
+            let hdr = &ep["overlay"]["reelPlayerOverlayRenderer"]["reelPlayerHeaderSupportedRenderers"]["reelPlayerHeaderRenderer"];
+            let title = text(&hdr["reelTitleText"])
                 .unwrap_or_else(|| format!("Short {vid}"));
-            let channel = text(&ep["overlay"]["reelPlayerOverlayRenderer"]["reelPlayerHeaderSupportedRenderers"]["reelPlayerHeaderRenderer"]["channelTitleText"])
+            let channel = text(&hdr["channelTitleText"])
                 .unwrap_or_default();
+            let channel_id = hdr["channelNavigationEndpoint"]["browseEndpoint"]["browseId"]
+                .as_str()
+                .filter(|s| s.starts_with("UC"))
+                .map(str::to_owned);
             out.push(VideoItem {
                 id: vid.to_owned(),
                 title,
                 channel,
-                channel_id: None,
+                channel_id,
                 channel_avatar_url: None,
                 views_text: String::new(),
                 published_text: String::new(),
@@ -4427,6 +5264,8 @@ pub async fn fetch_shorts_sequence(
                 resume_secs: None,
                 playlist_browse_id: None,
                 playlist_set_video_id: None,
+                is_new: false,
+                is_members_only: false,
             });
         }
     }
@@ -4436,6 +5275,9 @@ pub async fn fetch_shorts_sequence(
 fn collect_videos(v: &Value, out: &mut Vec<VideoItem>, seen: &mut HashSet<String>) {
     match v {
         Value::Object(map) => {
+            if is_ad_container(map) {
+                return;
+            }
             if let Some(vr) = map.get("videoRenderer").or_else(|| map.get("compactVideoRenderer")) {
                 if let Some(item) = parse_video_renderer(vr) {
                     if seen.insert(item.id.clone()) {
@@ -4500,12 +5342,22 @@ fn parse_video_renderer(vr: &Value) -> Option<VideoItem> {
         .or_else(|| text(&vr["viewCountText"]))
         .unwrap_or_default();
     let published_text = text(&vr["publishedTimeText"]).unwrap_or_default();
-    let duration_text = text(&vr["lengthText"]).unwrap_or_default();
-    let is_live = duration_text.is_empty()
+    let is_short = has_shorts_indicator(vr);
+    let duration_text = if is_short {
+        "Short".to_owned()
+    } else {
+        text(&vr["lengthText"]).unwrap_or_default()
+    };
+    let is_live = !is_short
+        && duration_text.is_empty()
         && vr["badges"].as_array().is_some_and(|b| {
             b.iter()
                 .any(|x| x["metadataBadgeRenderer"]["style"] == "BADGE_STYLE_TYPE_LIVE_NOW")
         });
+    let (badge_new, is_members_only) = detect_video_badges(&vr["badges"]);
+    let (ov_new, ov_members) = detect_video_badges(&vr["thumbnailOverlays"]);
+    let is_new = badge_new || ov_new || is_recent_publish_text(&published_text);
+    let is_members_only = is_members_only || ov_members;
     let thumbnail_url = pick_thumb(&vr["thumbnail"]["thumbnails"], &id);
     let watched_percent = vr["thumbnailOverlays"].as_array().and_then(|arr| {
         arr.iter().find_map(|o| {
@@ -4534,6 +5386,8 @@ fn parse_video_renderer(vr: &Value) -> Option<VideoItem> {
         resume_secs,
         playlist_browse_id: None,
         playlist_set_video_id: None,
+        is_new,
+        is_members_only,
     })
 }
 
@@ -4549,7 +5403,12 @@ fn parse_playlist_video_renderer(pvr: &Value) -> Option<VideoItem> {
     let channel_id = channel_run
         .and_then(|r| r["navigationEndpoint"]["browseEndpoint"]["browseId"].as_str())
         .map(str::to_owned);
-    let duration_text = text(&pvr["lengthText"]).unwrap_or_default();
+    let duration_text = if has_shorts_indicator(pvr) {
+        "Short".to_owned()
+    } else {
+        text(&pvr["lengthText"]).unwrap_or_default()
+    };
+    let (is_new, is_members_only) = detect_video_badges(&pvr["badges"]);
     let thumbnail_url = pick_thumb(&pvr["thumbnail"]["thumbnails"], &id);
     let watched_percent = pvr["thumbnailOverlays"].as_array().and_then(|arr| {
         arr.iter().find_map(|o| {
@@ -4578,12 +5437,14 @@ fn parse_playlist_video_renderer(pvr: &Value) -> Option<VideoItem> {
         resume_secs,
         playlist_browse_id: None,
         playlist_set_video_id,
+        is_new,
+        is_members_only,
     })
 }
 
 fn parse_lockup_view_model(lm: &Value) -> Option<VideoItem> {
     let ctype = lm["contentType"].as_str().unwrap_or_default();
-    if !ctype.is_empty() && !ctype.contains("VIDEO") {
+    if !ctype.is_empty() && !ctype.contains("VIDEO") && !ctype.contains("SHORT") {
         return None;
     }
     let id = lm["contentId"].as_str()?.to_owned();
@@ -4596,6 +5457,7 @@ fn parse_lockup_view_model(lm: &Value) -> Option<VideoItem> {
     let mut channel = String::new();
     let mut views_text = String::new();
     let mut published_text = String::new();
+    let mut row_is_members = false;
 
     if let Some(rows) = meta["metadata"]["contentMetadataViewModel"]["metadataRows"].as_array() {
         for (idx, row) in rows.iter().enumerate() {
@@ -4603,19 +5465,36 @@ fn parse_lockup_view_model(lm: &Value) -> Option<VideoItem> {
                 .as_array()
                 .map(|a| a.iter().filter_map(|p| p["text"]["content"].as_str()).collect())
                 .unwrap_or_default();
-            if idx == 0 && !parts.is_empty() {
-                if parts[0].contains("view") || parts[0].contains("watching") {
-                    views_text = parts[0].to_owned();
-                    for &p in &parts[1..] {
+            let filtered: Vec<&str> = parts
+                .into_iter()
+                .filter(|p| {
+                    let low = p.trim().to_ascii_lowercase();
+                    if low.contains("members only")
+                        || low.contains("members-only")
+                        || low.contains("khusus pelanggan")
+                        || low.contains("khusus member")
+                        || low.contains("khusus anggota")
+                    {
+                        row_is_members = true;
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+            if idx == 0 && !filtered.is_empty() {
+                if filtered[0].contains("view") || filtered[0].contains("watching") {
+                    views_text = filtered[0].to_owned();
+                    for &p in &filtered[1..] {
                         if published_text.is_empty() {
                             published_text = p.to_owned();
                         }
                     }
                 } else {
-                    channel = parts[0].to_owned();
+                    channel = filtered[0].to_owned();
                 }
             } else {
-                for p in parts {
+                for p in filtered {
                     if p.contains("view") || p.contains("watching") {
                         views_text = p.to_owned();
                     } else if published_text.is_empty() {
@@ -4629,9 +5508,20 @@ fn parse_lockup_view_model(lm: &Value) -> Option<VideoItem> {
     let channel_avatar_url = find_first_thumb_url(&meta["image"]);
 
     let thumb_vm = &lm["contentImage"]["thumbnailViewModel"];
-    let thumbnail_url = pick_thumb(&thumb_vm["image"]["sources"], &id);
-    let (duration_text, mut watched_percent) = extract_lockup_thumb_meta(thumb_vm);
+    let (mut duration_text, mut watched_percent) = extract_lockup_thumb_meta(thumb_vm);
+    let is_short = ctype.contains("SHORT") || has_shorts_indicator(lm);
+    if is_short {
+        duration_text = "Short".to_owned();
+    }
+    let thumbnail_url = if is_short {
+        pick_short_thumb(lm, &id)
+    } else {
+        pick_thumb(&thumb_vm["image"]["sources"], &id)
+    };
     let is_live = duration_text.eq_ignore_ascii_case("LIVE");
+    let (badge_new, badge_members) = detect_video_badges(lm);
+    let is_members_only = row_is_members || badge_members;
+    let is_new = badge_new || is_recent_publish_text(&published_text);
     let channel_id = meta["image"]["decoratedAvatarViewModel"]["rendererContext"]
         ["commandContext"]["onTap"]["innertubeCommand"]["browseEndpoint"]["browseId"]
         .as_str()
@@ -4669,6 +5559,8 @@ fn parse_lockup_view_model(lm: &Value) -> Option<VideoItem> {
         resume_secs,
         playlist_browse_id: None,
         playlist_set_video_id: None,
+        is_new,
+        is_members_only,
     })
 }
 
@@ -4972,7 +5864,7 @@ mod tests {
                 }
             }
         });
-        let (_, _, likes, liked, disliked, _, _, _, _, _, _, _) =
+        let (_, _, likes, liked, disliked, _, _, _, _, _, _, _, _) =
             parse_next_metadata(&next, "abc12345678");
         assert_eq!(likes, "313");
         assert!(liked);
@@ -5445,5 +6337,280 @@ mod tests {
         assert_eq!(videos.len(), 2);
         assert_eq!((videos[0].id.as_str(), videos[0].duration_text.as_str()), ("abc12345678", "Short"));
         assert_eq!((videos[1].id.as_str(), videos[1].duration_text.as_str()), ("def12345678", "Short"));
+    }
+
+    #[test]
+    fn parses_badges_new_shorts_ads_and_notification_sections() {
+        let root = json!({
+            "items": [
+                {
+                    "adSlotRenderer": {
+                        "videoRenderer": {
+                            "videoId": "ad000000001",
+                            "title": { "simpleText": "Sponsored Ad" }
+                        }
+                    }
+                },
+                {
+                    "videoRenderer": {
+                        "videoId": "mem12345678",
+                        "title": { "simpleText": "Members Special Stream" },
+                        "badges": [
+                            { "metadataBadgeRenderer": { "style": "BADGE_STYLE_TYPE_MEMBERS_ONLY", "label": "Members only" } }
+                        ]
+                    }
+                },
+                {
+                    "shortsLockupViewModel": {
+                        "entityId": "shorts-shelf-item-new12345678",
+                        "thumbnailViewModel": {
+                            "thumbnailViewModel": {
+                                "image": {
+                                    "sources": [
+                                        { "url": "https://i.ytimg.com/vi/new12345678/small.jpg", "width": 120, "height": 213 },
+                                        { "url": "https://i.ytimg.com/vi/new12345678/oar2.jpg", "width": 720, "height": 1280 }
+                                    ]
+                                }
+                            }
+                        },
+                        "overlayMetadata": {
+                            "primaryText": { "content": "Fresh Short" },
+                            "secondaryText": { "content": "3 hours ago · 4K views" }
+                        }
+                    }
+                },
+                {
+                    "lockupViewModel": {
+                        "contentId": "shl12345678",
+                        "rendererContext": {
+                            "commandContext": {
+                                "onTap": {
+                                    "innertubeCommand": {
+                                        "commandMetadata": {
+                                            "webCommandMetadata": { "url": "/shorts/shl12345678" }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "metadata": {
+                            "lockupMetadataViewModel": {
+                                "title": { "content": "Lockup Short" },
+                                "metadata": {
+                                    "contentMetadataViewModel": {
+                                        "metadataRows": [
+                                            { "metadataParts": [{ "text": { "content": "My Channel" } }] },
+                                            { "metadataParts": [{ "text": { "content": "Khusus anggota" } }, { "text": { "content": "2 jam yang lalu" } }] }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+        let mut items = Vec::new();
+        let mut seen = HashSet::new();
+        collect_videos(&root, &mut items, &mut seen);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].id, "mem12345678");
+        assert!(items[0].is_members_only);
+        assert_eq!(items[1].id, "new12345678");
+        assert_eq!(items[1].thumbnail_url, "https://i.ytimg.com/vi/new12345678/oar2.jpg");
+        assert!(items[1].is_new);
+        assert!(items[1].is_short());
+        assert_eq!(items[2].id, "shl12345678");
+        assert!(items[2].is_short());
+        assert!(items[2].is_members_only);
+        assert!(items[2].is_new);
+
+        let notif_payload = json!({
+            "actions": [{
+                "openPopupAction": {
+                    "popup": {
+                        "multiPageMenuRenderer": {
+                            "sections": [
+                                {
+                                    "multiPageMenuNotificationSectionRenderer": {
+                                        "header": {
+                                            "notificationSectionHeaderRenderer": {
+                                                "headerText": { "runs": [{ "text": "Penting" }] }
+                                            }
+                                        },
+                                        "items": [{
+                                            "notificationRenderer": {
+                                                "notificationId": "N1",
+                                                "shortMessage": { "simpleText": "RiverV mengupload: Stars" },
+                                                "sentTimeText": { "simpleText": "3 jam yang lalu" },
+                                                "read": false,
+                                                "contextualMenu": {
+                                                    "menuRenderer": {
+                                                        "items": [{
+                                                            "menuServiceItemRenderer": {
+                                                                "serviceEndpoint": {
+                                                                    "recordNotificationInteractionsEndpoint": {
+                                                                        "serializedInteractionsRequest": "HIDE_NOTIF_TOKEN"
+                                                                    }
+                                                                }
+                                                            }
+                                                        }]
+                                                    }
+                                                },
+                                                "navigationEndpoint": {
+                                                    "commandMetadata": {
+                                                        "webCommandMetadata": { "url": "/watch?v=vid12345678" }
+                                                    }
+                                                }
+                                            }
+                                        }]
+                                    }
+                                },
+                                {
+                                    "multiPageMenuNotificationSectionRenderer": {
+                                        "notificationSectionHeaderRenderer": {
+                                            "title": { "runs": [{ "text": "Notifikasi lainnya" }] }
+                                        },
+                                        "items": [{
+                                            "notificationViewModel": {
+                                                "notificationId": "N2",
+                                                "metadata": {
+                                                    "contentViewModel": {
+                                                        "text": { "runs": [{ "text": "Channel B live sekarang" }] }
+                                                    }
+                                                },
+                                                "sentTime": { "content": "12 menit yang lalu" },
+                                                "readState": "NOTIFICATION_READ_STATE_UNREAD",
+                                                "onTap": {
+                                                    "innertubeCommand": {
+                                                        "commandMetadata": {
+                                                            "webCommandMetadata": { "url": "/shorts/sht12345678" }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }]
+        });
+        let (notifs, unseen, seen_params) = parse_notifications_menu(&notif_payload);
+        assert_eq!(seen_params, None);
+        assert_eq!(unseen, 2);
+        assert_eq!(notifs.len(), 2);
+        assert_eq!(notifs[0].section.as_deref(), Some("Penting"));
+        assert_eq!(notifs[0].video_id.as_deref(), Some("vid12345678"));
+        assert!(!notifs[0].read);
+        assert_eq!(notifs[1].section.as_deref(), Some("Notifikasi lainnya"));
+        assert_eq!(notifs[1].message, "Channel B live sekarang");
+        assert_eq!(notifs[1].video_id.as_deref(), Some("sht12345678"));
+        assert!(!notifs[1].read);
+
+        assert_eq!(publish_age_minutes("44 menit yang lalu"), Some(44));
+        assert_eq!(publish_age_minutes("3 hours ago"), Some(180));
+        assert_eq!(publish_age_minutes("Streamed 2 hours ago"), Some(120));
+        assert_eq!(publish_age_minutes("2 hari yang lalu"), Some(2880));
+
+        let guide = vec![SidebarChannel {
+            name: "Lein Xceed".into(),
+            browse_id: "UC_LEIN".into(),
+            avatar_url: Some("https://yt3.ggpht.com/lein.jpg".into()),
+            is_live: true,
+        }];
+        let sub_items = vec![
+            VideoItem {
+                id: "sub_new_001".into(),
+                title: "Silver Palace Lore".into(),
+                channel: "Lein Xceed".into(),
+                channel_id: Some("UC_LEIN".into()),
+                channel_avatar_url: None,
+                views_text: "818 views".into(),
+                published_text: "3 hours ago".into(),
+                duration_text: "10:02".into(),
+                thumbnail_url: "https://i.ytimg.com/vi/sub_new_001/hqdefault.jpg".into(),
+                is_live: false,
+                watched_percent: None,
+                resume_secs: None,
+                playlist_browse_id: None,
+                playlist_set_video_id: None,
+                is_new: true,
+                is_members_only: false,
+            },
+            VideoItem {
+                id: "sub_old_002".into(),
+                title: "Weekly Podcast".into(),
+                channel: "Tirta PengPengPeng".into(),
+                channel_id: Some("UC_TIRTA".into()),
+                channel_avatar_url: None,
+                views_text: "12K views".into(),
+                published_text: "5 days ago".into(),
+                duration_text: "20:00".into(),
+                thumbnail_url: "https://i.ytimg.com/vi/sub_old_002/hqdefault.jpg".into(),
+                is_live: false,
+                watched_percent: None,
+                resume_secs: None,
+                playlist_browse_id: None,
+                playlist_set_video_id: None,
+                is_new: false,
+                is_members_only: false,
+            },
+        ];
+        let home_items = vec![
+            VideoItem {
+                id: "home_live01".into(),
+                title: "Live Gacha Stream".into(),
+                channel: "Lein Xceed".into(),
+                channel_id: Some("UC_LEIN".into()),
+                channel_avatar_url: None,
+                views_text: "1.2K watching".into(),
+                published_text: "".into(),
+                duration_text: "LIVE".into(),
+                thumbnail_url: "https://i.ytimg.com/vi/home_live01/hqdefault.jpg".into(),
+                is_live: true,
+                watched_percent: None,
+                resume_secs: None,
+                playlist_browse_id: None,
+                playlist_set_video_id: None,
+                is_new: false,
+                is_members_only: false,
+            },
+            VideoItem {
+                id: "home_unsub1".into(),
+                title: "Random Viral Video".into(),
+                channel: "Not Subscribed".into(),
+                channel_id: Some("UC_RANDOM".into()),
+                channel_avatar_url: None,
+                views_text: "500K views".into(),
+                published_text: "1 hour ago".into(),
+                duration_text: "5:00".into(),
+                thumbnail_url: "https://i.ytimg.com/vi/home_unsub1/hqdefault.jpg".into(),
+                is_live: false,
+                watched_percent: None,
+                resume_secs: None,
+                playlist_browse_id: None,
+                playlist_set_video_id: None,
+                is_new: true,
+                is_members_only: false,
+            },
+        ];
+        let mut av_map = HashMap::new();
+        av_map.insert("UC_TIRTA".to_owned(), "https://yt3.ggpht.com/tirta.jpg".to_owned());
+        let (fb, fb_unseen) =
+            build_subscription_notifications(&sub_items, &guide, &home_items, &av_map, 42);
+        assert_eq!(fb_unseen, 2);
+        assert_eq!(fb.len(), 3);
+        assert_eq!(fb[0].video_id.as_deref(), Some("home_live01"));
+        assert!(fb[0].message.contains("is live"));
+        assert_eq!(fb[0].channel_avatar_url.as_deref(), Some("https://yt3.ggpht.com/lein.jpg"));
+        assert_eq!(fb[1].video_id.as_deref(), Some("sub_new_001"));
+        assert_eq!(fb[1].section.as_deref(), Some("Important"));
+        assert_eq!(fb[2].video_id.as_deref(), Some("sub_old_002"));
+        assert_eq!(fb[2].section.as_deref(), Some("Other notifications"));
+        assert!(fb[2].read);
+        assert_eq!(fb[2].channel_avatar_url.as_deref(), Some("https://yt3.ggpht.com/tirta.jpg"));
     }
 }

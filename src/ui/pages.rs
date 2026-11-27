@@ -4,15 +4,16 @@ use egui::{
 };
 
 use crate::backend::Request;
-use crate::model::{ChannelInfo, HwdecMode, PreferredQuality, VideoItem};
+use crate::model::{
+    AmbientMode, ChannelInfo, HwdecMode, PoTokenMode, PreferredQuality, VideoItem, WindowMaterial,
+};
 use crate::theme::{self, icon};
 use crate::ytdlp;
 
 use super::cards::{
     draw_avatar, draw_thumbnail, draw_video_grid, draw_video_grid_with_flags, icon_circle_button,
-    settings_card,
 };
-use super::{GUEST_TOPICS, Page, SubsFilter, YtApp, format_duration};
+use super::{GUEST_TOPICS, Page, SettingsTab, SubsFilter, YtApp, format_duration};
 
 impl YtApp {
     pub(super) fn draw_home_page(&mut self, ui: &mut egui::Ui) {
@@ -34,7 +35,8 @@ impl YtApp {
 
         ui.horizontal(|ui| {
             let left_clicked = icon_circle_button(ui, icon::CHEVRON_LEFT, 15.0, "Scroll left");
-            let avail_bar_w = (ui.available_width() - 40.0).max(160.0);
+            let reload_reserve = 92.0;
+            let avail_bar_w = (ui.available_width() - 40.0 - reload_reserve).max(140.0);
             let bar_out = ui.allocate_ui_with_layout(
                 Vec2::new(avail_bar_w, 34.0),
                 Layout::left_to_right(Align::Center),
@@ -151,6 +153,50 @@ impl YtApp {
                 next_target = (next_target + 240.0).clamp(0.0, max_scroll);
             }
             self.chips_scroll_target = next_target.clamp(0.0, max_scroll);
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let (rrect, rresp) =
+                    ui.allocate_exact_size(Vec2::new(82.0, 30.0), Sense::click());
+                let rhov = ui
+                    .ctx()
+                    .animate_bool_with_time(rresp.id, rresp.hovered(), 0.12);
+                if rresp.hovered() && !self.home_loading {
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                }
+                ui.painter().rect_filled(
+                    rrect,
+                    15.0,
+                    theme::lerp_color(theme::CHIP, theme::CHIP_HOVER, rhov),
+                );
+                if self.home_loading {
+                    ui.painter().text(
+                        rrect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Loading...",
+                        theme::medium(11.5),
+                        theme::TEXT_DIM,
+                    );
+                } else {
+                    theme::draw_refresh_icon(
+                        ui.painter(),
+                        pos2(rrect.left() + 17.0, rrect.center().y),
+                        13.5,
+                        theme::TEXT,
+                    );
+                    ui.painter().text(
+                        pos2(rrect.left() + 30.0, rrect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        "Reload",
+                        theme::medium(12.0),
+                        theme::TEXT,
+                    );
+                }
+                if !self.home_loading
+                    && rresp.on_hover_text("Reload Home recommendations (F5)").clicked()
+                {
+                    self.reload_home_feed();
+                }
+            });
         });
 
         if let Some(idx) = clicked_remote {
@@ -197,8 +243,16 @@ impl YtApp {
         ui.add_space(10.0);
 
         if let Some(lw) = self.last_watched.clone() {
-            let currently_playing_same = self.watch.as_ref().is_some_and(|w| w.id == lw.id);
-            if !currently_playing_same && lw.position_secs > 2.0 {
+            let matches_primary = self.watch.as_ref().is_some_and(|w| w.id == lw.id);
+            let matches_second = lw.second_tab.as_ref().is_none_or(|b| {
+                self.bg_player_tab
+                    .as_ref()
+                    .and_then(|s| s.watch.as_ref())
+                    .is_some_and(|w| w.id == b.id)
+                    || self.watch.as_ref().is_some_and(|w| w.id == b.id)
+            });
+            let currently_playing_same = matches_primary && matches_second;
+            if !currently_playing_same && (lw.position_secs > 2.0 || lw.second_tab.is_some()) {
                 let mut resume_now = false;
                 let mut dismiss_now = false;
                 Frame::new()
@@ -229,7 +283,7 @@ impl YtApp {
                                 ui.add_space(8.0);
                             }
                             ui.vertical(|ui| {
-                                ui.set_max_width((ui.available_width() - 170.0).max(120.0));
+                                ui.set_max_width((ui.available_width() - 185.0).max(120.0));
                                 let time_str = if lw.duration_secs > 1.0 {
                                     format!(
                                         "Continue watching · {} / {}",
@@ -255,9 +309,23 @@ impl YtApp {
                                     )
                                     .truncate(),
                                 );
+                                let sub_line = if let Some(bg) = &lw.second_tab {
+                                    if bg.position_secs > 2.0 {
+                                        format!(
+                                            "{}  ·  + Tab 2: {} ({})",
+                                            lw.channel,
+                                            bg.title,
+                                            format_duration(bg.position_secs)
+                                        )
+                                    } else {
+                                        format!("{}  ·  + Tab 2: {}", lw.channel, bg.title)
+                                    }
+                                } else {
+                                    lw.channel.clone()
+                                };
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(&lw.channel)
+                                        RichText::new(sub_line)
                                             .font(theme::regular(12.0))
                                             .color(theme::TEXT_DIM),
                                     )
@@ -268,10 +336,15 @@ impl YtApp {
                                 if icon_circle_button(ui, icon::X, 14.0, "Dismiss") {
                                     dismiss_now = true;
                                 }
+                                let btn_label = if lw.second_tab.is_some() {
+                                    format!("{}  Resume 2 tabs", icon::PLAY)
+                                } else {
+                                    format!("{}  Resume", icon::PLAY)
+                                };
                                 if ui
                                     .add(
                                         egui::Button::new(
-                                            RichText::new(format!("{}  Resume", icon::PLAY))
+                                            RichText::new(btn_label)
                                                 .font(theme::semibold(12.5))
                                                 .color(Color32::from_rgb(15, 15, 15)),
                                         )
@@ -287,7 +360,8 @@ impl YtApp {
                     });
                 ui.add_space(10.0);
                 if resume_now {
-                    self.resume_last_watched();
+                    let ctx = ui.ctx().clone();
+                    self.resume_last_watched(&ctx);
                 } else if dismiss_now {
                     self.clear_last_watched();
                 }
@@ -332,6 +406,7 @@ impl YtApp {
         }
 
         let items = self.home_items.clone();
+        let home_shorts = self.prioritized_home_shorts();
         let loading = self.home_loading;
         let cont = self.home_continuation.clone();
         let title = if self.signed_in {
@@ -340,7 +415,14 @@ impl YtApp {
             "Recommended & Trending"
         };
         let ctx = ui.ctx().clone();
-        if let Some(act) = super::cards::draw_home_mixed_grid(ui, title, &items, loading, cont.is_some()) {
+        if let Some(act) = super::cards::draw_home_mixed_grid(
+            ui,
+            title,
+            &items,
+            &home_shorts,
+            loading,
+            cont.is_some(),
+        ) {
             self.handle_grid_action(&ctx, act, |app| {
                 app.home_loading = true;
                 let _ = app.backend.tx.send(Request::LoadHome {
@@ -353,6 +435,15 @@ impl YtApp {
     }
 
     pub(super) fn draw_shorts_page(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        if !self.shorts_grid_view
+            && (self.shorts_slot.watch.is_some()
+                || self.shorts_slot.watch_loading
+                || self.shorts_slot.active_watch_id.is_some())
+        {
+            self.draw_shorts_player(ui, &ctx);
+            return;
+        }
         if self.shorts_loading && self.shorts_items.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.vertical_centered(|ui| {
@@ -406,6 +497,7 @@ impl YtApp {
                         )
                         .clicked()
                     {
+                        self.shorts_grid_view = false;
                         let list = self.shorts_items.clone();
                         self.open_short(first, list);
                     }
@@ -415,7 +507,6 @@ impl YtApp {
         ui.add_space(10.0);
         let items = self.shorts_items.clone();
         let loading = self.shorts_loading;
-        let ctx = ui.ctx().clone();
         if let Some(act) = super::cards::draw_shorts_portrait_grid(ui, "", &items, loading) {
             self.handle_grid_action(&ctx, act, |_| {});
         }
@@ -836,49 +927,413 @@ impl YtApp {
     }
 
     pub(super) fn draw_settings_page(&mut self, ui: &mut egui::Ui) {
-        ScrollArea::vertical().show(ui, |ui| {
-            ui.set_max_width(680.0);
-            ui.label(RichText::new("Settings").font(theme::bold(22.0)));
-            ui.add_space(14.0);
+        let total_w = ui.available_width();
+        let wide = total_w >= 760.0;
 
-            settings_card(ui, "Account", |ui| {
-                if self.signed_in {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "Signed in as {}",
-                                self.account_name.as_deref().unwrap_or("Google Account")
-                            ))
-                            .font(theme::medium(14.0)),
-                        );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.button("Sign out").clicked() {
-                                let _ = self.backend.tx.send(Request::SignOut);
-                            }
-                        });
-                    });
-                    ui.add_space(6.0);
-                    ui.checkbox(
-                        &mut self.sync_history,
-                        "Sync watch history & playback progress with YouTube",
-                    );
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.label("Sign in with Google to access your Home feed & Subscriptions.");
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.button("Sign in").clicked() {
-                                self.start_sign_in();
-                            }
-                        });
-                    });
+        if wide {
+            let rail_w = 224.0_f32;
+            let total_h = ui.available_height();
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(rail_w, total_h),
+                    Layout::top_down(Align::LEFT),
+                    |ui| {
+                        self.draw_settings_nav(ui, true);
+                    },
+                );
+                ui.add_space(24.0);
+                let content_w = (ui.available_width() - 8.0).max(320.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(content_w, total_h),
+                    Layout::top_down(Align::LEFT),
+                    |ui| {
+                        ScrollArea::vertical()
+                            .id_salt("settings_content_scroll")
+                            .show(ui, |ui| {
+                                ui.set_max_width(720.0);
+                                self.draw_settings_groups(ui);
+                                ui.add_space(28.0);
+                            });
+                    },
+                );
+            });
+        } else {
+            self.draw_settings_nav(ui, false);
+            ui.add_space(12.0);
+            ScrollArea::vertical()
+                .id_salt("settings_content_scroll_narrow")
+                .show(ui, |ui| {
+                    ui.set_max_width(720.0);
+                    self.draw_settings_groups(ui);
+                    ui.add_space(24.0);
+                });
+        }
+    }
+
+    fn draw_settings_nav(&mut self, ui: &mut egui::Ui, vertical: bool) {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Settings")
+                .font(theme::bold(28.0))
+                .color(Color32::WHITE),
+        );
+        ui.add_space(12.0);
+
+        // Search input pill
+        let search_h = 36.0;
+        let search_w = if vertical {
+            ui.available_width()
+        } else {
+            ui.available_width().min(360.0)
+        };
+        let (srect, sresp) = ui.allocate_exact_size(Vec2::new(search_w, search_h), Sense::click());
+        let search_fill = if theme::is_translucent() {
+            Color32::from_rgba_unmultiplied(255, 255, 255, 18)
+        } else {
+            theme::SURFACE
+        };
+        ui.painter()
+            .rect_filled(srect, search_h * 0.5, search_fill);
+        ui.painter().rect_stroke(
+            srect,
+            search_h * 0.5,
+            Stroke::new(1.0, theme::card_stroke()),
+            egui::StrokeKind::Middle,
+        );
+        theme::draw_icon_centered(
+            ui.painter(),
+            pos2(srect.left() + 17.0, srect.center().y),
+            icon::SEARCH,
+            14.0,
+            theme::TEXT_DIM,
+        );
+        let clearable = !self.settings_query.is_empty();
+        let inner = Rect::from_min_max(
+            pos2(srect.left() + 33.0, srect.top() + 3.0),
+            pos2(
+                srect.right() - if clearable { 32.0 } else { 12.0 },
+                srect.bottom() - 3.0,
+            ),
+        );
+        let edit = ui.put(
+            inner,
+            egui::TextEdit::singleline(&mut self.settings_query)
+                .hint_text(
+                    RichText::new("Search settings")
+                        .font(theme::regular(13.0))
+                        .color(theme::TEXT_FAINT),
+                )
+                .font(theme::regular(13.0))
+                .frame(Frame::NONE)
+                .desired_width(inner.width()),
+        );
+        if clearable {
+            let x_rect = Rect::from_center_size(
+                pos2(srect.right() - 17.0, srect.center().y),
+                Vec2::splat(24.0),
+            );
+            let x_resp = ui
+                .interact(x_rect, egui::Id::unique("settings_search_clear"), Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand);
+            if x_resp.hovered() {
+                ui.painter().circle_filled(
+                    x_rect.center(),
+                    11.0,
+                    Color32::from_white_alpha(20),
+                );
+            }
+            theme::draw_icon_centered(
+                ui.painter(),
+                x_rect.center(),
+                icon::X,
+                13.0,
+                theme::TEXT_DIM,
+            );
+            if x_resp.clicked() {
+                self.settings_query.clear();
+                edit.request_focus();
+            }
+        }
+        if sresp.clicked() {
+            edit.request_focus();
+        }
+        if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.settings_query.clear();
+        }
+
+        // Per-group vs all-groups search toggle
+        if !self.settings_query.trim().is_empty() {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for (in_group, lbl) in [
+                    (false, "All groups"),
+                    (true, self.settings_tab.label()),
+                ] {
+                    let active = self.settings_search_in_group == in_group;
+                    let fill = if active {
+                        theme::YT_BLUE.gamma_multiply(0.24)
+                    } else if theme::is_translucent() {
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 14)
+                    } else {
+                        theme::CHIP
+                    };
+                    let col = if active { Color32::WHITE } else { theme::TEXT_DIM };
+                    let btn = egui::Button::new(
+                        RichText::new(lbl).font(theme::medium(11.5)).color(col),
+                    )
+                    .fill(fill)
+                    .stroke(Stroke::new(
+                        1.0,
+                        if active {
+                            theme::YT_BLUE.gamma_multiply(0.65)
+                        } else {
+                            theme::card_stroke()
+                        },
+                    ))
+                    .corner_radius(12);
+                    if ui.add(btn).clicked() {
+                        self.settings_search_in_group = in_group;
+                    }
                 }
             });
+        }
 
-            ui.add_space(12.0);
-            settings_card(ui, "Playback", |ui| {
+        ui.add_space(12.0);
+        let filtering = !self.settings_query.trim().is_empty();
+        if vertical {
+            for tab in SettingsTab::ALL {
+                let selected = (!filtering || self.settings_search_in_group) && self.settings_tab == tab;
+                let (rect, resp) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), Sense::click());
+                let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+                let hover_t = ui.ctx().animate_bool_with_time(
+                    egui::Id::unique(("settings_nav_h", tab as usize)),
+                    resp.hovered(),
+                    0.14,
+                );
+                let sel_t = ui.ctx().animate_bool_with_time(
+                    egui::Id::unique(("settings_nav_s", tab as usize)),
+                    selected,
+                    0.16,
+                );
+                if hover_t + sel_t > 0.01 {
+                    let alpha = (14.0 * hover_t + 26.0 * sel_t).round() as u8;
+                    ui.painter()
+                        .rect_filled(rect, 10.0, Color32::from_white_alpha(alpha));
+                }
+                let text_col = if selected || resp.hovered() {
+                    Color32::WHITE
+                } else {
+                    theme::TEXT_DIM
+                };
+                ui.painter().text(
+                    pos2(rect.left() + 14.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    tab.label(),
+                    if selected {
+                        theme::semibold(13.5)
+                    } else {
+                        theme::medium(13.5)
+                    },
+                    text_col,
+                );
+                if resp.clicked() {
+                    self.settings_tab = tab;
+                    if filtering && !self.settings_search_in_group {
+                        self.settings_query.clear();
+                    }
+                }
+            }
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                for tab in SettingsTab::ALL {
+                    let selected = (!filtering || self.settings_search_in_group) && self.settings_tab == tab;
+                    let fill = if selected {
+                        Color32::from_white_alpha(32)
+                    } else if theme::is_translucent() {
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 12)
+                    } else {
+                        theme::CHIP
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(tab.label())
+                                    .font(theme::medium(12.5))
+                                    .color(if selected {
+                                        Color32::WHITE
+                                    } else {
+                                        theme::TEXT_DIM
+                                    }),
+                            )
+                            .fill(fill)
+                            .corner_radius(14),
+                        )
+                        .clicked()
+                    {
+                        self.settings_tab = tab;
+                        if filtering && !self.settings_search_in_group {
+                            self.settings_query.clear();
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    fn draw_settings_groups(&mut self, ui: &mut egui::Ui) {
+        let raw_query = self.settings_query.trim().to_ascii_lowercase();
+        let words: Vec<String> = raw_query
+            .split_whitespace()
+            .filter(|w| !w.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let filtering = !words.is_empty();
+
+        let tabs_to_render: Vec<SettingsTab> = if !filtering || self.settings_search_in_group {
+            vec![self.settings_tab]
+        } else {
+            SettingsTab::ALL.to_vec()
+        };
+
+        let mut shown_groups = 0usize;
+        for tab in tabs_to_render {
+            let group_name = tab.label();
+            let rendered = match tab {
+                SettingsTab::Account => self.draw_settings_account_group(ui, group_name, &words),
+                SettingsTab::Playback => self.draw_settings_playback_group(ui, group_name, &words),
+                SettingsTab::Appearance => self.draw_settings_appearance_group(ui, group_name, &words),
+                SettingsTab::Engine => self.draw_settings_engine_group(ui, group_name, &words),
+                SettingsTab::Connections => self.draw_settings_connections_group(ui, group_name, &words),
+                SettingsTab::Shortcuts => self.draw_settings_shortcuts_group(ui, group_name, &words),
+            };
+            if rendered {
+                shown_groups += 1;
+                ui.add_space(18.0);
+            }
+        }
+
+        if filtering && shown_groups == 0 {
+            settings_group_frame(ui, "No matching settings", None, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("Preferred max quality");
+                    ui.label(
+                        RichText::new(format!(
+                            "No settings found matching \"{}\"{}.",
+                            self.settings_query.trim(),
+                            if self.settings_search_in_group {
+                                format!(" in {}", self.settings_tab.label())
+                            } else {
+                                String::new()
+                            }
+                        ))
+                        .font(theme::regular(13.0))
+                        .color(theme::TEXT_DIM),
+                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Clear search").clicked() {
+                            self.settings_query.clear();
+                        }
+                    });
+                });
+            });
+        }
+    }
+
+    fn draw_settings_account_group(
+        &mut self,
+        ui: &mut egui::Ui,
+        group: &str,
+        words: &[String],
+    ) -> bool {
+        let mut any = false;
+        let show_auth = settings_match(
+            words,
+            group,
+            "Google account sign in sign out YouTube feed subscriptions",
+        );
+        let show_sync =
+            self.signed_in && settings_match(words, group, "Sync watch history playback progress");
+        if !show_auth && !show_sync {
+            return false;
+        }
+        settings_group_frame(ui, group, None, |ui| {
+            if show_auth {
+                any = true;
+                if self.signed_in {
+                    let name = self
+                        .account_name
+                        .as_deref()
+                        .unwrap_or("Google Account")
+                        .to_owned();
+                    settings_row(
+                        ui,
+                        &name,
+                        Some("Signed in with Google. Home feed, subscriptions, playlists and likes come from this account."),
+                        |ui| {
+                            if settings_pill_btn(ui, "Sign out", Some(icon::LOG_OUT)).clicked() {
+                                let _ = self.backend.tx.send(Request::SignOut);
+                            }
+                        },
+                    );
+                } else {
+                    settings_row(
+                        ui,
+                        "Not signed in",
+                        Some("Sign in with Google to access your Home feed, Subscriptions and synced history."),
+                        |ui| {
+                            if settings_pill_btn(ui, "Sign in", Some(icon::CIRCLE_USER)).clicked() {
+                                self.start_sign_in();
+                            }
+                        },
+                    );
+                }
+            }
+            if show_sync {
+                if any {
+                    settings_divider(ui);
+                }
+                any = true;
+                settings_row(
+                    ui,
+                    "Sync watch history",
+                    Some("Report playback progress and watch history back to YouTube."),
+                    |ui| {
+                        settings_toggle(ui, &mut self.sync_history, "sync_history");
+                    },
+                );
+            }
+        });
+        any
+    }
+
+    fn draw_settings_playback_group(
+        &mut self,
+        ui: &mut egui::Ui,
+        group: &str,
+        words: &[String],
+    ) -> bool {
+        let m_quality = settings_match(words, group, "Preferred max quality resolution 4k 1080p 720p");
+        let m_autoplay = settings_match(words, group, "Autoplay next Up Next video");
+        let m_resume = settings_match(words, group, "Auto-resume last watched video tabs startup");
+        let m_pot = settings_match(
+            words,
+            group,
+            "BotGuard PO Token auto on off yt-dlp blocked 403 webview",
+        );
+        if !m_quality && !m_autoplay && !m_resume && !m_pot {
+            return false;
+        }
+        settings_group_frame(ui, group, None, |ui| {
+            let mut count = 0usize;
+            if m_quality {
+                count += 1;
+                settings_row(
+                    ui,
+                    "Preferred max quality",
+                    Some("Target resolution chosen when loading or recovering streams."),
+                    |ui| {
                         egui::ComboBox::from_id_salt("settings_quality")
                             .selected_text(self.preferred_quality.label())
                             .show_ui(ui, |ui| {
@@ -886,41 +1341,340 @@ impl YtApp {
                                     ui.selectable_value(&mut self.preferred_quality, q, q.label());
                                 }
                             });
-                    });
-                });
-                ui.add_space(6.0);
-                ui.checkbox(&mut self.sponsorblock_enabled, "Auto-skip SponsorBlock segments");
-                ui.checkbox(&mut self.autoplay_next, "Autoplay next Up Next video");
-                ui.checkbox(
-                    &mut self.auto_resume_on_start,
-                    "Auto-resume last watched video on startup",
+                    },
                 );
-            });
+            }
+            if m_autoplay {
+                if count > 0 {
+                    settings_divider(ui);
+                }
+                count += 1;
+                settings_row(
+                    ui,
+                    "Autoplay next video",
+                    Some("Automatically play the next queued or Up Next video when playback ends."),
+                    |ui| {
+                        settings_toggle(ui, &mut self.autoplay_next, "autoplay_next");
+                    },
+                );
+            }
+            if m_resume {
+                if count > 0 {
+                    settings_divider(ui);
+                }
+                count += 1;
+                settings_row(
+                    ui,
+                    "Auto-resume on startup",
+                    Some("Reopen your last watched tab(s) and timestamps automatically when yt-rust starts."),
+                    |ui| {
+                        settings_toggle(
+                            ui,
+                            &mut self.auto_resume_on_start,
+                            "auto_resume_on_start",
+                        );
+                    },
+                );
+            }
+            if m_pot {
+                if count > 0 {
+                    settings_divider(ui);
+                }
+                let prev_pot = self.po_token_mode;
+                settings_row(
+                    ui,
+                    "BotGuard PO Token",
+                    Some("Mint Proof-of-Origin tokens on demand via hidden WebView2 when yt-dlp fallback hits bot checks or 403."),
+                    |ui| {
+                        egui::ComboBox::from_id_salt("settings_potoken_mode")
+                            .width(190.0)
+                            .selected_text(self.po_token_mode.label())
+                            .show_ui(ui, |ui| {
+                                for mode in PoTokenMode::ALL {
+                                    ui.selectable_value(
+                                        &mut self.po_token_mode,
+                                        mode,
+                                        mode.label(),
+                                    );
+                                }
+                            });
+                    },
+                );
+                if self.po_token_mode != prev_pot {
+                    let _ = self
+                        .backend
+                        .tx
+                        .send(Request::SetPoTokenMode(self.po_token_mode));
+                    self.toast(format!("BotGuard PO Token: {}", self.po_token_mode.label()));
+                }
+            }
+        });
+        true
+    }
 
-            ui.add_space(12.0);
-            settings_card(ui, "Downloads", |ui| {
+    fn draw_settings_appearance_group(
+        &mut self,
+        ui: &mut egui::Ui,
+        group: &str,
+        words: &[String],
+    ) -> bool {
+        let backdrop_supported = crate::win_shell::windows_backdrop_supported();
+        let m_mat = backdrop_supported
+            && settings_match(words, group, "Window material theme acrylic mica solid dark glass");
+        let m_amb = settings_match(
+            words,
+            group,
+            "Ambient mode background video blur soft tiled repeat wallpaper",
+        );
+        let m_amb_op = self.ambient_mode != AmbientMode::Off
+            && settings_match(words, group, "Ambient background strength opacity intensity");
+        let m_glow = settings_match(
+            words,
+            group,
+            "Ambient cinema glow behind video player watch",
+        );
+        let m_sub_sz = settings_match(words, group, "Caption font size subtitles");
+        let m_sub_op = settings_match(words, group, "Caption background opacity subtitles");
+        let m_aot = settings_match(words, group, "Always on Top window pin");
+        let m_close_tray = settings_match(words, group, "Close button system tray");
+        let m_min_tray = settings_match(words, group, "Minimize button system tray");
+
+        if !m_mat
+            && !m_amb
+            && !m_amb_op
+            && !m_glow
+            && !m_sub_sz
+            && !m_sub_op
+            && !m_aot
+            && !m_close_tray
+            && !m_min_tray
+        {
+            return false;
+        }
+
+        settings_group_frame(ui, group, None, |ui| {
+            let mut count = 0usize;
+            if m_mat {
+                count += 1;
+                let prev = self.window_material;
+                settings_row(
+                    ui,
+                    "Window material",
+                    Some("Windows 11 translucent backdrop style (Acrylic / Mica) applied live."),
+                    |ui| {
+                        egui::ComboBox::from_id_salt("settings_window_material")
+                            .width(155.0)
+                            .selected_text(self.window_material.label())
+                            .show_ui(ui, |ui| {
+                                for m in WindowMaterial::ALL {
+                                    ui.selectable_value(&mut self.window_material, m, m.label());
+                                }
+                            });
+                    },
+                );
+                if self.window_material != prev {
+                    self.toast(format!("Theme material: {}", self.window_material.label()));
+                }
+            }
+            if m_amb {
+                if count > 0 {
+                    settings_divider(ui);
+                }
+                count += 1;
+                settings_row(
+                    ui,
+                    "Ambient background",
+                    Some("Softly blurred or tiled video artwork behind pages, similar to ytm-rs."),
+                    |ui| {
+                        egui::ComboBox::from_id_salt("settings_ambient_mode")
+                            .width(155.0)
+                            .selected_text(self.ambient_mode.label())
+                            .show_ui(ui, |ui| {
+                                for mode in AmbientMode::ALL {
+                                    ui.selectable_value(&mut self.ambient_mode, mode, mode.label());
+                                }
+                            });
+                    },
+                );
+            }
+            if m_amb_op {
+                if count > 0 {
+                    settings_divider(ui);
+                }
+                count += 1;
+                settings_row(
+                    ui,
+                    "Ambient intensity",
+                    Some("How subtly the blurred artwork blends into the app backdrop."),
+                    |ui| {
+                        let mut pct = (self.ambient_opacity * 100.0).round() as u32;
+                        ui.label(
+                            RichText::new(format!("{pct}%"))
+                                .font(theme::medium(12.5))
+                                .color(theme::TEXT_DIM),
+                        );
+                        if ui
+                            .add(egui::Slider::new(&mut pct, 5..=70).show_value(false))
+                            .changed()
+                        {
+                            self.ambient_opacity = pct as f32 / 100.0;
+                        }
+                    },
+                );
+            }
+            if m_glow {
+                if count > 0 {
+                    settings_divider(ui);
+                }
+                count += 1;
+                settings_row(
+                    ui,
+                    "Player ambient cinema glow",
+                    Some("Soft glowing halo behind the active video surface on the Watch page."),
+                    |ui| {
+                        settings_toggle(ui, &mut self.ambient_glow, "ambient_glow");
+                    },
+                );
+            }
+            let mut sub_changed = false;
+            if m_sub_sz {
+                if count > 0 {
+                    settings_divider(ui);
+                }
+                count += 1;
+                settings_row(ui, "Caption font size", None, |ui| {
+                    ui.label(
+                        RichText::new(format!("{} px", self.sub_font_size))
+                            .font(theme::medium(12.5))
+                            .color(theme::TEXT_DIM),
+                    );
+                    if ui
+                        .add(egui::Slider::new(&mut self.sub_font_size, 24..=80).show_value(false))
+                        .changed()
+                    {
+                        sub_changed = true;
+                    }
+                });
+            }
+            if m_sub_op {
+                if count > 0 {
+                    settings_divider(ui);
+                }
+                count += 1;
+                settings_row(ui, "Caption background opacity", None, |ui| {
+                    let mut pct = (self.sub_bg_opacity * 100.0).round() as u32;
+                    ui.label(
+                        RichText::new(format!("{pct}%"))
+                            .font(theme::medium(12.5))
+                            .color(theme::TEXT_DIM),
+                    );
+                    if ui
+                        .add(egui::Slider::new(&mut pct, 0..=100).show_value(false))
+                        .changed()
+                    {
+                        self.sub_bg_opacity = pct as f32 / 100.0;
+                        sub_changed = true;
+                    }
+                });
+            }
+            if sub_changed {
+                if let Some(mpv) = &self.mpv {
+                    mpv.set_subtitle_style(self.sub_font_size, self.sub_bg_opacity);
+                }
+            }
+            if m_aot {
+                if count > 0 {
+                    settings_divider(ui);
+                }
+                count += 1;
+                let mut aot = self.always_on_top;
+                let ctx = ui.ctx().clone();
+                settings_row(
+                    ui,
+                    "Keep window Always on Top",
+                    Some("Pin the main yt-rust window above all other windows."),
+                    |ui| {
+                        if settings_toggle(ui, &mut aot, "always_on_top") {
+                            self.set_always_on_top(&ctx, aot);
+                        }
+                    },
+                );
+            }
+            if m_close_tray {
+                if count > 0 {
+                    settings_divider(ui);
+                }
+                count += 1;
+                settings_row(
+                    ui,
+                    "Close to system tray",
+                    Some("Close button hides window to tray (use tray menu -> Quit to exit)."),
+                    |ui| {
+                        settings_toggle(ui, &mut self.close_to_tray, "close_to_tray");
+                    },
+                );
+            }
+            if m_min_tray {
+                if count > 0 {
+                    settings_divider(ui);
+                }
+                settings_row(
+                    ui,
+                    "Minimize to system tray",
+                    Some("Minimize button sends window to the Windows notification area."),
+                    |ui| {
+                        settings_toggle(ui, &mut self.minimize_to_tray, "minimize_to_tray");
+                    },
+                );
+            }
+        });
+        true
+    }
+
+    fn draw_settings_engine_group(
+        &mut self,
+        ui: &mut egui::Ui,
+        group: &str,
+        words: &[String],
+    ) -> bool {
+        let m_dl = settings_match(words, group, "Download folder offline directory open reset");
+        let m_hw = settings_match(
+            words,
+            group,
+            "Hardware decoding hwdec libmpv video engine auto-copy software",
+        );
+        let m_mpv = settings_match(words, group, "libmpv-2.dll status download video engine");
+        if !m_dl && !m_hw && !m_mpv {
+            return false;
+        }
+        settings_group_frame(ui, group, None, |ui| {
+            let mut count = 0usize;
+            if m_dl {
+                count += 1;
                 let default_dir = ytdlp::default_downloads_dir(&self.backend.data_dir);
                 let active_dir = self.effective_download_dir();
                 ui.label(
-                    RichText::new("Download folder (leave empty for default)")
-                        .font(theme::medium(13.0))
+                    RichText::new("Download folder")
+                        .font(theme::medium(14.0))
+                        .color(Color32::WHITE),
+                );
+                ui.label(
+                    RichText::new("Leave empty to use the default app downloads directory.")
+                        .font(theme::regular(12.0))
                         .color(theme::TEXT_DIM),
                 );
-                ui.add_space(4.0);
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let edit_w = (ui.available_width() - 210.0).max(160.0);
                     ui.add_sized(
-                        Vec2::new(edit_w, 28.0),
+                        Vec2::new(edit_w, 30.0),
                         egui::TextEdit::singleline(&mut self.download_dir)
                             .hint_text(default_dir.display().to_string()),
                     );
                     if !self.download_dir.trim().is_empty() && ui.button("Reset").clicked() {
                         self.download_dir.clear();
                     }
-                    if ui
-                        .button(format!("{}  Open Downloads folder", icon::FOLDER_OPEN))
-                        .clicked()
-                    {
+                    if settings_pill_btn(ui, "Open folder", Some(icon::FOLDER_OPEN)).clicked() {
                         let _ = std::fs::create_dir_all(&active_dir);
                         #[cfg(windows)]
                         let _ = std::process::Command::new("explorer").arg(&active_dir).spawn();
@@ -930,16 +1684,20 @@ impl YtApp {
                         let _ = std::process::Command::new("xdg-open").arg(&active_dir).spawn();
                     }
                 });
-            });
-
-            ui.add_space(12.0);
-            settings_card(ui, "Video Engine (libmpv)", |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Hardware decoding (hwdec)");
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let prev = self.hwdec_mode;
+            }
+            if m_hw {
+                if count > 0 {
+                    settings_divider(ui);
+                }
+                count += 1;
+                let prev = self.hwdec_mode;
+                settings_row(
+                    ui,
+                    "Hardware decoding (hwdec)",
+                    Some("Use GPU decoding when supported or fall back to CPU stability."),
+                    |ui| {
                         egui::ComboBox::from_id_salt("settings_hwdec")
-                            .width(300.0)
+                            .width(260.0)
                             .selected_text(self.hwdec_mode.label())
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(
@@ -953,193 +1711,112 @@ impl YtApp {
                                     HwdecMode::Software.label(),
                                 );
                             });
-                        if self.hwdec_mode != prev {
-                            if let Some(mpv) = &self.mpv {
-                                mpv.set_hwdec(self.hwdec_mode);
-                            }
-                            self.toast(format!("hwdec: {}", self.hwdec_mode.mpv_value()));
-                        }
-                    });
-                });
-                ui.add_space(8.0);
-                if let Some(mpv) = &self.mpv {
-                    ui.colored_label(
-                        Color32::from_rgb(110, 215, 135),
-                        format!("Active: {}", mpv.dll_path.display()),
-                    );
-                } else {
-                    ui.colored_label(
-                        Color32::from_rgb(255, 185, 85),
-                        "libmpv-2.dll is not installed yet.",
-                    );
-                    if let Some(err) = &self.mpv_error {
-                        ui.label(
-                            RichText::new(err)
-                                .font(theme::regular(12.0))
-                                .color(theme::TEXT_DIM),
-                        );
+                    },
+                );
+                if self.hwdec_mode != prev {
+                    if let Some(mpv) = &self.mpv {
+                        mpv.set_hwdec(self.hwdec_mode);
                     }
-                    ui.add_space(6.0);
-                    if self.downloading_mpv {
+                    self.toast(format!("hwdec: {}", self.hwdec_mode.mpv_value()));
+                }
+            }
+            if m_mpv {
+                if count > 0 {
+                    settings_divider(ui);
+                }
+                let status_desc = if let Some(mpv) = &self.mpv {
+                    format!("Active: {}", mpv.dll_path.display())
+                } else {
+                    self.mpv_error
+                        .as_deref()
+                        .unwrap_or("libmpv-2.dll is not installed yet.")
+                        .to_owned()
+                };
+                settings_row(ui, "libmpv Engine", Some(&status_desc), |ui| {
+                    if self.mpv.is_some() {
+                        ui.colored_label(Color32::from_rgb(110, 215, 135), "Ready");
+                    } else if self.downloading_mpv {
                         ui.spinner();
-                    } else if ui.button("Download libmpv-2.dll automatically").clicked() {
+                    } else if settings_pill_btn(ui, "Download libmpv-2.dll", Some(icon::DOWNLOAD))
+                        .clicked()
+                    {
                         self.downloading_mpv = true;
                         let _ = self.backend.tx.send(Request::DownloadLibmpv);
                     }
-                }
-            });
-
-            ui.add_space(12.0);
-            settings_card(ui, "Window & System Tray", |ui| {
-                let mut aot = self.always_on_top;
-                if ui
-                    .checkbox(&mut aot, "Keep window Always on Top")
-                    .changed()
-                {
-                    self.set_always_on_top(ui.ctx(), aot);
-                }
-                ui.checkbox(
-                    &mut self.close_to_tray,
-                    "Close button hides window to system tray (use tray menu -> Quit to exit)",
-                );
-                ui.checkbox(
-                    &mut self.minimize_to_tray,
-                    "Minimize button hides window to system tray",
-                );
-            });
-
-            ui.add_space(12.0);
-            settings_card(ui, "Subtitles & Player Appearance", |ui| {
-                ui.checkbox(
-                    &mut self.ambient_glow,
-                    "Ambient cinema glow behind video player",
-                );
-                ui.add_space(8.0);
-                let mut sub_changed = false;
-                ui.horizontal(|ui| {
-                    ui.label("Caption font size");
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!("{} px", self.sub_font_size))
-                                .font(theme::medium(13.0))
-                                .color(theme::TEXT_DIM),
-                        );
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut self.sub_font_size, 24..=80)
-                                    .show_value(false),
-                            )
-                            .changed()
-                        {
-                            sub_changed = true;
-                        }
-                    });
                 });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("Caption background opacity");
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let mut pct = (self.sub_bg_opacity * 100.0).round() as u32;
-                        ui.label(
-                            RichText::new(format!("{pct}%"))
-                                .font(theme::medium(13.0))
-                                .color(theme::TEXT_DIM),
-                        );
-                        if ui
-                            .add(egui::Slider::new(&mut pct, 0..=100).show_value(false))
-                            .changed()
-                        {
-                            self.sub_bg_opacity = pct as f32 / 100.0;
-                            sub_changed = true;
-                        }
-                    });
-                });
-                if sub_changed {
-                    if let Some(mpv) = &self.mpv {
-                        mpv.set_subtitle_style(self.sub_font_size, self.sub_bg_opacity);
-                    }
-                }
-            });
+            }
+        });
+        true
+    }
 
-            ui.add_space(12.0);
-            settings_card(ui, "Keyboard Shortcuts", |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Click any binding and press a new key combination (Esc cancels)")
-                            .font(theme::regular(12.5))
-                            .color(theme::TEXT_DIM),
+    fn draw_settings_connections_group(
+        &mut self,
+        ui: &mut egui::Ui,
+        group: &str,
+        words: &[String],
+    ) -> bool {
+        let m_sb = settings_match(
+            words,
+            group,
+            "SponsorBlock auto-skip sponsor intro outro interaction",
+        );
+        let m_da = settings_match(
+            words,
+            group,
+            "DeArrow clickbait titles thumbnails branding",
+        );
+        let m_ryd = settings_match(words, group, "Return YouTube Dislike counts RYD");
+        if !m_sb && !m_da && !m_ryd {
+            return false;
+        }
+        settings_group_frame(
+            ui,
+            group,
+            Some("Optional privacy-friendly third-party enhancements."),
+            |ui| {
+                let mut count = 0usize;
+                if m_sb {
+                    count += 1;
+                    settings_row(
+                        ui,
+                        "Auto-skip SponsorBlock segments",
+                        Some("Skip sponsored segments, intros, outros, and reminders automatically."),
+                        |ui| {
+                            settings_toggle(ui, &mut self.sponsorblock_enabled, "sb_enabled");
+                        },
                     );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Reset defaults").clicked() {
-                            self.shortcuts = crate::model::ShortcutConfig::default();
-                            self.rebinding_shortcut = None;
-                            self.toast("Keyboard shortcuts reset to defaults");
-                        }
-                    });
-                });
-                ui.add_space(8.0);
-                for slot in crate::model::ShortcutSlot::ALL {
-                    let listening = self.rebinding_shortcut == Some(*slot);
-                    ui.horizontal(|ui| {
-                        ui.label(slot.label());
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let label = if listening {
-                                "Press key...".to_owned()
-                            } else {
-                                self.shortcuts.get(*slot).display()
-                            };
-                            let btn = egui::Button::new(
-                                RichText::new(label)
-                                    .font(theme::medium(12.5))
-                                    .color(if listening {
-                                        Color32::WHITE
+                    if self.sponsorblock_enabled {
+                        ui.add_space(6.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+                            for &cat in crate::model::SponsorCategory::ALL {
+                                let mut on = self.sponsorblock_categories.contains(&cat);
+                                if ui.checkbox(&mut on, cat.label()).changed() {
+                                    if on {
+                                        self.sponsorblock_categories.insert(cat);
                                     } else {
-                                        theme::TEXT
-                                    }),
-                            )
-                            .min_size(Vec2::new(112.0, 26.0))
-                            .fill(if listening {
-                                theme::YT_BLUE
-                            } else {
-                                theme::CHIP
-                            })
-                            .corner_radius(6);
-                            if ui.add(btn).clicked() {
-                                self.rebinding_shortcut = if listening { None } else { Some(*slot) };
-                            }
-                        });
-                    });
-                    ui.add_space(4.0);
-                }
-            });
-
-            ui.add_space(12.0);
-            settings_card(ui, "Community Integrations (Optional)", |ui| {
-                ui.checkbox(&mut self.sponsorblock_enabled, "Auto-skip SponsorBlock segments");
-                if self.sponsorblock_enabled {
-                    ui.add_space(4.0);
-                    ui.horizontal_wrapped(|ui| {
-                        for &cat in crate::model::SponsorCategory::ALL {
-                            let mut on = self.sponsorblock_categories.contains(&cat);
-                            if ui.checkbox(&mut on, cat.label()).changed() {
-                                if on {
-                                    self.sponsorblock_categories.insert(cat);
-                                } else {
-                                    self.sponsorblock_categories.remove(&cat);
+                                        self.sponsorblock_categories.remove(&cat);
+                                    }
                                 }
                             }
-                        }
-                    });
+                        });
+                    }
                 }
-                ui.add_space(8.0);
-                if ui
-                    .checkbox(
-                        &mut self.dearrow_enabled,
-                        "DeArrow: Replace clickbait titles & thumbnails via crowd-sourced branding",
-                    )
-                    .changed()
-                {
-                    if self.dearrow_enabled {
+                if m_da {
+                    if count > 0 {
+                        settings_divider(ui);
+                    }
+                    count += 1;
+                    let mut changed = false;
+                    settings_row(
+                        ui,
+                        "DeArrow",
+                        Some("Replace clickbait video titles & thumbnails via crowd-sourced branding."),
+                        |ui| {
+                            changed = settings_toggle(ui, &mut self.dearrow_enabled, "dearrow");
+                        },
+                    );
+                    if changed && self.dearrow_enabled {
                         if let Some(w) = &self.watch {
                             if !w.id.starts_with("local:") {
                                 let _ = self.backend.tx.send(Request::LoadCommunityMeta {
@@ -1151,29 +1828,113 @@ impl YtApp {
                         }
                     }
                 }
-                if ui
-                    .checkbox(
-                        &mut self.ryd_enabled,
-                        "Return YouTube Dislike: Show estimated dislike counts beside Dislike button",
-                    )
-                    .changed()
-                {
-                    if self.ryd_enabled {
-                        if let Some(w) = &self.watch {
-                            if !w.id.starts_with("local:") {
-                                let _ = self.backend.tx.send(Request::LoadCommunityMeta {
-                                    video_id: w.id.clone(),
-                                    dearrow: false,
-                                    ryd: true,
-                                });
+                if m_ryd {
+                    if count > 0 {
+                        settings_divider(ui);
+                    }
+                    let mut changed = false;
+                    settings_row(
+                        ui,
+                        "Return YouTube Dislike",
+                        Some("Show estimated dislike counts beside the Dislike button."),
+                        |ui| {
+                            changed = settings_toggle(ui, &mut self.ryd_enabled, "ryd");
+                        },
+                    );
+                    if changed {
+                        if self.ryd_enabled {
+                            if let Some(w) = &self.watch {
+                                if !w.id.starts_with("local:") {
+                                    let _ = self.backend.tx.send(Request::LoadCommunityMeta {
+                                        video_id: w.id.clone(),
+                                        dearrow: false,
+                                        ryd: true,
+                                    });
+                                }
                             }
+                        } else if let Some(w) = &mut self.watch {
+                            w.dislikes_text = None;
                         }
-                    } else if let Some(w) = &mut self.watch {
-                        w.dislikes_text = None;
                     }
                 }
-            });
-        });
+            },
+        );
+        true
+    }
+
+    fn draw_settings_shortcuts_group(
+        &mut self,
+        ui: &mut egui::Ui,
+        group: &str,
+        words: &[String],
+    ) -> bool {
+        let slots: Vec<crate::model::ShortcutSlot> = crate::model::ShortcutSlot::ALL
+            .iter()
+            .copied()
+            .filter(|slot| {
+                let hay = format!(
+                    "{} {}",
+                    slot.label(),
+                    self.shortcuts.get(*slot).display()
+                );
+                settings_match(words, group, &hay)
+            })
+            .collect();
+        if slots.is_empty() {
+            return false;
+        }
+        settings_group_frame(
+            ui,
+            group,
+            Some("Click any shortcut pill and press a key combination (Esc cancels)."),
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if settings_pill_btn(ui, "Reset defaults", None).clicked() {
+                            self.shortcuts = crate::model::ShortcutConfig::default();
+                            self.rebinding_shortcut = None;
+                            self.toast("Keyboard shortcuts reset to defaults");
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                for (idx, slot) in slots.into_iter().enumerate() {
+                    if idx > 0 {
+                        settings_divider(ui);
+                    }
+                    let listening = self.rebinding_shortcut == Some(slot);
+                    settings_row(ui, slot.label(), None, |ui| {
+                        let label = if listening {
+                            "Press key...".to_owned()
+                        } else {
+                            self.shortcuts.get(slot).display()
+                        };
+                        let btn = egui::Button::new(
+                            RichText::new(label)
+                                .font(theme::medium(12.5))
+                                .color(if listening {
+                                    Color32::WHITE
+                                } else {
+                                    theme::TEXT
+                                }),
+                        )
+                        .min_size(Vec2::new(112.0, 28.0))
+                        .fill(if listening {
+                            theme::YT_BLUE
+                        } else if theme::is_translucent() {
+                            Color32::from_rgba_unmultiplied(255, 255, 255, 22)
+                        } else {
+                            theme::CHIP
+                        })
+                        .corner_radius(8);
+                        if ui.add(btn).clicked() {
+                            self.rebinding_shortcut = if listening { None } else { Some(slot) };
+                        }
+                    });
+                }
+            },
+        );
+        true
     }
 
     pub(super) fn draw_downloads_page(&mut self, ui: &mut egui::Ui) {
@@ -1947,5 +2708,156 @@ impl YtApp {
                 }
             });
         }
+    }
+}
+
+fn settings_match(words: &[String], group: &str, text: &str) -> bool {
+    if words.is_empty() {
+        return true;
+    }
+    let hay = format!("{} {}", group.to_ascii_lowercase(), text.to_ascii_lowercase());
+    words.iter().all(|w| hay.contains(w.as_str()))
+}
+
+fn settings_group_frame(
+    ui: &mut egui::Ui,
+    title: &str,
+    subtitle: Option<&str>,
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    ui.label(
+        RichText::new(title)
+            .font(theme::semibold(15.5))
+            .color(Color32::WHITE),
+    );
+    if let Some(sub) = subtitle {
+        ui.label(
+            RichText::new(sub)
+                .font(theme::regular(12.5))
+                .color(theme::TEXT_DIM),
+        );
+    }
+    ui.add_space(10.0);
+    Frame::new()
+        .fill(theme::card_fill())
+        .stroke(Stroke::new(1.0, theme::card_stroke()))
+        .corner_radius(14)
+        .inner_margin(Margin::symmetric(18, 14))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui);
+        });
+}
+
+fn settings_divider(ui: &mut egui::Ui) {
+    ui.add_space(10.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+    let line_col = if theme::is_translucent() {
+        Color32::from_white_alpha(22)
+    } else {
+        theme::BORDER
+    };
+    ui.painter().rect_filled(rect, 0.0, line_col);
+    ui.add_space(10.0);
+}
+
+fn settings_row(
+    ui: &mut egui::Ui,
+    title: &str,
+    desc: Option<&str>,
+    control: impl FnOnce(&mut egui::Ui),
+) {
+    let total_w = ui.available_width();
+    let label_w = (total_w - 230.0).max(160.0);
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            Vec2::new(label_w, 0.0),
+            Layout::top_down(Align::LEFT),
+            |ui| {
+                ui.label(
+                    RichText::new(title)
+                        .font(theme::medium(14.0))
+                        .color(Color32::WHITE),
+                );
+                if let Some(d) = desc {
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(d)
+                            .font(theme::regular(12.0))
+                            .color(theme::TEXT_DIM),
+                    );
+                }
+            },
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            control(ui);
+        });
+    });
+}
+
+fn settings_toggle(ui: &mut egui::Ui, value: &mut bool, id_salt: &str) -> bool {
+    let desired = Vec2::new(40.0, 22.0);
+    let (rect, resp) = ui.allocate_exact_size(desired, Sense::click());
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    let clicked = resp.clicked();
+    if clicked {
+        *value = !*value;
+    }
+    let t = ui.ctx().animate_bool_with_time(
+        egui::Id::unique(("settings_switch", id_salt)),
+        *value,
+        0.16,
+    );
+    let off_col = if theme::is_translucent() {
+        Color32::from_white_alpha(38)
+    } else {
+        theme::CHIP_HOVER
+    };
+    let on_col = theme::YT_BLUE;
+    let fill = Color32::from_rgb(
+        (off_col.r() as f32 + (on_col.r() as f32 - off_col.r() as f32) * t).round() as u8,
+        (off_col.g() as f32 + (on_col.g() as f32 - off_col.g() as f32) * t).round() as u8,
+        (off_col.b() as f32 + (on_col.b() as f32 - off_col.b() as f32) * t).round() as u8,
+    );
+    ui.painter().rect_filled(rect, 11.0, fill);
+    let knob_x = rect.left() + 11.0 + t * (rect.width() - 22.0);
+    ui.painter()
+        .circle_filled(pos2(knob_x, rect.center().y), 8.0, Color32::WHITE);
+    clicked
+}
+
+fn settings_pill_btn(ui: &mut egui::Ui, label: &str, ico: Option<char>) -> egui::Response {
+    let text = match ico {
+        Some(c) => format!("{c}  {label}"),
+        None => label.to_owned(),
+    };
+    let fill = if theme::is_translucent() {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 20)
+    } else {
+        theme::CHIP
+    };
+    ui.add(
+        egui::Button::new(RichText::new(text).font(theme::medium(12.5)).color(Color32::WHITE))
+            .fill(fill)
+            .stroke(Stroke::new(1.0, theme::card_stroke()))
+            .corner_radius(16)
+            .min_size(Vec2::new(86.0, 30.0)),
+    )
+    .on_hover_cursor(CursorIcon::PointingHand)
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::settings_match;
+
+    #[test]
+    fn settings_match_filters_by_group_and_row() {
+        let q = vec!["acrylic".to_owned()];
+        assert!(settings_match(&q, "Appearance", "Window material Acrylic Mica"));
+        assert!(!settings_match(&q, "Playback", "Preferred max quality"));
+
+        let q_group = vec!["playback".to_owned(), "token".to_owned()];
+        assert!(settings_match(&q_group, "Playback", "BotGuard PO Token"));
+        assert!(!settings_match(&q_group, "Appearance", "Ambient background"));
     }
 }

@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use egui::{
     Align, Align2, Color32, CornerRadius, CursorIcon, Frame, Layout, Margin, Rect, RichText,
-    ScrollArea, Sense, Stroke, Vec2, pos2, vec2,
+    ScrollArea, Sense, Stroke, Vec2, ViewportCommand, pos2, vec2,
 };
 
 use crate::backend::Request;
@@ -10,23 +10,23 @@ use crate::model::{LiveChatKind, LiveChatRun, SponsorCategory, VideoItem, WatchD
 use crate::theme::{self, icon};
 
 use super::cards::{
-    GridAction, draw_avatar, draw_thumbnail, draw_video_context_menu, icon_circle_button, join_meta,
+    GridAction, clamp_two_lines, draw_avatar, draw_members_badge, draw_thumbnail,
+    draw_video_context_menu, icon_circle_button, join_meta,
 };
-use super::{HudIcon, Page, PlayerMenu, RightTab, YtApp, format_duration};
+use super::{
+    HudIcon, Page, PlayerMenu, PlayerSlot, RightTab, SleepTimer, YtApp, format_duration,
+    parse_sleep_timer_input,
+};
 
 impl YtApp {
     pub(super) fn draw_watch_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if self.fullscreen {
             let avail = ui.available_size();
-            self.draw_video_surface(ui, ctx, avail, true);
+            self.draw_video_surface(ui, ctx, avail, true, false);
             return;
         }
 
-        if self.shorts_mode {
-            self.watch_scrolled_into_pip = false;
-            self.draw_shorts_player(ui, ctx);
-            return;
-        }
+        self.draw_player_tab_bar(ui);
 
         let wide = ui.available_width() >= 920.0 && !self.theater_mode;
         if wide {
@@ -55,7 +55,13 @@ impl YtApp {
                                     self.scroll_watch_to_top = true;
                                 }
                             } else {
-                                self.draw_video_surface(ui, ctx, Vec2::new(left_w, video_h), false);
+                                self.draw_video_surface(
+                                    ui,
+                                    ctx,
+                                    Vec2::new(left_w, video_h),
+                                    false,
+                                    false,
+                                );
                             }
                             ui.add_space(12.0);
                             self.draw_watch_metadata(ui);
@@ -107,7 +113,7 @@ impl YtApp {
                         self.scroll_watch_to_top = true;
                     }
                 } else {
-                    self.draw_video_surface(ui, ctx, Vec2::new(w, video_h), false);
+                    self.draw_video_surface(ui, ctx, Vec2::new(w, video_h), false, false);
                 }
                 ui.add_space(12.0);
                 self.draw_watch_metadata(ui);
@@ -131,11 +137,269 @@ impl YtApp {
         }
     }
 
-    fn draw_shorts_player(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let drawer_w = 360.0_f32;
-        let has_wide_info = ui.available_width() >= if self.shorts_comments_open { 1040.0 } else { 760.0 };
+    pub(super) fn draw_player_tab_bar(&mut self, ui: &mut egui::Ui) {
+        let has_active = self.watch.is_some() || self.watch_loading;
+        let has_bg = self.bg_player_tab.is_some();
+        if !has_active && !has_bg {
+            return;
+        }
+        let mut switch_tab = false;
+        let mut add_second_tab = false;
+        let mut close_idx: Option<usize> = None;
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            for tab_idx in 0..2 {
+                let is_active = self.active_player_tab == tab_idx;
+                if !is_active && self.bg_player_tab.is_none() {
+                    continue;
+                }
+                let tab_title: String = if is_active {
+                    self.watch
+                        .as_ref()
+                        .map(|w| w.title.clone())
+                        .unwrap_or_else(|| {
+                            if self.watch_loading {
+                                "Loading...".to_owned()
+                            } else {
+                                "Empty (picks open here)".to_owned()
+                            }
+                        })
+                } else if let Some(bg) = &self.bg_player_tab {
+                    bg.watch
+                        .as_ref()
+                        .map(|w| w.title.clone())
+                        .unwrap_or_else(|| {
+                            if bg.watch_loading {
+                                "Loading...".to_owned()
+                            } else {
+                                "Empty Tab".to_owned()
+                            }
+                        })
+                } else {
+                    continue;
+                };
+                let short_title: String = if tab_title.chars().count() > 26 {
+                    let s: String = tab_title.chars().take(25).collect();
+                    format!("{s}…")
+                } else {
+                    tab_title
+                };
+                let label_text = format!("Tab {}: {}", tab_idx + 1, short_title);
+
+                let (fill, stroke, text_col) = if is_active {
+                    (
+                        theme::CHIP_HOVER,
+                        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 45)),
+                        Color32::WHITE,
+                    )
+                } else {
+                    (
+                        theme::SURFACE,
+                        Stroke::new(1.0, theme::BORDER),
+                        theme::TEXT_DIM,
+                    )
+                };
+
+                Frame::new()
+                    .fill(fill)
+                    .stroke(stroke)
+                    .corner_radius(14)
+                    .inner_margin(Margin::symmetric(10, 4))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let btn = ui.add(
+                                egui::Button::new(
+                                    RichText::new(label_text)
+                                        .font(if is_active {
+                                            theme::semibold(12.0)
+                                        } else {
+                                            theme::medium(12.0)
+                                        })
+                                        .color(text_col),
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .frame(false),
+                            );
+                            if btn.hovered() {
+                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                            }
+                            if btn.clicked() && !is_active {
+                                switch_tab = true;
+                            }
+                            if !is_active {
+                                if let Some(bg) = &mut self.bg_player_tab {
+                                    if bg.watch.is_some() {
+                                        let p_ico = if bg.playback.paused {
+                                            icon::PLAY
+                                        } else {
+                                            icon::PAUSE
+                                        };
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new(p_ico.to_string())
+                                                        .font(theme::icon_font(12.0))
+                                                        .color(theme::TEXT),
+                                                )
+                                                .fill(Color32::TRANSPARENT)
+                                                .frame(false),
+                                            )
+                                            .on_hover_text("Play/Pause background tab")
+                                            .clicked()
+                                        {
+                                            if let Some(m) = &bg.mpv {
+                                                m.toggle_pause();
+                                            }
+                                        }
+                                        let m_ico = if bg.muted {
+                                            icon::VOLUME_X
+                                        } else {
+                                            icon::VOLUME_2
+                                        };
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new(m_ico.to_string())
+                                                        .font(theme::icon_font(12.0))
+                                                        .color(if bg.muted {
+                                                            theme::YT_RED
+                                                        } else {
+                                                            theme::TEXT_DIM
+                                                        }),
+                                                )
+                                                .fill(Color32::TRANSPARENT)
+                                                .frame(false),
+                                            )
+                                            .on_hover_text("Mute/Unmute background tab")
+                                            .clicked()
+                                        {
+                                            bg.muted = !bg.muted;
+                                            if let Some(m) = &bg.mpv {
+                                                m.set_mute(bg.muted);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if self.bg_player_tab.is_some()
+                                && ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new(icon::X.to_string())
+                                                .font(theme::icon_font(11.0))
+                                                .color(theme::TEXT_DIM),
+                                        )
+                                        .fill(Color32::TRANSPARENT)
+                                        .frame(false),
+                                    )
+                                    .on_hover_text("Close tab")
+                                    .clicked()
+                            {
+                                close_idx = Some(tab_idx);
+                            }
+                        });
+                    });
+            }
+
+            if self.bg_player_tab.is_none() && has_active {
+                let plus = ui.add(
+                    egui::Button::new(
+                        RichText::new("+ 2nd Tab")
+                            .font(theme::medium(11.5))
+                            .color(theme::TEXT_DIM),
+                    )
+                    .fill(theme::SURFACE)
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(14),
+                );
+                if plus.hovered() {
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                }
+                if plus
+                    .on_hover_text("Open a 2nd player tab (or middle-click any video card) to play two videos/podcasts simultaneously")
+                    .clicked()
+                {
+                    add_second_tab = true;
+                }
+            }
+        });
+        ui.add_space(6.0);
+
+        if let Some(ci) = close_idx {
+            self.close_player_tab(ci == self.active_player_tab);
+        } else if switch_tab {
+            self.switch_player_tab();
+        } else if add_second_tab {
+            let mut slot = Box::new(PlayerSlot::new(1.0));
+            slot.ensure_mpv(
+                &self.backend.data_dir,
+                &self.get_proc_address,
+                ui.ctx(),
+                self.volume,
+                self.hwdec_mode,
+                self.sub_font_size,
+                self.sub_bg_opacity,
+            );
+            self.swap_active_with(&mut slot);
+            self.bg_player_tab = Some(slot);
+            self.active_player_tab = 1 - self.active_player_tab;
+            self.watch = None;
+            self.active_watch_id = None;
+            self.watch_loading = false;
+            self.toast("2nd player tab ready — pick any video to play here");
+        }
+    }
+
+    pub(super) fn draw_shorts_player(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let resume_video_title = self
+            .watch
+            .as_ref()
+            .map(|w| w.title.clone())
+            .or_else(|| {
+                self.bg_player_tab
+                    .as_ref()
+                    .and_then(|b| b.watch.as_ref().map(|w| w.title.clone()))
+            });
+
+        let mut slot = Box::new(PlayerSlot::new(1.0));
+        std::mem::swap(&mut self.shorts_slot, &mut slot);
+        self.swap_active_with(&mut slot);
+        let action = self.draw_shorts_player_inner(ui, ctx, resume_video_title.as_deref());
+        self.swap_active_with(&mut slot);
+        std::mem::swap(&mut self.shorts_slot, &mut slot);
+
+        match action {
+            ShortsUiAction::None => {}
+            ShortsUiAction::Step(delta) => self.step_short(delta),
+            ShortsUiAction::ReturnToVideo => self.return_from_shorts_to_video(),
+            ShortsUiAction::GridView => {
+                if let Some(m) = &self.shorts_slot.mpv {
+                    m.set_paused(true);
+                }
+                self.shorts_grid_view = true;
+            }
+            ShortsUiAction::OpenChannel(cid, name) => {
+                if let Some(m) = &self.shorts_slot.mpv {
+                    m.set_paused(true);
+                }
+                self.open_channel(cid, name);
+            }
+        }
+    }
+
+    fn draw_shorts_player_inner(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        resume_video_title: Option<&str>,
+    ) -> ShortsUiAction {
+        let drawer_w = 370.0_f32;
+        let has_wide_info =
+            ui.available_width() >= if self.shorts_comments_open { 1040.0 } else { 760.0 };
         let info_w = if has_wide_info {
-            (ui.available_width() * 0.22).clamp(200.0, 280.0)
+            (ui.available_width() * 0.23).clamp(215.0, 290.0)
         } else {
             0.0
         };
@@ -144,31 +408,55 @@ impl YtApp {
         } else {
             0.0
         };
-        let height_reserve = if has_wide_info { 60.0 } else { 142.0 };
+        let height_reserve = if has_wide_info { 62.0 } else { 150.0 };
         let sh = (ui.available_height() - height_reserve).clamp(360.0, 820.0);
-        let sw = (sh * 9.0 / 16.0).min(
-            (ui.available_width() - 160.0 - info_w - comments_reserve).max(220.0),
-        );
-        let mut step_delta: isize = 0;
+        let sw = (sh * 9.0 / 16.0)
+            .min((ui.available_width() - 160.0 - info_w - comments_reserve).max(220.0));
+        let mut action = ShortsUiAction::None;
 
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
+                if let Some(vtitle) = resume_video_title {
+                    let short_v: String = if vtitle.chars().count() > 28 {
+                        let s: String = vtitle.chars().take(27).collect();
+                        format!("{s}…")
+                    } else {
+                        vtitle.to_owned()
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(format!(
+                                    "{}  Back to video: {short_v}",
+                                    icon::CHEVRON_LEFT
+                                ))
+                                .font(theme::medium(12.5))
+                                .color(theme::TEXT),
+                            )
+                            .fill(theme::CHIP)
+                            .corner_radius(16),
+                        )
+                        .on_hover_text("Return to your regular video player")
+                        .clicked()
+                    {
+                        action = ShortsUiAction::ReturnToVideo;
+                    }
+                    ui.add_space(6.0);
+                }
                 if ui
                     .add(
                         egui::Button::new(
-                            RichText::new(format!("{}  Standard Player", icon::CHEVRON_LEFT))
-                                .font(theme::medium(12.5))
-                                .color(theme::TEXT),
+                            RichText::new("Grid View")
+                                .font(theme::medium(12.0))
+                                .color(theme::TEXT_DIM),
                         )
-                        .fill(theme::CHIP)
+                        .fill(theme::SURFACE)
+                        .stroke(Stroke::new(1.0, theme::BORDER))
                         .corner_radius(16),
                     )
                     .clicked()
                 {
-                    self.shorts_mode = false;
-                    if let Some(mpv) = &self.mpv {
-                        mpv.set_loop_file(false);
-                    }
+                    action = ShortsUiAction::GridView;
                 }
                 ui.add_space(10.0);
                 let (irec, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
@@ -203,51 +491,12 @@ impl YtApp {
                 if has_wide_info {
                     ui.allocate_ui_with_layout(
                         Vec2::new(info_w, sh),
-                        Layout::top_down(Align::LEFT),
+                        Layout::bottom_up(Align::LEFT),
                         |ui| {
                             if let Some(w) = self.watch.clone() {
-                                ui.add_space((sh - 134.0).max(8.0));
-                                if let Some(cid) = w.channel_id.clone() {
-                                    ui.horizontal(|ui| {
-                                        draw_avatar(
-                                            ui,
-                                            w.channel_avatar_url.as_deref(),
-                                            &w.channel,
-                                            32.0,
-                                        );
-                                        ui.add_space(6.0);
-                                        let ch_btn = ui.add(
-                                            egui::Label::new(
-                                                RichText::new(&w.channel)
-                                                    .font(theme::semibold(13.5))
-                                                    .color(theme::TEXT),
-                                            )
-                                            .truncate()
-                                            .sense(Sense::click()),
-                                        );
-                                        if ch_btn.hovered() {
-                                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                                        }
-                                        if ch_btn.clicked() {
-                                            self.open_channel(cid.clone(), w.channel.clone());
-                                        }
-                                    });
-                                    ui.add_space(6.0);
-                                    super::cards::draw_subscribe_bell_button(
-                                        ui,
-                                        cid,
-                                        w.is_subscribed,
-                                        &w.notifications,
-                                        &self.backend.tx,
-                                    );
-                                    ui.add_space(8.0);
-                                }
-                                let title_display = clamp_two_lines(
-                                    ui,
-                                    &w.title,
-                                    theme::semibold(14.5),
-                                    info_w,
-                                );
+                                ui.add_space(8.0);
+                                let title_display =
+                                    clamp_two_lines(ui, &w.title, theme::semibold(14.5), info_w);
                                 ui.add(
                                     egui::Label::new(
                                         RichText::new(title_display)
@@ -257,6 +506,68 @@ impl YtApp {
                                     .wrap(),
                                 )
                                 .on_hover_text(&w.title);
+
+                                if w.is_members_only {
+                                    ui.add_space(6.0);
+                                    draw_members_badge(ui);
+                                }
+
+                                if let Some(cid) = w.channel_id.clone() {
+                                    ui.add_space(6.0);
+                                    super::cards::draw_subscribe_bell_button(
+                                        ui,
+                                        cid.clone(),
+                                        w.is_subscribed,
+                                        &w.notifications,
+                                        &self.backend.tx,
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        draw_avatar(
+                                            ui,
+                                            w.channel_avatar_url.as_deref(),
+                                            &w.channel,
+                                            32.0,
+                                        );
+                                        ui.add_space(8.0);
+                                        let name_max_w = (info_w - 42.0).max(90.0);
+                                        let ch_display = clamp_two_lines(
+                                            ui,
+                                            &w.channel,
+                                            theme::semibold(13.5),
+                                            name_max_w,
+                                        );
+                                        ui.allocate_ui_with_layout(
+                                            Vec2::new(name_max_w, 34.0),
+                                            Layout::top_down(Align::LEFT),
+                                            |ui| {
+                                                let ch_btn = ui
+                                                    .add(
+                                                        egui::Label::new(
+                                                            RichText::new(ch_display)
+                                                                .font(theme::semibold(13.5))
+                                                                .color(theme::TEXT),
+                                                        )
+                                                        .wrap()
+                                                        .sense(Sense::click()),
+                                                    )
+                                                    .on_hover_text(&w.channel);
+                                                if ch_btn.hovered() {
+                                                    ui.ctx()
+                                                        .set_cursor_icon(CursorIcon::PointingHand);
+                                                }
+                                                if ch_btn.clicked() {
+                                                    action = ShortsUiAction::OpenChannel(
+                                                        cid.clone(),
+                                                        w.channel.clone(),
+                                                    );
+                                                }
+                                            },
+                                        );
+                                    });
+                                }
+                            } else if self.watch_loading {
+                                ui.spinner();
                             }
                         },
                     );
@@ -264,14 +575,14 @@ impl YtApp {
                 }
 
                 let player_rect_before = ui.cursor();
-                self.draw_video_surface(ui, ctx, Vec2::new(sw, sh), false);
+                self.draw_video_surface(ui, ctx, Vec2::new(sw, sh), false, true);
                 let scroll_rect = Rect::from_min_size(player_rect_before.min, Vec2::new(sw, sh));
                 if ui.rect_contains_pointer(scroll_rect) {
                     let wy = ctx.input(|i| i.smooth_scroll_delta.y);
                     if wy > 28.0 {
-                        step_delta = -1;
+                        action = ShortsUiAction::Step(-1);
                     } else if wy < -28.0 {
-                        step_delta = 1;
+                        action = ShortsUiAction::Step(1);
                     }
                 }
 
@@ -314,7 +625,11 @@ impl YtApp {
                             if shorts_rail_button(
                                 ui,
                                 dislike_lbl,
-                                if w.is_disliked { "Remove dislike" } else { "Dislike" },
+                                if w.is_disliked {
+                                    "Remove dislike"
+                                } else {
+                                    "Dislike"
+                                },
                                 w.is_disliked,
                                 |painter, c, col| {
                                     theme::draw_icon_centered(
@@ -402,33 +717,44 @@ impl YtApp {
                 if self.shorts_comments_open {
                     if let Some(w) = self.watch.clone() {
                         ui.add_space(14.0);
-                        Frame::new()
-                            .fill(theme::SURFACE)
-                            .stroke(Stroke::new(1.0, theme::BORDER))
-                            .corner_radius(12)
-                            .inner_margin(Margin::same(12))
-                            .show(ui, |ui| {
-                                ui.set_width((drawer_w - 24.0).max(120.0));
-                                ui.set_height((sh - 24.0).max(180.0));
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new("Comments")
-                                            .font(theme::semibold(15.0))
-                                            .color(theme::TEXT),
-                                    );
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        if icon_circle_button(ui, icon::X, 15.0, "Close comments") {
-                                            self.shorts_comments_open = false;
-                                        }
-                                    });
-                                });
-                                ui.add_space(6.0);
-                                ScrollArea::vertical()
-                                    .id_salt("shorts_comments_drawer")
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(drawer_w, sh),
+                            Layout::top_down(Align::LEFT),
+                            |ui| {
+                                Frame::new()
+                                    .fill(theme::SURFACE)
+                                    .stroke(Stroke::new(1.0, theme::BORDER))
+                                    .corner_radius(14)
+                                    .inner_margin(Margin::same(12))
                                     .show(ui, |ui| {
-                                        self.draw_comments(ui, &w);
+                                        let inner_w = (drawer_w - 24.0).max(160.0);
+                                        let inner_h = (sh - 24.0).max(200.0);
+                                        ui.set_width(inner_w);
+                                        ui.set_height(inner_h);
+                                        ui.vertical(|ui| {
+                                            self.draw_comments_header(ui, &w, true);
+                                            ui.separator();
+                                            ui.add_space(4.0);
+                                            let has_composer = self.signed_in
+                                                && self.comment_create_params.is_some();
+                                            let composer_h = if has_composer { 46.0 } else { 0.0 };
+                                            let list_h = (inner_h - 46.0 - composer_h).max(80.0);
+                                            ScrollArea::vertical()
+                                                .id_salt("shorts_comments_drawer")
+                                                .max_height(list_h)
+                                                .show(ui, |ui| {
+                                                    ui.set_width(inner_w - 6.0);
+                                                    self.draw_comments_list(ui, &w);
+                                                });
+                                            if has_composer {
+                                                ui.separator();
+                                                ui.add_space(4.0);
+                                                self.draw_comment_composer(ui, &w);
+                                            }
+                                        });
                                     });
-                            });
+                            },
+                        );
                     }
                 }
 
@@ -449,7 +775,7 @@ impl YtApp {
                         if can_prev
                             && shorts_nav_circle(ui, icon::CHEVRON_UP, "Previous Short (Up)")
                         {
-                            step_delta = -1;
+                            action = ShortsUiAction::Step(-1);
                         }
                         if can_prev && can_next {
                             ui.add_space(12.0);
@@ -457,7 +783,7 @@ impl YtApp {
                         if can_next
                             && shorts_nav_circle(ui, icon::CHEVRON_DOWN, "Next Short (Down)")
                         {
-                            step_delta = 1;
+                            action = ShortsUiAction::Step(1);
                         }
                     },
                 );
@@ -466,8 +792,12 @@ impl YtApp {
             if !has_wide_info {
                 if let Some(w) = self.watch.clone() {
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.add_space(side_pad);
+                        if w.is_members_only {
+                            draw_members_badge(ui);
+                            ui.add_space(6.0);
+                        }
                         if let Some(cid) = w.channel_id.clone() {
                             draw_avatar(ui, w.channel_avatar_url.as_deref(), &w.channel, 28.0);
                             ui.add_space(4.0);
@@ -480,9 +810,11 @@ impl YtApp {
                                     )
                                     .fill(Color32::TRANSPARENT),
                                 )
+                                .on_hover_text(&w.channel)
                                 .clicked()
                             {
-                                self.open_channel(cid.clone(), w.channel.clone());
+                                action =
+                                    ShortsUiAction::OpenChannel(cid.clone(), w.channel.clone());
                             }
                             super::cards::draw_subscribe_bell_button(
                                 ui,
@@ -505,15 +837,14 @@ impl YtApp {
                             ))
                             .font(theme::semibold(13.5))
                             .color(theme::TEXT),
-                        );
+                        )
+                        .on_hover_text(&w.title);
                     });
                 }
             }
         });
 
-        if step_delta != 0 {
-            self.step_short(step_delta);
-        }
+        action
     }
 
     fn draw_video_surface(
@@ -522,6 +853,7 @@ impl YtApp {
         ctx: &egui::Context,
         size: Vec2,
         is_fullscreen: bool,
+        is_shorts: bool,
     ) {
         let radius = if is_fullscreen || self.theater_mode {
             0.0
@@ -696,7 +1028,8 @@ impl YtApp {
                 Color32::TRANSPARENT,
                 Color32::from_black_alpha((220.0 * overlay_alpha).round() as u8),
             );
-            let (interacted, toggled) = self.draw_overlaid_controls(ui, ctx, rect, overlay_alpha);
+            let (interacted, toggled) =
+                self.draw_overlaid_controls(ui, ctx, rect, overlay_alpha, is_shorts);
             clicked_overlay = interacted;
             toggled_menu = toggled;
         }
@@ -707,7 +1040,7 @@ impl YtApp {
 
         // Video surface click (toggle pause) & double click (fullscreen), ignoring control hits
         if !pointer_in_controls && !clicked_overlay && !popup_hit {
-            if resp.double_clicked() {
+            if !is_shorts && resp.double_clicked() {
                 self.toggle_fullscreen(ctx);
                 self.last_pointer_move = Instant::now();
             } else if resp.clicked() {
@@ -736,6 +1069,7 @@ impl YtApp {
         ctx: &egui::Context,
         video_rect: Rect,
         alpha: f32,
+        is_shorts: bool,
     ) -> (bool, bool) {
         let mut any_interacted = false;
         let mut toggled_menu = false;
@@ -973,7 +1307,7 @@ impl YtApp {
         cui.add_space(4.0);
         let row_w = cui.available_width();
         let (row_rect, _) = cui.allocate_exact_size(Vec2::new(row_w, 38.0), Sense::hover());
-        let right_w = if self.shorts_mode && !self.fullscreen {
+        let right_w = if is_shorts && !self.fullscreen {
             82.0_f32.min(row_w * 0.35)
         } else {
             240.0_f32.min(row_w * 0.45)
@@ -1017,7 +1351,7 @@ impl YtApp {
                 }
             }
 
-            if !self.shorts_mode {
+            if !is_shorts {
                 let next_item = self
                     .queue
                     .first()
@@ -1242,8 +1576,22 @@ impl YtApp {
                 self.toggle_fullscreen(ctx);
             }
 
+            // Windows PiP (borderless always-on-top video-only window)
+            if !is_shorts {
+                let (pip_rect, pip_resp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
+                paint_hover_circle(ui, pip_rect, &pip_resp, alpha);
+                draw_win_pip_icon(ui.painter(), pip_rect.center(), 16.0, white);
+                if pip_resp
+                    .on_hover_text("Windows PiP (float video-only window)")
+                    .clicked()
+                {
+                    any_interacted = true;
+                    self.toggle_win_pip(ctx);
+                }
+            }
+
             // Theater mode (hidden in fullscreen and Shorts mode)
-            if !self.fullscreen && !self.shorts_mode {
+            if !self.fullscreen && !is_shorts {
                 let (th_rect, th_resp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
                 paint_hover_circle(ui, th_rect, &th_resp, alpha);
                 theme::draw_theater_icon(
@@ -1257,6 +1605,46 @@ impl YtApp {
                     any_interacted = true;
                     self.theater_mode = !self.theater_mode;
                 }
+            }
+
+            // Sleep timer quick toggle button
+            let sleep_active = self.sleep_timer != SleepTimer::Off;
+            let (sl_rect, sl_resp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
+            paint_hover_circle(ui, sl_rect, &sl_resp, alpha);
+            theme::draw_sleep_timer_icon(
+                ui.ctx(),
+                ui.painter(),
+                sl_rect.center(),
+                17.0,
+                if sleep_active || self.player_menu == PlayerMenu::SleepTimer {
+                    theme::YT_BLUE.gamma_multiply(alpha)
+                } else {
+                    white
+                },
+            );
+            if sleep_active {
+                let dot_r = Rect::from_min_size(
+                    pos2(sl_rect.right() - 10.0, sl_rect.top() + 6.0),
+                    vec2(6.0, 6.0),
+                );
+                ui.painter().circle_filled(
+                    dot_r.center(),
+                    3.0,
+                    theme::YT_BLUE.gamma_multiply(alpha),
+                );
+            }
+            let sleep_tip = match self.sleep_timer_remaining_label() {
+                Some(rem) => format!("Sleep timer: {rem}"),
+                None => "Sleep timer".to_owned(),
+            };
+            if sl_resp.on_hover_text(sleep_tip).clicked() {
+                any_interacted = true;
+                toggled_menu = true;
+                self.player_menu = if self.player_menu == PlayerMenu::SleepTimer {
+                    PlayerMenu::None
+                } else {
+                    PlayerMenu::SleepTimer
+                };
             }
 
             // Settings Gear button (opens speed, quality, audio track, stats for nerds)
@@ -1308,7 +1696,7 @@ impl YtApp {
             }
 
             // Captions (CC) button (hidden in compact Shorts bar unless active)
-            let has_cc = !self.shorts_mode
+            let has_cc = !is_shorts
                 && self
                     .watch
                     .as_ref()
@@ -1350,7 +1738,7 @@ impl YtApp {
                 }
             }
 
-            if !self.shorts_mode {
+            if !is_shorts {
                 // YouTube-style Autoplay pill switch
                 let (ap_rect, ap_resp) =
                     ui.allocate_exact_size(Vec2::new(34.0, 24.0), Sense::click());
@@ -1567,6 +1955,18 @@ impl YtApp {
                                 ui.add_space(6.0);
                                 ui.separator();
                                 ui.add_space(4.0);
+                                let sleep_row_label = match self.sleep_timer_remaining_label() {
+                                    Some(rem) => format!("Sleep timer · {rem}"),
+                                    None => "Sleep timer · Off".to_owned(),
+                                };
+                                if popover_option_row(
+                                    ui,
+                                    &sleep_row_label,
+                                    self.sleep_timer != SleepTimer::Off,
+                                ) {
+                                    self.player_menu = PlayerMenu::SleepTimer;
+                                    interacted = true;
+                                }
                                 if popover_option_row(
                                     ui,
                                     "Ambient cinema glow",
@@ -1684,6 +2084,158 @@ impl YtApp {
                                             self.sub_bg_opacity,
                                         );
                                     }
+                                }
+                            }
+                            PlayerMenu::SleepTimer => {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("Sleep timer")
+                                            .font(theme::semibold(13.5))
+                                            .color(Color32::WHITE),
+                                    );
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if popover_close_btn(ui) {
+                                            self.player_menu = PlayerMenu::None;
+                                        }
+                                    });
+                                });
+                                if let Some(rem) = self.sleep_timer_remaining_label() {
+                                    ui.add_space(6.0);
+                                    Frame::new()
+                                        .fill(Color32::from_rgba_unmultiplied(62, 166, 255, 28))
+                                        .stroke(Stroke::new(1.0, theme::YT_BLUE.gamma_multiply(0.5)))
+                                        .corner_radius(8)
+                                        .inner_margin(Margin::symmetric(8, 6))
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    RichText::new(format!("Active: {rem}"))
+                                                        .font(theme::medium(12.0))
+                                                        .color(theme::YT_BLUE),
+                                                );
+                                                ui.with_layout(
+                                                    Layout::right_to_left(Align::Center),
+                                                    |ui| {
+                                                        if ui.small_button("Turn off").clicked() {
+                                                            self.sleep_timer = SleepTimer::Off;
+                                                            self.toast("Sleep timer turned off");
+                                                            interacted = true;
+                                                        }
+                                                    },
+                                                );
+                                            });
+                                        });
+                                }
+                                ui.add_space(6.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing = vec2(5.0, 5.0);
+                                    let presets: [(&str, Option<u64>); 7] = [
+                                        ("Off", None),
+                                        ("10 min", Some(10)),
+                                        ("15 min", Some(15)),
+                                        ("20 min", Some(20)),
+                                        ("30 min", Some(30)),
+                                        ("45 min", Some(45)),
+                                        ("60 min", Some(60)),
+                                    ];
+                                    for (lbl, mins_opt) in presets {
+                                        let active = match (mins_opt, &self.sleep_timer) {
+                                            (None, SleepTimer::Off) => true,
+                                            _ => false,
+                                        };
+                                        let btn = egui::Button::new(
+                                            RichText::new(lbl)
+                                                .font(theme::medium(11.5))
+                                                .color(if active {
+                                                    Color32::from_rgb(15, 15, 15)
+                                                } else {
+                                                    theme::TEXT
+                                                }),
+                                        )
+                                        .min_size(vec2(54.0, 26.0))
+                                        .fill(if active {
+                                            Color32::from_rgb(241, 241, 241)
+                                        } else {
+                                            theme::CHIP
+                                        })
+                                        .corner_radius(7);
+                                        if ui.add(btn).clicked() {
+                                            if let Some(m) = mins_opt {
+                                                self.sleep_timer = SleepTimer::Until(
+                                                    Instant::now() + Duration::from_secs(m * 60),
+                                                );
+                                                self.toast(format!("Sleep timer: {m} min"));
+                                            } else {
+                                                self.sleep_timer = SleepTimer::Off;
+                                                self.toast("Sleep timer turned off");
+                                            }
+                                            self.player_menu = PlayerMenu::None;
+                                            interacted = true;
+                                        }
+                                    }
+                                });
+                                ui.add_space(4.0);
+                                if popover_option_row(
+                                    ui,
+                                    "End of video",
+                                    self.sleep_timer == SleepTimer::EndOfVideo,
+                                ) {
+                                    self.sleep_timer = SleepTimer::EndOfVideo;
+                                    self.player_menu = PlayerMenu::None;
+                                    self.toast("Sleep timer: End of video");
+                                    interacted = true;
+                                }
+                                ui.add_space(6.0);
+                                ui.separator();
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new("Custom timer (e.g. 2h, 1:30, 90, 2 jam)")
+                                        .font(theme::medium(11.5))
+                                        .color(theme::TEXT_DIM),
+                                );
+                                ui.add_space(4.0);
+                                let mut submit_custom = false;
+                                ui.horizontal(|ui| {
+                                    let edit = ui.add_sized(
+                                        [172.0, 28.0],
+                                        egui::TextEdit::singleline(&mut self.sleep_timer_input)
+                                            .hint_text("2h / 90m / 1:30"),
+                                    );
+                                    if edit.has_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                    {
+                                        submit_custom = true;
+                                    }
+                                    if ui
+                                        .add_sized(
+                                            [68.0, 28.0],
+                                            egui::Button::new(
+                                                RichText::new("Set")
+                                                    .font(theme::semibold(12.0))
+                                                    .color(Color32::from_rgb(15, 15, 15)),
+                                            )
+                                            .fill(theme::YT_BLUE)
+                                            .corner_radius(7),
+                                        )
+                                        .clicked()
+                                    {
+                                        submit_custom = true;
+                                    }
+                                });
+                                if submit_custom {
+                                    if let Some(dur) = parse_sleep_timer_input(&self.sleep_timer_input)
+                                    {
+                                        self.sleep_timer =
+                                            SleepTimer::Until(Instant::now() + dur);
+                                        self.player_menu = PlayerMenu::None;
+                                        self.toast(format!(
+                                            "Sleep timer set for {}",
+                                            format_duration(dur.as_secs_f64())
+                                        ));
+                                    } else {
+                                        self.toast("Invalid duration (try 2h, 1:30, 90)");
+                                    }
+                                    interacted = true;
                                 }
                             }
                             PlayerMenu::None => {}
@@ -1884,10 +2436,58 @@ impl YtApp {
         let Some(w) = self.watch.clone() else {
             if self.watch_loading {
                 ui.spinner();
+            } else if let Some(bg) = &self.bg_player_tab {
+                if let Some(bg_w) = &bg.watch {
+                    Frame::new()
+                        .fill(theme::SURFACE)
+                        .stroke(Stroke::new(1.0, theme::BORDER))
+                        .corner_radius(12)
+                        .inner_margin(Margin::same(16))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("Tab ready — pick a video to play here")
+                                    .font(theme::semibold(16.0))
+                                    .color(theme::TEXT),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(format!(
+                                    "\"{}\"{}. Pick any video from Home, Search, or middle-click a card to play alongside it.",
+                                    bg_w.title,
+                                    if bg.playback.paused {
+                                        " (paused in other tab)"
+                                    } else {
+                                        " is playing in the other tab"
+                                    }
+                                ))
+                                .font(theme::regular(13.0))
+                                .color(theme::TEXT_DIM),
+                            );
+                            ui.add_space(10.0);
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new("Browse Home (keep this tab active)")
+                                            .font(theme::semibold(12.5))
+                                            .color(Color32::from_rgb(15, 15, 15)),
+                                    )
+                                    .fill(theme::YT_BLUE)
+                                    .corner_radius(16),
+                                )
+                                .clicked()
+                            {
+                                self.page = Page::Home;
+                            }
+                        });
+                }
             }
             return;
         };
 
+        if w.is_members_only {
+            draw_members_badge(ui);
+            ui.add_space(6.0);
+        }
         ui.label(
             RichText::new(&w.title)
                 .font(theme::bold(20.0))
@@ -2051,8 +2651,20 @@ impl YtApp {
     }
 
     fn draw_comments(&mut self, ui: &mut egui::Ui, w: &crate::model::WatchData) {
+        self.draw_comments_header(ui, w, false);
+        ui.add_space(8.0);
+        self.draw_comment_composer(ui, w);
+        self.draw_comments_list(ui, w);
+    }
+
+    fn draw_comments_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        w: &crate::model::WatchData,
+        show_close_shorts: bool,
+    ) {
         let mut load_sort: Option<(usize, String)> = None;
-        let mut expand_replies: Option<(String, String)> = None;
+        let compact = show_close_shorts;
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(if self.comments.is_empty() {
@@ -2060,10 +2672,10 @@ impl YtApp {
                 } else {
                     format!("Comments ({})", self.comments.len())
                 })
-                .font(theme::semibold(16.0)),
+                .font(theme::semibold(if compact { 15.0 } else { 16.0 })),
             );
             if !self.comment_sort_options.is_empty() {
-                ui.add_space(12.0);
+                ui.add_space(8.0);
                 for (idx, (label, tok)) in self.comment_sort_options.iter().enumerate() {
                     let active = idx == self.selected_comment_sort;
                     let (fill, col) = if active {
@@ -2074,7 +2686,9 @@ impl YtApp {
                     if ui
                         .add(
                             egui::Button::new(
-                                RichText::new(label).font(theme::medium(12.0)).color(col),
+                                RichText::new(label)
+                                    .font(theme::medium(if compact { 11.5 } else { 12.0 }))
+                                    .color(col),
                             )
                             .fill(fill)
                             .corner_radius(8),
@@ -2087,8 +2701,15 @@ impl YtApp {
                 }
             }
             if self.comments_loading {
-                ui.add_space(8.0);
+                ui.add_space(6.0);
                 ui.spinner();
+            }
+            if show_close_shorts {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if icon_circle_button(ui, icon::X, 15.0, "Close comments") {
+                        self.shorts_comments_open = false;
+                    }
+                });
             }
         });
         if let Some((idx, tok)) = load_sort {
@@ -2102,51 +2723,57 @@ impl YtApp {
                 append: false,
             });
         }
-        ui.add_space(8.0);
+    }
 
-        if self.signed_in {
-            if let Some(params) = self.comment_create_params.clone() {
-                ui.horizontal(|ui| {
-                    let input_w = (ui.available_width() - 96.0).max(160.0);
-                    let te = ui.add_sized(
-                        Vec2::new(input_w, 32.0),
-                        egui::TextEdit::singleline(&mut self.comment_draft)
-                            .hint_text("Add a comment..."),
-                    );
-                    let submit = ui
-                        .add_sized(
-                            Vec2::new(84.0, 32.0),
-                            egui::Button::new(
-                                RichText::new("Comment")
-                                    .font(theme::semibold(12.5))
-                                    .color(Color32::from_rgb(15, 15, 15)),
-                            )
-                            .fill(theme::YT_BLUE)
-                            .corner_radius(16),
-                        )
-                        .clicked()
-                        || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                    if submit {
-                        let body = self.comment_draft.trim().to_owned();
-                        if !body.is_empty() {
-                            let reload_tok = self
-                                .comment_sort_options
-                                .get(self.selected_comment_sort)
-                                .map(|(_, t)| t.clone())
-                                .or_else(|| w.comments_token.clone());
-                            let _ = self.backend.tx.send(Request::PostComment {
-                                video_id: w.id.clone(),
-                                text: body,
-                                params,
-                                reload_continuation: reload_tok,
-                            });
-                            self.comment_draft.clear();
-                        }
-                    }
-                });
-                ui.add_space(10.0);
-            }
+    fn draw_comment_composer(&mut self, ui: &mut egui::Ui, w: &crate::model::WatchData) {
+        if !self.signed_in {
+            return;
         }
+        let Some(params) = self.comment_create_params.clone() else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            let input_w = (ui.available_width() - 92.0).max(120.0);
+            let te = ui.add_sized(
+                Vec2::new(input_w, 32.0),
+                egui::TextEdit::singleline(&mut self.comment_draft).hint_text("Add a comment..."),
+            );
+            let submit = ui
+                .add_sized(
+                    Vec2::new(82.0, 32.0),
+                    egui::Button::new(
+                        RichText::new("Comment")
+                            .font(theme::semibold(12.5))
+                            .color(Color32::from_rgb(15, 15, 15)),
+                    )
+                    .fill(theme::YT_BLUE)
+                    .corner_radius(16),
+                )
+                .clicked()
+                || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            if submit {
+                let body = self.comment_draft.trim().to_owned();
+                if !body.is_empty() {
+                    let reload_tok = self
+                        .comment_sort_options
+                        .get(self.selected_comment_sort)
+                        .map(|(_, t)| t.clone())
+                        .or_else(|| w.comments_token.clone());
+                    let _ = self.backend.tx.send(Request::PostComment {
+                        video_id: w.id.clone(),
+                        text: body,
+                        params,
+                        reload_continuation: reload_tok,
+                    });
+                    self.comment_draft.clear();
+                }
+            }
+        });
+        ui.add_space(6.0);
+    }
+
+    fn draw_comments_list(&mut self, ui: &mut egui::Ui, w: &crate::model::WatchData) {
+        let mut expand_replies: Option<(String, String)> = None;
 
         if self.comments.is_empty() && !self.comments_loading {
             if let Some(tok) = w.comments_token.clone() {
@@ -2693,6 +3320,8 @@ impl YtApp {
                         duration_text: format_duration(w.duration_secs),
                         thumbnail_url: format!("https://i.ytimg.com/vi/{}/mqdefault.jpg", w.id),
                         is_live: w.is_live,
+                        is_new: false,
+                        is_members_only: w.is_members_only,
                         watched_percent: None,
                         resume_secs: None,
                         playlist_browse_id: None,
@@ -3749,7 +4378,9 @@ impl YtApp {
                 } else {
                     row_resp
                 };
-                if row_hover_resp.clicked() && right_action.is_none() {
+                if row_hover_resp.middle_clicked() && right_action.is_none() {
+                    right_action = Some(GridAction::OpenInSecondTab(item));
+                } else if row_hover_resp.clicked() && right_action.is_none() {
                     right_action = Some(GridAction::Open(item));
                 }
                 ui.add_space(4.0);
@@ -3761,9 +4392,45 @@ impl YtApp {
     }
 
     pub(super) fn draw_mini_player(&mut self, ctx: &egui::Context) {
-        let Some(w) = self.watch.as_ref() else {
+        if self.watch.is_some() {
+            self.draw_mini_player_inner(ctx, false);
             return;
+        }
+        if self
+            .bg_player_tab
+            .as_ref()
+            .is_some_and(|b| b.watch.is_some())
+        {
+            if let Some(mut bg) = self.bg_player_tab.take() {
+                self.swap_active_with(&mut bg);
+                let action = self.draw_mini_player_inner(ctx, true);
+                self.swap_active_with(&mut bg);
+                self.bg_player_tab = Some(bg);
+                match action {
+                    MiniPlayerAction::Expand => {
+                        self.switch_player_tab();
+                        self.page = Page::Watch;
+                        self.watch_scrolled_into_pip = false;
+                        self.scroll_watch_to_top = true;
+                    }
+                    MiniPlayerAction::Close => {
+                        self.close_player_tab(false);
+                    }
+                    MiniPlayerAction::PopOutWinPip => {
+                        self.switch_player_tab();
+                        self.enter_win_pip(ctx);
+                    }
+                    MiniPlayerAction::None => {}
+                }
+            }
+        }
+    }
+
+    fn draw_mini_player_inner(&mut self, ctx: &egui::Context, previewing_bg: bool) -> MiniPlayerAction {
+        let Some(w) = self.watch.as_ref() else {
+            return MiniPlayerAction::None;
         };
+        let mut mini_action = MiniPlayerAction::None;
         let title = w.title.clone();
         let channel = w.channel.clone();
         let dur = self.playback.duration.max(w.duration_secs).max(0.0);
@@ -3828,10 +4495,35 @@ impl YtApp {
                         // Round top corners cleanly over the OpenGL blit using corner masks matching Frame fill
                         paint_rounded_top_corners_mask(ui.painter(), vrect, 11.0, theme::SURFACE);
 
+                        if self.bg_player_tab.is_some() || previewing_bg {
+                            let tab_num = if previewing_bg {
+                                (1 - self.active_player_tab) + 1
+                            } else {
+                                self.active_player_tab + 1
+                            };
+                            let chip_r = Rect::from_min_size(
+                                pos2(vrect.left() + 8.0, vrect.top() + 8.0),
+                                vec2(44.0, 18.0),
+                            );
+                            ui.painter()
+                                .rect_filled(chip_r, 5.0, Color32::from_black_alpha(180));
+                            ui.painter().text(
+                                chip_r.center(),
+                                Align2::CENTER_CENTER,
+                                format!("Tab {tab_num}"),
+                                theme::semibold(10.0),
+                                Color32::WHITE,
+                            );
+                        }
+
                         if vresp.clicked() {
-                            self.page = Page::Watch;
-                            self.watch_scrolled_into_pip = false;
-                            self.scroll_watch_to_top = true;
+                            if previewing_bg {
+                                mini_action = MiniPlayerAction::Expand;
+                            } else {
+                                self.page = Page::Watch;
+                                self.watch_scrolled_into_pip = false;
+                                self.scroll_watch_to_top = true;
+                            }
                         }
 
                         // Interactive seek/progress bar directly under the PiP video
@@ -3905,8 +4597,8 @@ impl YtApp {
                             .inner_margin(Margin::symmetric(10, 6))
                             .show(ui, |ui| {
                                 let inner_w = pip_w - 20.0;
-                                let btns_w = 112.0;
-                                let text_w = (inner_w - btns_w - 8.0).max(110.0);
+                                let btns_w = 144.0;
+                                let text_w = (inner_w - btns_w - 8.0).max(96.0);
                                 let sub_line = if is_live {
                                     format!("LIVE · {channel}")
                                 } else if dur > 0.5 {
@@ -3947,29 +4639,56 @@ impl YtApp {
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                         ui.spacing_mut().item_spacing.x = 2.0;
                                         if icon_circle_button(ui, icon::X, 15.0, "Close player") {
-                                            self.backend.cursor.stop();
-                                            if let Some(m) = &self.mpv {
-                                                m.stop();
+                                            if previewing_bg {
+                                                mini_action = MiniPlayerAction::Close;
+                                            } else if self.bg_player_tab.is_some() {
+                                                self.close_player_tab(true);
+                                            } else {
+                                                self.backend.cursor.stop();
+                                                if let Some(m) = &self.mpv {
+                                                    m.stop();
+                                                }
+                                                self.watch = None;
+                                                self.watch_scrolled_into_pip = false;
+                                                self.clear_last_watched();
                                             }
-                                            self.watch = None;
-                                            self.watch_scrolled_into_pip = false;
-                                            self.clear_last_watched();
                                         }
                                         let (mrect, mresp) = ui.allocate_exact_size(
                                             Vec2::splat(34.0),
                                             Sense::click(),
                                         );
                                         paint_hover_circle(ui, mrect, &mresp, 1.0);
-                                        theme::draw_miniplayer_icon(
+                                        draw_expand_icon(
                                             ui.painter(),
                                             mrect.center(),
-                                            16.0,
+                                            15.0,
                                             Color32::WHITE,
                                         );
-                                        if mresp.on_hover_text("Expand").clicked() {
-                                            self.page = Page::Watch;
-                                            self.watch_scrolled_into_pip = false;
-                                            self.scroll_watch_to_top = true;
+                                        if mresp.on_hover_text("Expand to full player").clicked() {
+                                            if previewing_bg {
+                                                mini_action = MiniPlayerAction::Expand;
+                                            } else {
+                                                self.page = Page::Watch;
+                                                self.watch_scrolled_into_pip = false;
+                                                self.scroll_watch_to_top = true;
+                                            }
+                                        }
+                                        let (wprect, wpresp) = ui.allocate_exact_size(
+                                            Vec2::splat(34.0),
+                                            Sense::click(),
+                                        );
+                                        paint_hover_circle(ui, wprect, &wpresp, 1.0);
+                                        draw_win_pip_icon(
+                                            ui.painter(),
+                                            wprect.center(),
+                                            15.0,
+                                            Color32::WHITE,
+                                        );
+                                        if wpresp
+                                            .on_hover_text("Windows PiP (float over Windows)")
+                                            .clicked()
+                                        {
+                                            mini_action = MiniPlayerAction::PopOutWinPip;
                                         }
                                         let play_ico = if self.playback.paused {
                                             icon::PLAY
@@ -3986,6 +4705,11 @@ impl YtApp {
                             });
                     });
             });
+
+        if mini_action == MiniPlayerAction::PopOutWinPip && !previewing_bg {
+            self.enter_win_pip(ctx);
+            mini_action = MiniPlayerAction::None;
+        }
 
         // Snap PiP gently to nearest screen corner when released near edges
         if area_resp.response.dragged() {
@@ -4009,7 +4733,337 @@ impl YtApp {
                 self.pip_snap_target = Some(pos2(snap_x, snap_y));
             }
         }
+        mini_action
     }
+
+    pub(super) fn draw_win_pip_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(w) = self.watch.as_ref() else {
+            return;
+        };
+        let dur = self.playback.duration.max(w.duration_secs).max(0.0);
+        let mut pos = self.seeking_pos.unwrap_or(self.playback.time_pos).max(0.0);
+        let is_live = w.is_live;
+
+        let full_rect = ui.available_rect_before_wrap();
+        let (vrect, vresp) = ui.allocate_exact_size(full_rect.size(), Sense::click_and_drag());
+        ui.painter().rect_filled(vrect, 0.0, Color32::BLACK);
+        if let Some(mpv) = &self.mpv {
+            ui.painter().add(mpv.paint_callback(vrect));
+        }
+
+        // Subtle 1px dark border so the borderless floating window stands out cleanly over other apps
+        ui.painter().rect_stroke(
+            vrect.shrink(0.5),
+            0.0,
+            Stroke::new(1.0, Color32::from_white_alpha(38)),
+            egui::StrokeKind::Inside,
+        );
+
+        let hovered = ui.rect_contains_pointer(vrect) || self.player_menu == PlayerMenu::SleepTimer;
+        let overlay_alpha = ui.ctx().animate_bool_with_time(
+            egui::Id::unique("win_pip_overlay_fade"),
+            hovered || self.seeking_pos.is_some(),
+            0.14,
+        );
+
+        let mut exit_pip = false;
+        let mut close_video = false;
+        let mut any_control_hit = false;
+
+        if overlay_alpha > 0.01 {
+            let white = Color32::from_white_alpha((245.0 * overlay_alpha).round() as u8);
+            let bg_pill = Color32::from_black_alpha((165.0 * overlay_alpha).round() as u8);
+
+            // Top gradient & top-right minimal action pills (Exit PiP / Sleep timer / Close)
+            let top_grad = Rect::from_min_max(
+                vrect.left_top(),
+                pos2(vrect.right(), (vrect.top() + 52.0).min(vrect.bottom())),
+            );
+            paint_vertical_gradient(
+                ui.painter(),
+                top_grad,
+                Color32::from_black_alpha((170.0 * overlay_alpha).round() as u8),
+                Color32::TRANSPARENT,
+            );
+
+            let top_bar = Rect::from_min_max(
+                pos2(vrect.left() + 8.0, vrect.top() + 8.0),
+                pos2(vrect.right() - 8.0, vrect.top() + 38.0),
+            );
+            let mut top_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(top_bar)
+                    .layout(Layout::right_to_left(Align::Center)),
+            );
+            top_ui.spacing_mut().item_spacing.x = 6.0;
+
+            let (x_rect, x_resp) = top_ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+            top_ui.painter().circle_filled(x_rect.center(), 13.0, bg_pill);
+            theme::draw_icon_centered(top_ui.painter(), x_rect.center(), icon::X, 13.0, white);
+            if x_resp.hovered() {
+                top_ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            if x_resp.on_hover_text("Close player").clicked() {
+                any_control_hit = true;
+                close_video = true;
+            }
+
+            let (back_rect, back_resp) =
+                top_ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+            top_ui.painter().circle_filled(back_rect.center(), 13.0, bg_pill);
+            draw_expand_icon(top_ui.painter(), back_rect.center(), 13.5, white);
+            if back_resp.hovered() {
+                top_ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            if back_resp
+                .on_hover_text("Back to full window (Esc)")
+                .clicked()
+            {
+                any_control_hit = true;
+                exit_pip = true;
+            }
+
+            if let Some(rem) = self.sleep_timer_remaining_label() {
+                let txt = format!("Sleep: {rem}");
+                let (srect, sresp) =
+                    top_ui.allocate_exact_size(Vec2::new(88.0, 24.0), Sense::click());
+                top_ui.painter().rect_filled(
+                    srect,
+                    12.0,
+                    Color32::from_rgba_unmultiplied(
+                        24,
+                        28,
+                        36,
+                        (200.0 * overlay_alpha).round() as u8,
+                    ),
+                );
+                top_ui.painter().text(
+                    srect.center(),
+                    Align2::CENTER_CENTER,
+                    txt,
+                    theme::medium(11.0),
+                    theme::YT_BLUE.gamma_multiply(overlay_alpha),
+                );
+                if sresp
+                    .on_hover_text("Click to turn off sleep timer")
+                    .clicked()
+                {
+                    any_control_hit = true;
+                    self.sleep_timer = SleepTimer::Off;
+                    self.toast("Sleep timer turned off");
+                }
+            }
+
+            // Bottom gradient & minimal playback bar (seek bar + Play/Pause + Mute + Time + Resize grip)
+            let bot_h = 54.0_f32.min(vrect.height() * 0.45);
+            let bot_grad = Rect::from_min_max(
+                pos2(vrect.left(), vrect.bottom() - bot_h - 14.0),
+                vrect.right_bottom(),
+            );
+            paint_vertical_gradient(
+                ui.painter(),
+                bot_grad,
+                Color32::TRANSPARENT,
+                Color32::from_black_alpha((205.0 * overlay_alpha).round() as u8),
+            );
+
+            // Resize grip in bottom-right corner
+            let grip_r = Rect::from_min_max(
+                pos2(vrect.right() - 18.0, vrect.bottom() - 18.0),
+                vrect.right_bottom(),
+            );
+            let grip_resp = ui.interact(
+                grip_r,
+                egui::Id::unique("win_pip_resize_grip"),
+                Sense::drag(),
+            );
+            if grip_resp.hovered() || grip_resp.dragged() {
+                ctx.set_cursor_icon(CursorIcon::ResizeNwSe);
+            }
+            for off in [5.0_f32, 9.5] {
+                ui.painter().line_segment(
+                    [
+                        pos2(vrect.right() - off - 2.0, vrect.bottom() - 3.0),
+                        pos2(vrect.right() - 3.0, vrect.bottom() - off - 2.0),
+                    ],
+                    Stroke::new(1.3, Color32::from_white_alpha((150.0 * overlay_alpha).round() as u8)),
+                );
+            }
+            if grip_resp.drag_started() {
+                any_control_hit = true;
+                ctx.send_viewport_cmd(ViewportCommand::BeginResize(
+                    egui::ResizeDirection::SouthEast,
+                ));
+            }
+
+            // Seek bar
+            if !is_live && dur > 0.5 {
+                let bar_rect = Rect::from_min_max(
+                    pos2(vrect.left() + 10.0, vrect.bottom() - 44.0),
+                    pos2(vrect.right() - 10.0, vrect.bottom() - 30.0),
+                );
+                let bar_resp =
+                    ui.interact(bar_rect, egui::Id::unique("win_pip_seek_bar"), Sense::click_and_drag());
+                let hot = bar_resp.hovered() || bar_resp.dragged();
+                let track_h = if hot { 4.5 } else { 3.0 };
+                let track = Rect::from_min_max(
+                    pos2(bar_rect.left(), bar_rect.center().y - track_h * 0.5),
+                    pos2(bar_rect.right(), bar_rect.center().y + track_h * 0.5),
+                );
+                ui.painter().rect_filled(
+                    track,
+                    1.5,
+                    Color32::from_white_alpha((55.0 * overlay_alpha).round() as u8),
+                );
+                if bar_resp.dragged() || bar_resp.clicked() {
+                    any_control_hit = true;
+                    if let Some(ptr) = bar_resp.interact_pointer_pos() {
+                        let f = ((ptr.x - track.left()) / track.width()).clamp(0.0, 1.0) as f64;
+                        pos = f * dur;
+                        self.seeking_pos = Some(pos);
+                    }
+                }
+                if bar_resp.drag_stopped() || bar_resp.clicked() {
+                    any_control_hit = true;
+                    if let Some(target) = self.seeking_pos.take() {
+                        if let Some(mpv) = &self.mpv {
+                            mpv.seek_abs(target);
+                        }
+                    }
+                }
+                let frac = (pos / dur).clamp(0.0, 1.0) as f32;
+                let fill_x = track.left() + track.width() * frac;
+                ui.painter().rect_filled(
+                    Rect::from_min_max(track.min, pos2(fill_x, track.max.y)),
+                    1.5,
+                    theme::YT_RED.gamma_multiply(overlay_alpha),
+                );
+                if hot {
+                    ui.painter().circle_filled(
+                        pos2(fill_x, track.center().y),
+                        5.5,
+                        theme::YT_RED.gamma_multiply(overlay_alpha),
+                    );
+                }
+            }
+
+            // Minimal bottom controls row
+            let ctrl_rect = Rect::from_min_max(
+                pos2(vrect.left() + 8.0, vrect.bottom() - 32.0),
+                pos2(vrect.right() - 22.0, vrect.bottom() - 4.0),
+            );
+            let mut cui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(ctrl_rect)
+                    .layout(Layout::left_to_right(Align::Center)),
+            );
+            cui.spacing_mut().item_spacing.x = 4.0;
+            let (prect, presp) = cui.allocate_exact_size(Vec2::splat(26.0), Sense::click());
+            paint_hover_circle(&cui, prect, &presp, overlay_alpha);
+            theme::draw_icon_centered(
+                cui.painter(),
+                prect.center(),
+                if self.playback.paused {
+                    icon::PLAY
+                } else {
+                    icon::PAUSE
+                },
+                14.0,
+                white,
+            );
+            if presp.clicked() {
+                any_control_hit = true;
+                self.toggle_play_pause();
+            }
+
+            let (mrect, mresp) = cui.allocate_exact_size(Vec2::splat(26.0), Sense::click());
+            paint_hover_circle(&cui, mrect, &mresp, overlay_alpha);
+            theme::draw_icon_centered(
+                cui.painter(),
+                mrect.center(),
+                if self.muted || self.volume <= 0.1 {
+                    icon::VOLUME_X
+                } else if self.volume < 50.0 {
+                    icon::VOLUME_1
+                } else {
+                    icon::VOLUME_2
+                },
+                14.0,
+                white,
+            );
+            if mresp.clicked() {
+                any_control_hit = true;
+                self.muted = !self.muted;
+                if let Some(m) = &self.mpv {
+                    m.set_mute(self.muted);
+                }
+            }
+
+            let time_txt = if is_live {
+                "LIVE".to_owned()
+            } else if dur > 0.5 {
+                format!("{} / {}", format_duration(pos), format_duration(dur))
+            } else {
+                String::new()
+            };
+            if !time_txt.is_empty() {
+                cui.label(
+                    RichText::new(time_txt)
+                        .font(theme::medium(11.5))
+                        .color(if is_live {
+                            theme::YT_RED.gamma_multiply(overlay_alpha)
+                        } else {
+                            white
+                        }),
+                );
+            }
+        }
+
+        // Video surface interactions: drag to move window, click to play/pause, double-click to return
+        if !any_control_hit {
+            if vresp.drag_started() {
+                ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+            } else if vresp.double_clicked() {
+                exit_pip = true;
+            } else if vresp.clicked() {
+                self.toggle_play_pause();
+            }
+        }
+        if vresp.hovered() {
+            let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
+            if scroll.abs() > 1.0 {
+                self.volume = (self.volume + f64::from(scroll) * 0.12).clamp(0.0, 100.0);
+                if let Some(m) = &self.mpv {
+                    m.set_volume(self.volume);
+                }
+            }
+        }
+
+        if close_video {
+            self.exit_win_pip(ctx);
+            if self.bg_player_tab.is_some() {
+                self.close_player_tab(true);
+            } else {
+                self.backend.cursor.stop();
+                if let Some(m) = &self.mpv {
+                    m.stop();
+                }
+                self.watch = None;
+                self.page = self.win_pip_saved_page;
+                self.clear_last_watched();
+            }
+        } else if exit_pip {
+            self.exit_win_pip(ctx);
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum MiniPlayerAction {
+    None,
+    Expand,
+    Close,
+    PopOutWinPip,
 }
 
 fn overlay_icon_btn(
@@ -4217,31 +5271,12 @@ fn popover_option_row(ui: &mut egui::Ui, label: &str, selected: bool) -> bool {
     resp.clicked()
 }
 
-fn clamp_two_lines(ui: &egui::Ui, text: &str, font: egui::FontId, max_w: f32) -> String {
-    let galley = ui
-        .painter()
-        .layout(text.to_owned(), font.clone(), theme::TEXT, max_w);
-    if galley.rows.len() <= 2 {
-        return text.to_owned();
-    }
-    let two_line_chars: usize = galley.rows[..2]
-        .iter()
-        .map(|r| r.glyphs.len())
-        .sum();
-    let mut out: String = text.chars().take(two_line_chars.saturating_sub(2)).collect();
-    while !out.is_empty() {
-        let cand = format!("{out}…");
-        let g = ui.painter().layout(cand, font.clone(), theme::TEXT, max_w);
-        if g.rows.len() <= 2 {
-            break;
-        }
-        out.pop();
-    }
-    if out.is_empty() {
-        "…".to_owned()
-    } else {
-        format!("{out}…")
-    }
+enum ShortsUiAction {
+    None,
+    Step(isize),
+    ReturnToVideo,
+    GridView,
+    OpenChannel(String, String),
 }
 
 fn draw_pip_dock_placeholder(ui: &mut egui::Ui, size: Vec2) -> bool {
@@ -4367,6 +5402,58 @@ fn shorts_rail_button(
         if active { theme::YT_BLUE } else { theme::TEXT_DIM },
     );
     resp.on_hover_text(tooltip).clicked()
+}
+
+/// Diagonal outward arrows icon (`⤢`) for expanding from PiP back to the full Watch player.
+fn draw_expand_icon(painter: &egui::Painter, center: egui::Pos2, size: f32, color: Color32) {
+    let half = size * 0.42;
+    let arm = size * 0.28;
+    let gap = size * 0.12;
+    let stroke = Stroke::new(1.6, color);
+
+    // Top-right outward arrow
+    let tr = pos2(center.x + half, center.y - half);
+    painter.line_segment([pos2(center.x + gap, center.y - gap), tr], stroke);
+    painter.line_segment([tr, pos2(tr.x - arm, tr.y)], stroke);
+    painter.line_segment([tr, pos2(tr.x, tr.y + arm)], stroke);
+
+    // Bottom-left outward arrow
+    let bl = pos2(center.x - half, center.y + half);
+    painter.line_segment([pos2(center.x - gap, center.y + gap), bl], stroke);
+    painter.line_segment([bl, pos2(bl.x + arm, bl.y)], stroke);
+    painter.line_segment([bl, pos2(bl.x, bl.y - arm)], stroke);
+}
+
+/// Pop-out window frame with diagonal external arrow (`↗`) for borderless Windows PiP.
+fn draw_win_pip_icon(painter: &egui::Painter, center: egui::Pos2, size: f32, color: Color32) {
+    let half = size * 0.42;
+    let stroke = Stroke::new(1.5, color);
+    let x0 = center.x - half;
+    let y0 = center.y - half * 0.78;
+    let x1 = center.x + half * 0.78;
+    let y1 = center.y + half;
+    let r = 2.0_f32;
+
+    // Open-top-right rounded window frame (top-left -> left -> bottom -> right-mid)
+    let pts = vec![
+        pos2(center.x + half * 0.05, y0),
+        pos2(x0 + r, y0),
+        pos2(x0, y0 + r),
+        pos2(x0, y1 - r),
+        pos2(x0 + r, y1),
+        pos2(x1 - r, y1),
+        pos2(x1, y1 - r),
+        pos2(x1, center.y - half * 0.05),
+    ];
+    painter.add(egui::Shape::line(pts, stroke));
+
+    // Pop-out diagonal arrow pointing out to the top-right corner
+    let tip = pos2(center.x + half, center.y - half);
+    let stem = pos2(center.x - half * 0.05, center.y + half * 0.05);
+    let head = size * 0.28;
+    painter.line_segment([stem, tip], stroke);
+    painter.line_segment([tip, pos2(tip.x - head, tip.y)], stroke);
+    painter.line_segment([tip, pos2(tip.x, tip.y + head)], stroke);
 }
 
 fn shorts_nav_circle(ui: &mut egui::Ui, ico: char, tooltip: &str) -> bool {
