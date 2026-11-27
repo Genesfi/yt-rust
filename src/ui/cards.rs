@@ -1189,7 +1189,7 @@ fn draw_video_card_row(
     ui.horizontal_top(|ui| {
         for (col_idx, item) in row.iter().enumerate() {
             let item = *item;
-            let card_h = thumb_h + if item.is_members_only { 108.0 } else { 92.0 };
+            let card_h = thumb_h + 92.0;
             let (card_rect, card_resp) =
                 ui.allocate_exact_size(Vec2::new(card_w, card_h), Sense::click());
             let hovered = card_resp.hovered() || ui.rect_contains_pointer(card_rect);
@@ -1294,6 +1294,29 @@ fn draw_video_card_row(
                         });
                     }
                 }
+                if item.is_members_only {
+                    let green = Color32::from_rgb(72, 232, 148);
+                    let galley = ui.painter().layout_no_wrap(
+                        "Members only".to_owned(),
+                        theme::semibold(10.0),
+                        green,
+                    );
+                    let pad = vec2(6.5, 2.0);
+                    let bsz = galley.size() + pad * 2.0;
+                    let has_bar = (is_preview_active && hover_in.has_frame)
+                        || item.watched_percent.is_some_and(|p| p > 0.01);
+                    let bottom_inset = if has_bar { 9.0 } else { 7.0 };
+                    let brect = Rect::from_min_size(
+                        pos2(thumb_rect.left() + 7.0, thumb_rect.bottom() - bsz.y - bottom_inset),
+                        bsz,
+                    );
+                    ui.painter().rect_filled(
+                        brect,
+                        4.0,
+                        Color32::from_rgba_unmultiplied(12, 46, 30, 225),
+                    );
+                    ui.painter().galley(brect.min + pad, galley, green);
+                }
                 ui.add_space(10.0);
                 ui.horizontal_top(|ui| {
                     let avatar_r = ui
@@ -1360,10 +1383,6 @@ fn draw_video_card_row(
                                 )
                                 .truncate(),
                             );
-                        }
-                        if item.is_members_only {
-                            ui.add_space(3.0);
-                            draw_members_badge(ui);
                         }
                     });
 
@@ -1651,10 +1670,8 @@ fn draw_thumbnail_with_hover(
             let pill = Rect::from_min_size(pos2(rect.right() - 34.0, rect.top() + 8.0), Vec2::splat(26.0));
             ui.painter()
                 .circle_filled(pill.center(), 13.0, Color32::from_black_alpha(180));
-            ui.put(
-                pill.shrink(5.0),
-                egui::Spinner::new().size(14.0).color(Color32::WHITE),
-            );
+            let mut spin_ui = ui.new_child(egui::UiBuilder::new().max_rect(pill.shrink(5.0)));
+            spin_ui.add(egui::Spinner::new().size(14.0).color(Color32::WHITE));
         } else if hover_t > 0.02 {
             let badge_alpha = (hover_t * 210.0).round() as u8;
             let play_pill = Rect::from_center_size(rect.center(), vec2(44.0, 32.0));
@@ -1712,16 +1729,20 @@ fn draw_thumbnail_with_hover(
         } else {
             Color32::from_black_alpha(210)
         };
+        let compact = size.y <= 54.0;
+        let font = theme::semibold(if compact { 8.8 } else { 11.0 });
+        let pad = if compact { vec2(3.5, 1.0) } else { vec2(6.0, 2.5) };
+        let offset = if compact { vec2(3.0, 3.0) } else { vec2(7.0, 7.0) };
+        let corner = if compact { 3.0 } else { 4.0 };
         let galley = ui.painter().layout_no_wrap(
             badge_text,
-            theme::semibold(11.0),
+            font,
             Color32::WHITE,
         );
-        let pad = vec2(6.0, 2.5);
         let badge_size = galley.size() + pad * 2.0;
         let badge_rect =
-            Rect::from_min_size(rect.max - badge_size - vec2(7.0, 7.0), badge_size);
-        ui.painter().rect_filled(badge_rect, 4.0, bg);
+            Rect::from_min_size(rect.max - badge_size - offset, badge_size);
+        ui.painter().rect_filled(badge_rect, corner, bg);
         ui.painter()
             .galley(badge_rect.min + pad, galley, Color32::WHITE);
     }

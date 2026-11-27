@@ -1431,6 +1431,49 @@ pub async fn channel_videos(
     ))
 }
 
+fn parse_channel_search_response(v: &Value, channel_id: &str) -> FeedPage {
+    let new_vd = v["responseContext"]["visitorData"]
+        .as_str()
+        .map(str::to_owned);
+    let channel_name = v["metadata"]["channelMetadataRenderer"]["title"]
+        .as_str()
+        .or_else(|| {
+            v["header"]["c4TabbedHeaderRenderer"]["title"]
+                .as_str()
+        })
+        .or_else(|| v["header"]["pageHeaderRenderer"]["pageTitle"].as_str())
+        .unwrap_or("");
+    let search_root = v["contents"]["twoColumnBrowseResultsRenderer"]["tabs"]
+        .as_array()
+        .and_then(|tabs| {
+            tabs.iter().find_map(|t| {
+                if let Some(et) = t.get("expandableTabRenderer") {
+                    if et["selected"].as_bool().unwrap_or(false) {
+                        return Some(&et["content"]);
+                    }
+                }
+                if let Some(tr) = t.get("tabRenderer") {
+                    if tr["selected"].as_bool().unwrap_or(false) {
+                        return Some(&tr["content"]);
+                    }
+                }
+                None
+            })
+        })
+        .unwrap_or(v);
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    collect_videos_with_channel_items(search_root, &mut items, &mut seen, channel_name, channel_id);
+    let cont = find_continuation(search_root).or_else(|| find_continuation(v));
+    FeedPage {
+        items,
+        chips: Vec::new(),
+        continuation: cont,
+        visitor_data: new_vd,
+        is_fallback_trending: false,
+    }
+}
+
 pub async fn search_channel(
     http: &reqwest::Client,
     channel_id: &str,
@@ -1448,20 +1491,7 @@ pub async fn search_channel(
         }),
     };
     let v = post_web(http, "browse", body, cfg, session).await?;
-    let new_vd = v["responseContext"]["visitorData"]
-        .as_str()
-        .map(str::to_owned);
-    let mut items = Vec::new();
-    let mut seen = HashSet::new();
-    collect_videos_with_channel_items(&v, &mut items, &mut seen, "", channel_id);
-    let cont = find_continuation(&v);
-    Ok(FeedPage {
-        items,
-        chips: Vec::new(),
-        continuation: cont,
-        visitor_data: new_vd,
-        is_fallback_trending: false,
-    })
+    Ok(parse_channel_search_response(&v, channel_id))
 }
 
 fn find_is_subscribed(v: &Value) -> bool {
@@ -4910,7 +4940,9 @@ fn extract_chip_continuation(cr: &Value) -> Option<String> {
         }
     }
 
-    walk_tok(&cr["navigationEndpoint"]).or_else(|| walk_tok(&cr["onSelectCommand"]))
+    walk_tok(&cr["navigationEndpoint"])
+        .or_else(|| walk_tok(&cr["onSelectCommand"]))
+        .or_else(|| walk_tok(&cr["tapCommand"]))
 }
 
 fn collect_chips(v: &Value) -> Vec<FeedChip> {
@@ -4922,26 +4954,56 @@ fn collect_chips(v: &Value) -> Vec<FeedChip> {
                     .get("feedFilterChipBarRenderer")
                     .or_else(|| map.get("chipCloudRenderer"))
                     .and_then(|c| c.get("contents"))
-                    .or_else(|| map.get("chipCloudRenderer").and_then(|c| c.get("chips")))
+                    .or_else(|| {
+                        map.get("chipBarViewModel")
+                            .or_else(|| map.get("chipCloudRenderer"))
+                            .and_then(|c| c.get("chips"))
+                    })
                     .and_then(|c| c.as_array())
                 {
                     for c in chips {
                         let cr = &c["chipCloudChipRenderer"];
-                        if let Some(title) = text(&cr["text"]) {
-                            let selected = cr["isSelected"].as_bool().unwrap_or(false);
-                            let params = cr["navigationEndpoint"]["browseEndpoint"]["params"]
+                        if cr.is_object() {
+                            if let Some(title) = text(&cr["text"]) {
+                                let selected = cr["isSelected"].as_bool().unwrap_or(false);
+                                let params = cr["navigationEndpoint"]["browseEndpoint"]["params"]
+                                    .as_str()
+                                    .map(str::to_owned);
+                                let continuation = extract_chip_continuation(cr);
+                                out.push(FeedChip {
+                                    title,
+                                    params,
+                                    continuation,
+                                    selected,
+                                });
+                            }
+                            continue;
+                        }
+                        let cvm = &c["chipViewModel"];
+                        if cvm.is_object() {
+                            let title = cvm["text"]
                                 .as_str()
-                                .map(str::to_owned);
-                            let continuation = extract_chip_continuation(cr);
-                            out.push(FeedChip {
-                                title,
-                                params,
-                                continuation,
-                                selected,
-                            });
+                                .map(str::to_owned)
+                                .or_else(|| text(&cvm["text"]));
+                            if let Some(title) = title.filter(|s| !s.is_empty()) {
+                                let selected = cvm["selected"].as_bool().unwrap_or(false);
+                                let params = cvm["tapCommand"]["innertubeCommand"]["browseEndpoint"]
+                                    ["params"]
+                                    .as_str()
+                                    .map(str::to_owned);
+                                let continuation = extract_chip_continuation(cvm);
+                                out.push(FeedChip {
+                                    title,
+                                    params,
+                                    continuation,
+                                    selected,
+                                });
+                            }
                         }
                     }
-                    return;
+                    if !out.is_empty() {
+                        return;
+                    }
                 }
                 for val in map.values() {
                     if !out.is_empty() {
@@ -6273,6 +6335,124 @@ mod tests {
         assert_eq!(chips[1].title, "Gaming");
         assert_eq!(chips[1].continuation.as_deref(), Some("CONT_GAMING"));
         assert_eq!(chips[2].params.as_deref(), Some("PAR_POD"));
+    }
+
+    #[test]
+    fn parses_channel_chip_bar_view_model_sort_chips() {
+        let ch = json!({
+            "header": {
+                "chipBarViewModel": {
+                    "chips": [
+                        {
+                            "chipViewModel": {
+                                "text": "Latest",
+                                "selected": true,
+                                "tapCommand": {
+                                    "innertubeCommand": {
+                                        "continuationCommand": { "token": "TOK_LATEST" }
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "chipViewModel": {
+                                "text": "Popular",
+                                "selected": false,
+                                "tapCommand": {
+                                    "innertubeCommand": {
+                                        "continuationCommand": { "token": "TOK_POPULAR" }
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "chipViewModel": {
+                                "text": "Oldest",
+                                "selected": false,
+                                "tapCommand": {
+                                    "innertubeCommand": {
+                                        "continuationCommand": { "token": "TOK_OLDEST" }
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let chips = collect_chips(&ch);
+        assert_eq!(chips.len(), 3);
+        assert_eq!(chips[0].title, "Latest");
+        assert!(chips[0].selected);
+        assert_eq!(chips[1].title, "Popular");
+        assert!(!chips[1].selected);
+        assert_eq!(chips[1].continuation.as_deref(), Some("TOK_POPULAR"));
+        assert_eq!(chips[2].title, "Oldest");
+        assert_eq!(chips[2].continuation.as_deref(), Some("TOK_OLDEST"));
+    }
+
+    #[test]
+    fn parses_channel_search_selected_expandable_tab_only() {
+        let resp = json!({
+            "metadata": {
+                "channelMetadataRenderer": { "title": "Ray Restu Fauzi" }
+            },
+            "contents": {
+                "twoColumnBrowseResultsRenderer": {
+                    "tabs": [
+                        {
+                            "tabRenderer": {
+                                "title": "Home",
+                                "selected": false,
+                                "content": {
+                                    "sectionListRenderer": {
+                                        "contents": [
+                                            { "videoRenderer": { "videoId": "STRAY_HOME_1", "title": { "simpleText": "Unrelated Home Trailer" } } }
+                                        ]
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "expandableTabRenderer": {
+                                "selected": true,
+                                "content": {
+                                    "sectionListRenderer": {
+                                        "contents": [
+                                            {
+                                                "itemSectionRenderer": {
+                                                    "contents": [
+                                                        {
+                                                            "videoRenderer": {
+                                                                "videoId": "MATCH_VID_1",
+                                                                "title": { "runs": [{ "text": "Ada indonesia LAGI" }] },
+                                                                "lengthText": { "simpleText": "12:26" }
+                                                            }
+                                                        },
+                                                        {
+                                                            "continuationItemRenderer": {
+                                                                "continuationEndpoint": {
+                                                                    "continuationCommand": { "token": "SEARCH_CONT_1" }
+                                                                }
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        let page = parse_channel_search_response(&resp, "UC_TEST");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, "MATCH_VID_1");
+        assert_eq!(page.items[0].channel, "Ray Restu Fauzi");
+        assert_eq!(page.continuation.as_deref(), Some("SEARCH_CONT_1"));
     }
 
     #[test]

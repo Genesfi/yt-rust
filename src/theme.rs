@@ -556,17 +556,23 @@ pub fn draw_fullscreen_icon(
     is_fullscreen: bool,
 ) {
     let stroke = Stroke::new(1.8, color);
-    let half = s * 0.38;
-    let arm = s * 0.20;
-    for (sx, sy) in [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
-        let corner = egui::pos2(c.x + sx * half, c.y + sy * half);
-        if is_fullscreen {
-            let p_mid = egui::pos2(c.x + sx * (half - arm), c.y + sy * (half - arm));
-            painter.line_segment([p_mid, egui::pos2(p_mid.x - sx * arm, p_mid.y)], stroke);
-            painter.line_segment([p_mid, egui::pos2(p_mid.x, p_mid.y - sy * arm)], stroke);
-        } else {
-            painter.line_segment([corner, egui::pos2(corner.x - sx * arm, corner.y)], stroke);
-            painter.line_segment([corner, egui::pos2(corner.x, corner.y - sy * arm)], stroke);
+    let outer = s * 0.39;
+    if is_fullscreen {
+        let inner = s * 0.14;
+        let arm = outer - inner;
+        for (sx, sy) in [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+            let vertex = egui::pos2(c.x + sx * inner, c.y + sy * inner);
+            let h_end = egui::pos2(vertex.x + sx * arm, vertex.y);
+            let v_end = egui::pos2(vertex.x, vertex.y + sy * arm);
+            painter.add(egui::Shape::line(vec![h_end, vertex, v_end], stroke));
+        }
+    } else {
+        let arm = s * 0.22;
+        for (sx, sy) in [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+            let corner = egui::pos2(c.x + sx * outer, c.y + sy * outer);
+            let h_end = egui::pos2(corner.x - sx * arm, corner.y);
+            let v_end = egui::pos2(corner.x, corner.y - sy * arm);
+            painter.add(egui::Shape::line(vec![h_end, corner, v_end], stroke));
         }
     }
 }

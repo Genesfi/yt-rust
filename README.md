@@ -24,15 +24,21 @@ Powered by [`eframe`](https://crates.io/crates/eframe) / [`egui`](https://crates
 | :---: | :---: | :---: |
 | ![Watch Page with Expanded Sidebar](assets/screenshots/watch-sidebar.jpg) | ![Livestream and Live Chat](assets/screenshots/live-chat.jpg) | ![Comments Sort and Replies](assets/screenshots/comments-replies.png) |
 
+| Channel Page, Search & Floating PiP | Sticky Channel Tabs & Video Grid | Mini-Player Hover Controls & Queue |
+| :---: | :---: | :---: |
+| ![Channel Page and Floating PiP](assets/screenshots/channel-page-pip.jpg) | ![Sticky Channel Tabs and Grid](assets/screenshots/channel-sticky-pip.jpg) | ![Mini-Player Hover Controls and Queue](assets/screenshots/mini-player-queue.jpg) |
+
 ---
 
 ## Key Features
 
-### Dual-Tab Player & Smart Playback
+### Dual-Tab Player, Mini-Player & Smart Playback
 - **Two Concurrent Player Tabs**: Open a second video directly in **Tab 2**, control play/pause or mute from the tab strip while browsing, and swap instantly between tabs without losing state.
-- **2-Tab Session Resume**: Crash-safe persistence (`last_watch.json`) restores both active and background tabs at their exact timestamps on startup or via the Home **Continue watching** banner.
-- **Native 1080p–4K OpenGL Playback (`libmpv`)**: Automatic first-run `libmpv-2.dll` downloader (`shinchiro/mpv-winbuild-cmake`), selectable hardware decoding (`auto-copy` GPU / software fallback), codec/resolution picker (`H.264`, `VP9`, `AV1`), multi-audio track selection, playback speed (`0.5x–2.0x`), closed captions (`.vtt`), chapters, storyboard seekbar previews, and **Stats for Nerds** (`Ctrl+I`).
-- **Parallel HTTP Range Prefetch Proxy (`src/proxy.rs`)**: Prevents single-connection throttling during 1080p+ and 4K adaptive streaming.
+- **2-Tab Session Resume**: Crash-safe persistence (`last_watch.json`) restores both active and background tabs at their exact timestamps on startup or via clickable Home **Continue watching** cards.
+- **YouTube-Style In-App Mini-Player & Queue**: Corner-snapping PiP with on-hover overlay controls (Expand, Close `X`, Play/Pause, Next, timestamp pill), seekbar scrubbing, Windows PiP pop-out, and an expandable **Up next** Queue drawer that auto-lifts when opened and snaps back down when closed.
+- **Hover Video Preview**: Muted auto-playing card previews on Home, Channel, Subscriptions, and Search grids (configurable quality or Off, with mute toggle and automatic idle GPU teardown).
+- **Native 1080p–4K OpenGL Playback (`libmpv`)**: Automatic first-run `libmpv-2.dll` downloader (`shinchiro/mpv-winbuild-cmake`), selectable hardware decoding (`auto-copy` GPU / software fallback), codec/resolution picker (`H.264`, `VP9`, `AV1`), multi-audio track selection, playback speed (`0.5x–2.0x`), closed captions (`.vtt`), chapters, storyboard seekbar previews, **Stats for Nerds** (`Ctrl+I`), and GL-thread FBO/texture cleanup with paused-frame render skipping.
+- **Parallel HTTP Range Prefetch Proxy (`src/proxy.rs`)**: Prevents single-connection throttling during 1080p+ and 4K adaptive streaming, with instant latest-seek cursor prioritization.
 - **DVR Live Streams**: Pinned live-edge scrubber with `-MM:SS` rewind hover timestamps and clickable `● Live` resync badge.
 
 ### Shorts, Windows PiP, Sleep Timer & PO Token Resilience
@@ -49,8 +55,8 @@ Powered by [`eframe`](https://crates.io/crates/eframe) / [`egui`](https://crates
 
 ### Google Account, Comments, Live Chat & Downloads
 - **Embedded WebView2 Sign-In**: Secure Google authentication stored in Windows Credential Manager (`keyring`) with automatic cookie rotation.
-- **Synced Library & Feeds**: Two-way Watch History (`FEhistory` + `videostats`), personalized Home topic chips, Subscriptions filters (`All` / `Unwatched` / `Live`), Trending, Playlists, **Save to Playlist** modal, Channel pages (`Videos` / `Shorts` / `Live` / `Playlists` + in-channel search), and bell notifications with subscription/live fallback.
-- **Interactive Engagement & Queue**: Top/Newest comments with expandable replies and posting, live & replay **Live Chat** polling/sending with emotes, persistent drag-reorderable Play Queue, and **Save Queue as Playlist**.
+- **Synced Library & Feeds**: Two-way Watch History (`FEhistory` + `videostats`), personalized Home topic chips, Subscriptions filters (`All` / `Unwatched` / `Live`), Trending, Playlists, **Save to Playlist** modal, Channel pages (`Home` / `Videos` / `Shorts` / `Live` / `Podcasts` / `Playlists`, `Latest` / `Popular` / `Oldest` sort chips, sticky full-width tab bar, `Play All` / `Shuffle`, and in-channel search), thumbnail `Members only` badges, and bell notifications with subscription/live fallback.
+- **Interactive Engagement & Queue**: Top/Newest comments with expandable replies, clickable `MM:SS` / `H:MM:SS` timestamps across descriptions/comments/replies, comment posting, live & replay **Live Chat** polling/sending with emotes, persistent drag-reorderable Play Queue, and **Save Queue as Playlist**.
 - **Community Integrations & Offline Downloads**: Optional **SponsorBlock** auto-skip per category, **DeArrow** title/thumbnail replacement, **Return YouTube Dislike** counts, and a built-in `yt-dlp` Downloads manager with live progress and offline playback.
 
 ---

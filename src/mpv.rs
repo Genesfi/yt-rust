@@ -811,38 +811,44 @@ fn render_into_egui(
         }
 
         let Some(surf) = &ctx.surface else {
+            let draw_target = std::num::NonZeroU32::new(prev_draw_fbo).map(glow::NativeFramebuffer);
+            let read_target = std::num::NonZeroU32::new(prev_read_fbo).map(glow::NativeFramebuffer);
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, draw_target);
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, read_target);
             return;
         };
 
-        // Disable egui's scissor test while mpv renders into the offscreen FBO
-        gl.disable(glow::SCISSOR_TEST);
-
         let flags = (ctx.vt.mpv_render_context_update)(ctx.render_ctx);
-        let _has_new_frame = (flags & MPV_RENDER_UPDATE_FRAME) != 0;
+        let has_new_frame = (flags & MPV_RENDER_UPDATE_FRAME) != 0;
 
-        let raw_fbo: u32 = surf.fbo.0.into();
-        let mut fbo_param = MpvOpenglFbo {
-            fbo: raw_fbo as c_int,
-            w,
-            h,
-            internal_format: glow::RGBA8 as c_int,
-        };
-        let mut flip_y: c_int = 1;
-        let mut params = [
-            MpvRenderParam {
-                type_: MPV_RENDER_PARAM_OPENGL_FBO,
-                data: (&mut fbo_param as *mut MpvOpenglFbo) as *mut c_void,
-            },
-            MpvRenderParam {
-                type_: MPV_RENDER_PARAM_FLIP_Y,
-                data: (&mut flip_y as *mut c_int) as *mut c_void,
-            },
-            MpvRenderParam {
-                type_: MPV_RENDER_PARAM_INVALID,
-                data: std::ptr::null_mut(),
-            },
-        ];
-        (ctx.vt.mpv_render_context_render)(ctx.render_ctx, params.as_mut_ptr());
+        if has_new_frame || needs_alloc {
+            // Disable egui's scissor test while mpv renders into the offscreen FBO
+            gl.disable(glow::SCISSOR_TEST);
+
+            let raw_fbo: u32 = surf.fbo.0.into();
+            let mut fbo_param = MpvOpenglFbo {
+                fbo: raw_fbo as c_int,
+                w,
+                h,
+                internal_format: glow::RGBA8 as c_int,
+            };
+            let mut flip_y: c_int = 1;
+            let mut params = [
+                MpvRenderParam {
+                    type_: MPV_RENDER_PARAM_OPENGL_FBO,
+                    data: (&mut fbo_param as *mut MpvOpenglFbo) as *mut c_void,
+                },
+                MpvRenderParam {
+                    type_: MPV_RENDER_PARAM_FLIP_Y,
+                    data: (&mut flip_y as *mut c_int) as *mut c_void,
+                },
+                MpvRenderParam {
+                    type_: MPV_RENDER_PARAM_INVALID,
+                    data: std::ptr::null_mut(),
+                },
+            ];
+            (ctx.vt.mpv_render_context_render)(ctx.render_ctx, params.as_mut_ptr());
+        }
 
         // Restore egui's exact clip scissor (mpv_render_context_render alters glScissor!)
         // and blit the rendered offscreen texture into the widget's viewport rect.

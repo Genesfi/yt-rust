@@ -255,83 +255,105 @@ impl YtApp {
             if !currently_playing_same && (lw.position_secs > 2.0 || lw.second_tab.is_some()) {
                 let mut resume_now = false;
                 let mut dismiss_now = false;
+                let card_hover_id = ui.scope_id().with("continue_watching_hover");
+                let prev_hovered = ui
+                    .ctx()
+                    .data_mut(|d| d.get_temp::<bool>(card_hover_id))
+                    .unwrap_or(false);
+                let frame_fill = if prev_hovered {
+                    theme::CHIP
+                } else {
+                    theme::SURFACE
+                };
                 Frame::new()
-                    .fill(theme::SURFACE)
+                    .fill(frame_fill)
                     .stroke(Stroke::new(1.0, theme::BORDER))
                     .corner_radius(12)
                     .inner_margin(Margin::symmetric(14, 10))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            let pct = if lw.duration_secs > 10.0 {
-                                Some((lw.position_secs / lw.duration_secs).clamp(0.02, 1.0) as f32)
-                            } else {
-                                None
-                            };
-                            if !lw.thumbnail_url.is_empty() {
-                                draw_thumbnail(
-                                    ui,
-                                    &lw.thumbnail_url,
-                                    "",
-                                    Vec2::new(88.0, 50.0),
-                                    7.0,
-                                    pct,
-                                );
-                                ui.add_space(10.0);
-                            } else {
-                                theme::draw_icon(ui, icon::PLAY, 22.0, theme::YT_BLUE);
-                                ui.add_space(8.0);
-                            }
-                            ui.vertical(|ui| {
-                                ui.set_max_width((ui.available_width() - 185.0).max(120.0));
-                                let time_str = if lw.duration_secs > 1.0 {
-                                    format!(
-                                        "Continue watching · {} / {}",
-                                        format_duration(lw.position_secs),
-                                        format_duration(lw.duration_secs)
-                                    )
-                                } else {
-                                    format!(
-                                        "Continue watching · {}",
-                                        format_duration(lw.position_secs)
-                                    )
-                                };
-                                ui.label(
-                                    RichText::new(time_str)
-                                        .font(theme::semibold(11.5))
-                                        .color(theme::YT_BLUE),
-                                );
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&lw.title)
-                                            .font(theme::semibold(13.5))
-                                            .color(Color32::WHITE),
-                                    )
-                                    .truncate(),
-                                );
-                                let sub_line = if let Some(bg) = &lw.second_tab {
-                                    if bg.position_secs > 2.0 {
-                                        format!(
-                                            "{}  ·  + Tab 2: {} ({})",
-                                            lw.channel,
-                                            bg.title,
-                                            format_duration(bg.position_secs)
-                                        )
+                            let left_resp = ui
+                                .horizontal(|ui| {
+                                    let pct = if lw.duration_secs > 10.0 {
+                                        Some((lw.position_secs / lw.duration_secs).clamp(0.02, 1.0)
+                                            as f32)
                                     } else {
-                                        format!("{}  ·  + Tab 2: {}", lw.channel, bg.title)
+                                        None
+                                    };
+                                    if !lw.thumbnail_url.is_empty() {
+                                        draw_thumbnail(
+                                            ui,
+                                            &lw.thumbnail_url,
+                                            "",
+                                            Vec2::new(88.0, 50.0),
+                                            7.0,
+                                            pct,
+                                        );
+                                        ui.add_space(10.0);
+                                    } else {
+                                        theme::draw_icon(ui, icon::PLAY, 22.0, theme::YT_BLUE);
+                                        ui.add_space(8.0);
                                     }
-                                } else {
-                                    lw.channel.clone()
-                                };
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(sub_line)
-                                            .font(theme::regular(12.0))
-                                            .color(theme::TEXT_DIM),
-                                    )
-                                    .truncate(),
-                                );
-                            });
+                                    ui.vertical(|ui| {
+                                        ui.set_max_width((ui.available_width() - 185.0).max(120.0));
+                                        let time_str = if lw.duration_secs > 1.0 {
+                                            format!(
+                                                "Continue watching · {} / {}",
+                                                format_duration(lw.position_secs),
+                                                format_duration(lw.duration_secs)
+                                            )
+                                        } else {
+                                            format!(
+                                                "Continue watching · {}",
+                                                format_duration(lw.position_secs)
+                                            )
+                                        };
+                                        ui.label(
+                                            RichText::new(time_str)
+                                                .font(theme::semibold(11.5))
+                                                .color(theme::YT_BLUE),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&lw.title)
+                                                    .font(theme::semibold(13.5))
+                                                    .color(Color32::WHITE),
+                                            )
+                                            .truncate(),
+                                        );
+                                        let sub_line = if let Some(bg) = &lw.second_tab {
+                                            if bg.position_secs > 2.0 {
+                                                format!(
+                                                    "{}  ·  + Tab 2: {} ({})",
+                                                    lw.channel,
+                                                    bg.title,
+                                                    format_duration(bg.position_secs)
+                                                )
+                                            } else {
+                                                format!("{}  ·  + Tab 2: {}", lw.channel, bg.title)
+                                            }
+                                        } else {
+                                            lw.channel.clone()
+                                        };
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(sub_line)
+                                                    .font(theme::regular(12.0))
+                                                    .color(theme::TEXT_DIM),
+                                            )
+                                            .truncate(),
+                                        );
+                                    });
+                                })
+                                .response
+                                .interact(Sense::click())
+                                .on_hover_cursor(CursorIcon::PointingHand);
+                            ui.ctx()
+                                .data_mut(|d| d.insert_temp(card_hover_id, left_resp.hovered()));
+                            if left_resp.clicked() {
+                                resume_now = true;
+                            }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if icon_circle_button(ui, icon::X, 14.0, "Dismiss") {
                                     dismiss_now = true;
@@ -649,6 +671,7 @@ impl YtApp {
         struct ChannelStickyState {
             header_h: f32,
             tab_bar_h: f32,
+            scroll_y: f32,
             pending_scroll_y: Option<f32>,
         }
         impl Default for ChannelStickyState {
@@ -656,6 +679,7 @@ impl YtApp {
                 Self {
                     header_h: 180.0,
                     tab_bar_h: 46.0,
+                    scroll_y: 0.0,
                     pending_scroll_y: None,
                 }
             }
@@ -688,11 +712,19 @@ impl YtApp {
         let mut clicked_channel_chip: Option<usize> = None;
         let mut measured_header_h = sticky.header_h;
 
+        let active_scroll_y = sticky.pending_scroll_y.unwrap_or(sticky.scroll_y);
+        let clip_tab_bottom_y = (page_rect.top()
+            + (sticky.header_h - active_scroll_y).max(0.0)
+            + sticky.tab_bar_h)
+            .min(page_rect.bottom());
+
         let mut sa = ScrollArea::vertical().id_salt(("channel_page_scroll", cid_key.as_str()));
         if let Some(target_y) = sticky.pending_scroll_y.take() {
             sa = sa.vertical_scroll_offset(target_y);
         }
         let scroll_out = sa.show(ui, |ui| {
+            let page_clip = ui.clip_rect().intersect(page_rect);
+            ui.set_clip_rect(page_clip);
             let content_top = ui.cursor().top();
             let hdr_resp = ui.vertical(|ui| {
                 if let Some(banner) = &info.banner_url {
@@ -800,6 +832,13 @@ impl YtApp {
             ui.allocate_space(Vec2::new(ui.available_width(), sticky.tab_bar_h));
             ui.add_space(8.0);
 
+            // Hard-clip scrolled chips and video grid below the sticky tab bar so cards never bleed behind or above it.
+            let below_tab_rect = Rect::from_min_max(
+                pos2(page_rect.left(), clip_tab_bottom_y),
+                page_rect.max,
+            );
+            ui.set_clip_rect(page_clip.intersect(below_tab_rect));
+
             if search_active.is_empty() && !self.channel_chips.is_empty() {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
@@ -885,40 +924,38 @@ impl YtApp {
 
         // Sticky tabs + channel search bar: slides up with the header until pinned at page top.
         let tab_top_y = page_rect.top() + (measured_header_h - cur_scroll_y).max(0.0);
-        let tab_full_rect = Rect::from_min_max(
-            pos2(page_rect.left(), tab_top_y),
-            pos2(
-                page_rect.right(),
-                (tab_top_y + sticky.tab_bar_h).min(page_rect.bottom()),
-            ),
-        );
         let tab_content_right = scroll_out.inner_rect.right().min(page_rect.right());
         let tab_inner_rect = Rect::from_min_max(
             pos2(page_rect.left(), tab_top_y),
             pos2(tab_content_right, tab_top_y + sticky.tab_bar_h + 24.0),
         );
+        let full_left = page_rect.left() - 12.0;
+        let full_right = page_rect.right() + 18.0;
 
-        let is_pinned = cur_scroll_y >= measured_header_h - 0.5;
-        let sticky_bg = if theme::is_translucent() {
-            if cur_scroll_y > 1.0 {
-                Color32::from_rgba_unmultiplied(15, 15, 19, 232)
-            } else {
-                Color32::TRANSPARENT
-            }
+        let sticky_bg = if cur_scroll_y <= 0.5 && theme::is_translucent() {
+            Color32::TRANSPARENT
+        } else if theme::is_translucent() {
+            theme::chrome_bg()
         } else {
             theme::BG
         };
-        if sticky_bg != Color32::TRANSPARENT {
-            ui.painter().rect_filled(tab_full_rect, 0.0, sticky_bg);
-        }
+        let bg_shape_idx = ui.painter().add(egui::Shape::Noop);
+        let pre_blocker_rect = Rect::from_min_max(
+            pos2(full_left, tab_top_y),
+            pos2(
+                full_right,
+                (tab_top_y + sticky.tab_bar_h).min(page_rect.bottom()),
+            ),
+        );
         // Block pointer clicks/hovers from hitting scrolled video cards underneath the sticky bar.
         ui.interact(
-            tab_full_rect,
+            pre_blocker_rect,
             ui.scope_id().with(("channel_sticky_blocker", cid_key.as_str())),
             Sense::click(),
         );
 
         let mut measured_tab_bar_h = sticky.tab_bar_h;
+        let mut clear_search_requested = false;
         ui.scope_builder(
             egui::UiBuilder::new()
                 .max_rect(tab_inner_rect)
@@ -926,7 +963,7 @@ impl YtApp {
             |ui| {
                 ui.set_clip_rect(ui.clip_rect().intersect(page_rect));
                 let bar_resp = ui.vertical(|ui| {
-                    ui.add_space(if is_pinned { 4.0 } else { 0.0 });
+                    ui.add_space(2.0);
                     ui.horizontal(|ui| {
                         for tab in &tabs {
                             let is_active = self.channel_search_active.is_empty()
@@ -986,23 +1023,7 @@ impl YtApp {
                             if !self.channel_search_active.is_empty()
                                 && icon_circle_button(ui, icon::X, 13.0, "Clear channel search")
                             {
-                                self.channel_search_input.clear();
-                                self.channel_search_active.clear();
-                                if let Some(cid) = self.channel_id.clone() {
-                                    self.channel_chips.clear();
-                                    self.channel_items.clear();
-                                    self.channel_continuation = None;
-                                    self.channel_loading = true;
-                                    if cur_scroll_y > measured_header_h {
-                                        sticky.pending_scroll_y = Some(measured_header_h);
-                                    }
-                                    let _ = self.backend.tx.send(Request::LoadChannel {
-                                        channel_id: cid,
-                                        params: self.channel_tab_params.clone(),
-                                        continuation: None,
-                                        append: false,
-                                    });
-                                }
+                                clear_search_requested = true;
                             }
                             let search_clicked =
                                 icon_circle_button(ui, icon::SEARCH, 14.0, "Search channel");
@@ -1016,33 +1037,77 @@ impl YtApp {
                                     && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                             {
                                 let q = self.channel_search_input.trim().to_owned();
-                                if !q.is_empty() {
-                                    if let Some(cid) = self.channel_id.clone() {
-                                        self.channel_search_active = q.clone();
-                                        self.channel_items.clear();
-                                        self.channel_continuation = None;
-                                        self.channel_loading = true;
-                                        if cur_scroll_y > measured_header_h {
-                                            sticky.pending_scroll_y = Some(measured_header_h);
-                                        }
-                                        let _ = self.backend.tx.send(Request::SearchChannel {
-                                            channel_id: cid,
-                                            query: q,
-                                            continuation: None,
-                                        });
+                                if q.is_empty() {
+                                    if !self.channel_search_active.is_empty() {
+                                        clear_search_requested = true;
                                     }
+                                } else if let Some(cid) = self.channel_id.clone() {
+                                    self.channel_search_active = q.clone();
+                                    self.channel_items.clear();
+                                    self.channel_continuation = None;
+                                    self.channel_loading = true;
+                                    if cur_scroll_y > measured_header_h {
+                                        sticky.pending_scroll_y = Some(measured_header_h);
+                                    }
+                                    let _ = self.backend.tx.send(Request::SearchChannel {
+                                        channel_id: cid,
+                                        query: q,
+                                        continuation: None,
+                                    });
                                 }
                             }
                         });
                     });
-                    ui.separator();
+                    ui.add_space(6.0);
                 });
                 measured_tab_bar_h = bar_resp.response.rect.height().max(38.0);
             },
         );
+        if clear_search_requested {
+            self.channel_search_input.clear();
+            self.channel_search_active.clear();
+            if let Some(cid) = self.channel_id.clone() {
+                self.channel_chips.clear();
+                self.channel_items.clear();
+                self.channel_continuation = None;
+                self.channel_loading = true;
+                if cur_scroll_y > measured_header_h {
+                    sticky.pending_scroll_y = Some(measured_header_h);
+                }
+                let _ = self.backend.tx.send(Request::LoadChannel {
+                    channel_id: cid,
+                    params: self.channel_tab_params.clone(),
+                    continuation: None,
+                    append: false,
+                });
+            }
+        }
+        let bar_bottom_y = (tab_top_y + measured_tab_bar_h).min(page_rect.bottom());
+        if sticky_bg != Color32::TRANSPARENT {
+            let bg_top = if tab_top_y <= page_rect.top() + 0.5 {
+                (tab_top_y - 4.0).max(page_rect.top() - 4.0)
+            } else {
+                tab_top_y
+            };
+            let exact_bg_rect = Rect::from_min_max(
+                pos2(full_left, bg_top),
+                pos2(full_right, bar_bottom_y),
+            );
+            ui.painter().set(
+                bg_shape_idx,
+                egui::Shape::rect_filled(exact_bg_rect, 0.0, sticky_bg),
+            );
+        }
+        let sep_left = if cur_scroll_y > 0.5 { full_left } else { page_rect.left() };
+        let sep_right = if cur_scroll_y > 0.5 { full_right } else { page_rect.right() };
+        ui.painter().line_segment(
+            [pos2(sep_left, bar_bottom_y), pos2(sep_right, bar_bottom_y)],
+            Stroke::new(1.0, theme::BORDER),
+        );
 
         sticky.header_h = measured_header_h;
         sticky.tab_bar_h = measured_tab_bar_h;
+        sticky.scroll_y = cur_scroll_y;
         ctx.data_mut(|d| d.insert_temp(sticky_id, sticky));
 
         if let Some(chip_idx) = clicked_channel_chip {

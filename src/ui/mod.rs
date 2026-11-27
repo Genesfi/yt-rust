@@ -6,7 +6,7 @@ mod watch;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::glow;
@@ -514,6 +514,8 @@ pub struct YtApp {
     pub(super) hover_preview_active_id: Option<String>,
     pub(super) hover_preview_duration: f64,
     pub(super) hover_preview_last_hover_at: Option<Instant>,
+    pub(super) hover_preview_stopped_at: Option<Instant>,
+    pub(super) retired_mpv: Arc<Mutex<Vec<MpvPlayer>>>,
     pub(super) hwdec_mode: HwdecMode,
     pub(super) download_dir: String,
     pub(super) sponsorblock_enabled: bool,
@@ -572,6 +574,8 @@ pub struct YtApp {
     pub(super) hud_feedback: Option<(HudIcon, String, Instant)>,
     pub(super) pip_pos: Option<egui::Pos2>,
     pub(super) pip_snap_target: Option<egui::Pos2>,
+    pub(super) pip_pre_queue_pos: Option<egui::Pos2>,
+    pub(super) pip_queue_open: bool,
 
     pub(super) status_toast: Option<(String, Instant)>,
     pub(super) last_error: Option<String>,
@@ -952,6 +956,8 @@ impl YtApp {
             hover_preview_active_id: None,
             hover_preview_duration: 0.0,
             hover_preview_last_hover_at: None,
+            hover_preview_stopped_at: None,
+            retired_mpv: Arc::new(Mutex::new(Vec::new())),
             hwdec_mode,
             download_dir,
             sponsorblock_enabled,
@@ -1008,6 +1014,8 @@ impl YtApp {
             hud_feedback: None,
             pip_pos: None,
             pip_snap_target: None,
+            pip_pre_queue_pos: None,
+            pip_queue_open: false,
             status_toast: None,
             last_error: None,
             playlist_modal_video: None,
@@ -1541,16 +1549,50 @@ impl YtApp {
         self.toast(format!("Opened in Tab 2: {title}"));
     }
 
+    /// Queue a dropped `MpvPlayer` so its OpenGL FBO/texture/render_context are freed
+    /// with an active GL context during the next paint pass (or `on_exit`).
+    pub(super) fn retire_mpv(&self, mpv: Option<MpvPlayer>) {
+        if let Some(m) = mpv {
+            m.stop();
+            if let Ok(mut q) = self.retired_mpv.lock() {
+                q.push(m);
+            }
+        }
+    }
+
+    fn schedule_retired_mpv_gl_cleanup(&self, ctx: &egui::Context) {
+        let has_retired = self
+            .retired_mpv
+            .lock()
+            .is_ok_and(|q| !q.is_empty());
+        if !has_retired {
+            return;
+        }
+        let queue = self.retired_mpv.clone();
+        let cb = egui::PaintCallback {
+            rect: egui::Rect::NOTHING,
+            callback: Arc::new(eframe::egui_glow::CallbackFn::new(move |_info, painter| {
+                let gl = painter.gl();
+                if let Ok(mut q) = queue.lock() {
+                    for mpv in q.drain(..) {
+                        mpv.destroy_gl(Some(gl));
+                    }
+                }
+            })),
+        };
+        ctx.layer_painter(egui::LayerId::background()).add(cb);
+    }
+
     pub(super) fn close_player_tab(&mut self, close_active: bool) {
         if close_active {
-            if let Some(m) = &self.mpv {
-                m.stop();
-            }
             if let Some(mut bg) = self.bg_player_tab.take() {
                 self.swap_active_with(&mut bg);
+                self.retire_mpv(bg.mpv.take());
                 drop(bg);
                 self.active_player_tab = 0;
             } else {
+                let old_mpv = self.mpv.take();
+                self.retire_mpv(old_mpv);
                 self.watch = None;
                 self.active_watch_id = None;
                 self.watch_loading = false;
@@ -1559,10 +1601,8 @@ impl YtApp {
                     self.page = self.prev_page;
                 }
             }
-        } else if let Some(bg) = self.bg_player_tab.take() {
-            if let Some(m) = &bg.mpv {
-                m.stop();
-            }
+        } else if let Some(mut bg) = self.bg_player_tab.take() {
+            self.retire_mpv(bg.mpv.take());
             drop(bg);
             self.active_player_tab = 0;
         }
@@ -3763,6 +3803,8 @@ impl YtApp {
         let mut wake_controls = false;
         let mut step_short_delta: isize = 0;
         let mut reload_home = false;
+        let mut exit_pip = false;
+        let mut set_fullscreen: Option<bool> = None;
         ctx.input(|i| {
             if i.key_pressed(Key::Escape) {
                 if self.notifications_open {
@@ -3770,10 +3812,10 @@ impl YtApp {
                 } else if self.player_menu != PlayerMenu::None {
                     self.player_menu = PlayerMenu::None;
                 } else if self.win_pip_mode {
-                    self.exit_win_pip(ctx);
+                    exit_pip = true;
                 } else if self.fullscreen {
                     self.fullscreen = false;
-                    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
+                    set_fullscreen = Some(false);
                 }
             }
             if self.page == Page::Home && i.key_pressed(Key::F5) {
@@ -3888,7 +3930,7 @@ impl YtApp {
             }
             if self.shortcuts.fullscreen.matches(i) {
                 self.fullscreen = !self.fullscreen;
-                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
+                set_fullscreen = Some(self.fullscreen);
                 wake_controls = true;
             }
             if self.shortcuts.toggle_captions.matches(i) {
@@ -3923,6 +3965,12 @@ impl YtApp {
                 wake_controls = true;
             }
         });
+        if exit_pip {
+            self.exit_win_pip(ctx);
+        }
+        if let Some(fs) = set_fullscreen {
+            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(fs));
+        }
         if reload_home {
             self.reload_home_feed();
         }
@@ -4837,10 +4885,16 @@ impl eframe::App for YtApp {
         if let Some(mpv) = &self.hover_preview_mpv {
             mpv.destroy_gl(gl);
         }
+        if let Ok(mut q) = self.retired_mpv.lock() {
+            for mpv in q.drain(..) {
+                mpv.destroy_gl(gl);
+            }
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.schedule_retired_mpv_gl_cleanup(&ctx);
         self.drain_backend(&ctx);
         self.handle_shortcuts(&ctx);
         self.handle_os_media();
@@ -5035,6 +5089,9 @@ impl YtApp {
         self.hover_preview_playback = PlaybackState::default();
         if let Some(mpv) = &self.hover_preview_mpv {
             mpv.stop();
+            if self.hover_preview_stopped_at.is_none() {
+                self.hover_preview_stopped_at = Some(Instant::now());
+            }
         }
     }
 
@@ -5046,6 +5103,11 @@ impl YtApp {
             && !self.fullscreen;
         if !allowed {
             self.stop_hover_preview();
+            if self.hover_preview_mpv.is_some() {
+                let retired = self.hover_preview_mpv.take();
+                self.retire_mpv(retired);
+                self.hover_preview_stopped_at = None;
+            }
             ctx.data_mut(|d| {
                 d.insert_temp(cards::hover_input_id(), cards::HoverPreviewInput::default());
                 d.insert_temp(
@@ -5055,7 +5117,20 @@ impl YtApp {
             });
             return;
         }
+        if self.hover_preview_active_id.is_none()
+            && self.hover_preview_loading_id.is_none()
+            && self.hover_preview_candidate.is_none()
+            && self
+                .hover_preview_stopped_at
+                .is_some_and(|t| t.elapsed() >= Duration::from_secs(20))
+        {
+            if let Some(m) = self.hover_preview_mpv.take() {
+                self.retire_mpv(Some(m));
+            }
+            self.hover_preview_stopped_at = None;
+        }
         if let (Some(mpv), Some(_)) = (&self.hover_preview_mpv, &self.hover_preview_active_id) {
+            self.hover_preview_stopped_at = None;
             self.hover_preview_playback = mpv.poll_state();
             if !self.hover_preview_playback.paused {
                 ctx.request_repaint_after(Duration::from_millis(33));
