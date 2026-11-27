@@ -55,7 +55,7 @@ Karena `eframe` sudah memegang event loop `winit` utama, WebView2 (`tao` + `wry`
 3. **Alur 2 Tahap BotGuard**:
    - **Tahap Init (sekali per TTL `integrityToken`, kurangi margin 10 menit)**:
      1. `POST https://www.youtube.com/api/jnn/v1/Create`
-        - Header: `Accept: application/json`, `Content-Type: application/json+protobuf`, `x-goog-api-key: AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw`, `x-user-agent: grpc-web-javascript/0.1`
+        - Header: `Accept: application/json`, `Content-Type: application/json+protobuf`, `x-goog-api-key` (public BotGuard client key, lihat `GOOGLE_API_KEY` di `src/potoken.rs`), `x-user-agent: grpc-web-javascript/0.1`
         - Body: `["O43z0dpjhgX20SCx4KAo"]`
      2. Parse/descramble response (base64url decode, jika indeks `[1]` string: tiap byte `(b + 97) as u8` ➔ JSON array challenge).
      3. Di WebView JS (`evaluate_script`): jalankan `new Function(interpreterJavascript)()` ➔ `bgVm.a(program, ...)` ➔ `asyncSnapshotFunction` ➔ kirim `botguardResponse` via `window.ipc.postMessage(...)`.
