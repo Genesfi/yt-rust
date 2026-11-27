@@ -321,7 +321,7 @@ impl MpvPlayer {
             set_opt("cache", "yes");
             set_opt("demuxer-max-bytes", "72MiB");
             set_opt("demuxer-max-back-bytes", "24MiB");
-            set_opt("demuxer-readahead-secs", "25");
+            set_opt("demuxer-readahead-secs", "60");
             set_opt("cache-pause-wait", "1.5");
             set_opt("network-timeout", "15");
             set_opt(
@@ -581,7 +581,15 @@ impl MpvPlayer {
         st.hwdec = self.get_string("hwdec-current").unwrap_or_default();
         st.video_codec = self.get_string("video-codec").unwrap_or_default();
         st.audio_codec = self.get_string("audio-codec-name").unwrap_or_default();
-        st.cache_duration = self.get_double("demuxer-cache-duration").unwrap_or(0.0);
+        st.cache_duration = self
+            .get_double("demuxer-cache-duration")
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .or_else(|| {
+                self.get_double("demuxer-cache-time")
+                    .filter(|t| t.is_finite())
+                    .map(|t| (t - st.time_pos).max(0.0))
+            })
+            .unwrap_or(0.0);
         st
     }
 

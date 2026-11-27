@@ -4196,7 +4196,7 @@ impl YtApp {
             && is_remote_watch
             && self.stream_recovering.is_none()
             && self.last_error.is_none()
-            && (proxy_403 || start_stalled || mid_eof_drop)
+            && (proxy_failed || start_stalled || mid_eof_drop)
         {
             if self.stream_recovery_attempts < 2 {
                 if let Some(w) = &self.watch {

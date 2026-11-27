@@ -1098,10 +1098,11 @@ impl YtApp {
     ) -> (bool, bool) {
         let mut any_interacted = false;
         let mut toggled_menu = false;
-        let dur = self
-            .playback
-            .duration
-            .max(self.watch.as_ref().map_or(0.0, |w| w.duration_secs));
+        let dur = if self.playback.duration > 0.0 {
+            self.playback.duration
+        } else {
+            self.watch.as_ref().map_or(0.0, |w| w.duration_secs)
+        };
         let mut pos = self.seeking_pos.unwrap_or(self.playback.time_pos);
         let is_live = self.watch.as_ref().is_some_and(|w| w.is_live);
         let live_behind = (dur - pos).max(0.0);
@@ -1147,12 +1148,14 @@ impl YtApp {
         cui.painter().rect_filled(
             track,
             h * 0.5,
-            Color32::from_white_alpha((70.0 * alpha).round() as u8),
+            Color32::from_white_alpha((55.0 * alpha).round() as u8),
         );
 
         if dur > 0.0 || is_live {
             if !is_live && dur > 0.0 && self.playback.cache_duration > 0.0 {
-                let buf_frac = ((pos + self.playback.cache_duration) / dur).clamp(0.0, 1.0) as f32;
+                let buf_pos = self.playback.time_pos.max(0.0);
+                let buf_frac =
+                    ((buf_pos + self.playback.cache_duration) / dur).clamp(0.0, 1.0) as f32;
                 let buf_rect = Rect::from_min_max(
                     track.min,
                     pos2(track.left() + track.width() * buf_frac, track.bottom()),
@@ -1160,7 +1163,7 @@ impl YtApp {
                 cui.painter().rect_filled(
                     buf_rect,
                     h * 0.5,
-                    Color32::from_white_alpha((120.0 * alpha).round() as u8),
+                    Color32::from_white_alpha((145.0 * alpha).round() as u8),
                 );
             }
 
@@ -1316,6 +1319,8 @@ impl YtApp {
                 if let Some(target) = self.seeking_pos.take() {
                     let seek_to = if is_live && dur > 4.0 && target >= (dur - 4.0) {
                         (dur - 2.0).max(0.0)
+                    } else if !is_live && dur > 2.0 && target >= (dur - 0.25) {
+                        (dur - 0.25).max(0.0)
                     } else {
                         target
                     };
@@ -4941,6 +4946,20 @@ impl YtApp {
                     1.5,
                     Color32::from_white_alpha((55.0 * overlay_alpha).round() as u8),
                 );
+                if self.playback.cache_duration > 0.0 {
+                    let cache_frac = ((self.playback.time_pos.max(0.0)
+                        + self.playback.cache_duration)
+                        / dur)
+                        .clamp(0.0, 1.0) as f32;
+                    ui.painter().rect_filled(
+                        Rect::from_min_size(
+                            track.min,
+                            Vec2::new(track.width() * cache_frac, track_h),
+                        ),
+                        1.5,
+                        Color32::from_white_alpha((145.0 * overlay_alpha).round() as u8),
+                    );
+                }
                 if bar_resp.dragged() || bar_resp.clicked() {
                     any_control_hit = true;
                     if let Some(ptr) = bar_resp.interact_pointer_pos() {

@@ -645,111 +645,170 @@ impl YtApp {
     }
 
     pub(super) fn draw_channel_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        #[derive(Clone, Copy)]
+        struct ChannelStickyState {
+            header_h: f32,
+            tab_bar_h: f32,
+            pending_scroll_y: Option<f32>,
+        }
+        impl Default for ChannelStickyState {
+            fn default() -> Self {
+                Self {
+                    header_h: 180.0,
+                    tab_bar_h: 46.0,
+                    pending_scroll_y: None,
+                }
+            }
+        }
+
         let info = self.channel_info.clone().unwrap_or_else(|| ChannelInfo {
             id: self.channel_id.clone().unwrap_or_default(),
             name: self.channel_name.clone(),
             ..Default::default()
         });
+        let cid_key = self.channel_id.as_deref().unwrap_or("").to_owned();
+        let sticky_id = egui::Id::unique(("channel_sticky_state", cid_key.as_str()));
+        let mut sticky = ctx
+            .data_mut(|d| d.get_temp::<ChannelStickyState>(sticky_id))
+            .unwrap_or_default();
 
-        if let Some(banner) = &info.banner_url {
-            let bw = ui.available_width();
-            let bh = (bw * 0.145).clamp(72.0, 140.0);
-            let (brect, _) = ui.allocate_exact_size(Vec2::new(bw, bh), Sense::hover());
-            theme::paint_image_rounded(ui, banner, brect, 12);
-            ui.add_space(12.0);
+        let page_rect = ui.available_rect_before_wrap();
+        let items = self.channel_items.clone();
+        let loading = self.channel_loading;
+        let cont = self.channel_continuation.clone();
+        let tab_params = self.channel_tab_params.clone();
+        let search_active = self.channel_search_active.clone();
+        let heading = if search_active.is_empty() {
+            String::new()
+        } else {
+            format!("Results in channel for \"{search_active}\"")
+        };
+
+        let mut grid_action: Option<super::cards::GridAction> = None;
+        let mut measured_header_h = sticky.header_h;
+
+        let mut sa = ScrollArea::vertical().id_salt(("channel_page_scroll", cid_key.as_str()));
+        if let Some(target_y) = sticky.pending_scroll_y.take() {
+            sa = sa.vertical_scroll_offset(target_y);
         }
-
-        ui.horizontal(|ui| {
-            draw_avatar(ui, info.avatar_url.as_deref(), &info.name, 72.0);
-            ui.add_space(12.0);
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new(&info.name)
-                        .font(theme::bold(22.0))
-                        .color(Color32::WHITE),
-                );
-                let sub_line = match (info.handle.is_empty(), info.subscribers_text.is_empty()) {
-                    (false, false) => format!("{} · {}", info.handle, info.subscribers_text),
-                    (false, true) => info.handle.clone(),
-                    (true, false) => info.subscribers_text.clone(),
-                    (true, true) => String::new(),
-                };
-                if !sub_line.is_empty() {
-                    ui.label(
-                        RichText::new(sub_line)
-                            .font(theme::regular(13.0))
-                            .color(theme::TEXT_DIM),
-                    );
+        let scroll_out = sa.show(ui, |ui| {
+            let content_top = ui.cursor().top();
+            let hdr_resp = ui.vertical(|ui| {
+                if let Some(banner) = &info.banner_url {
+                    let bw = (ui.available_width() - 8.0).max(200.0);
+                    let bh = (bw * 0.145).clamp(72.0, 140.0);
+                    let (brect, _) = ui.allocate_exact_size(Vec2::new(bw, bh), Sense::hover());
+                    theme::paint_image_rounded(ui, banner, brect, 12);
+                    ui.add_space(12.0);
                 }
-                ui.add_space(4.0);
-                if let Some(cid) = self.channel_id.clone() {
-                    ui.horizontal(|ui| {
-                        super::cards::draw_subscribe_bell_button(
-                            ui,
-                            cid,
-                            info.is_subscribed,
-                            &info.notifications,
-                            &self.backend.tx,
+
+                ui.horizontal(|ui| {
+                    draw_avatar(ui, info.avatar_url.as_deref(), &info.name, 72.0);
+                    ui.add_space(12.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(&info.name)
+                                .font(theme::bold(22.0))
+                                .color(Color32::WHITE),
                         );
-                        if self
-                            .channel_items
-                            .iter()
-                            .any(|it| it.playlist_browse_id.is_none())
-                        {
-                            let items_snap = self.channel_items.clone();
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new(format!("{}  Play All", icon::PLAY))
-                                            .font(theme::medium(12.5))
-                                            .color(theme::TEXT),
-                                    )
-                                    .fill(theme::CHIP)
-                                    .corner_radius(18),
-                                )
-                                .clicked()
-                            {
-                                self.play_all(&items_snap, false, None);
-                            }
-                            let (sh_rect, sh_resp) = ui.allocate_exact_size(
-                                Vec2::new(88.0, 30.0),
-                                Sense::click(),
+                        let sub_line = match (info.handle.is_empty(), info.subscribers_text.is_empty()) {
+                            (false, false) => format!("{} · {}", info.handle, info.subscribers_text),
+                            (false, true) => info.handle.clone(),
+                            (true, false) => info.subscribers_text.clone(),
+                            (true, true) => String::new(),
+                        };
+                        if !sub_line.is_empty() {
+                            ui.label(
+                                RichText::new(sub_line)
+                                    .font(theme::regular(13.0))
+                                    .color(theme::TEXT_DIM),
                             );
-                            if sh_resp.hovered() {
-                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                            }
-                            ui.painter().rect_filled(
-                                sh_rect,
-                                15.0,
-                                if sh_resp.hovered() {
-                                    theme::CHIP_HOVER
-                                } else {
-                                    theme::CHIP
-                                },
-                            );
-                            theme::draw_shuffle_icon(
-                                ui.painter(),
-                                pos2(sh_rect.left() + 17.0, sh_rect.center().y),
-                                14.0,
-                                theme::TEXT,
-                            );
-                            ui.painter().text(
-                                pos2(sh_rect.left() + 30.0, sh_rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                "Shuffle",
-                                theme::medium(12.5),
-                                theme::TEXT,
-                            );
-                            if sh_resp.clicked() {
-                                self.play_all(&items_snap, true, None);
-                            }
+                        }
+                        ui.add_space(4.0);
+                        if let Some(cid) = self.channel_id.clone() {
+                            ui.horizontal(|ui| {
+                                super::cards::draw_subscribe_bell_button(
+                                    ui,
+                                    cid,
+                                    info.is_subscribed,
+                                    &info.notifications,
+                                    &self.backend.tx,
+                                );
+                                if self
+                                    .channel_items
+                                    .iter()
+                                    .any(|it| it.playlist_browse_id.is_none())
+                                {
+                                    let items_snap = self.channel_items.clone();
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new(format!("{}  Play All", icon::PLAY))
+                                                    .font(theme::medium(12.5))
+                                                    .color(theme::TEXT),
+                                            )
+                                            .fill(theme::CHIP)
+                                            .corner_radius(18),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.play_all(&items_snap, false, None);
+                                    }
+                                    let (sh_rect, sh_resp) = ui.allocate_exact_size(
+                                        Vec2::new(88.0, 30.0),
+                                        Sense::click(),
+                                    );
+                                    if sh_resp.hovered() {
+                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                    }
+                                    ui.painter().rect_filled(
+                                        sh_rect,
+                                        15.0,
+                                        if sh_resp.hovered() {
+                                            theme::CHIP_HOVER
+                                        } else {
+                                            theme::CHIP
+                                        },
+                                    );
+                                    theme::draw_shuffle_icon(
+                                        ui.painter(),
+                                        pos2(sh_rect.left() + 17.0, sh_rect.center().y),
+                                        14.0,
+                                        theme::TEXT,
+                                    );
+                                    ui.painter().text(
+                                        pos2(sh_rect.left() + 30.0, sh_rect.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        "Shuffle",
+                                        theme::medium(12.5),
+                                        theme::TEXT,
+                                    );
+                                    if sh_resp.clicked() {
+                                        self.play_all(&items_snap, true, None);
+                                    }
+                                }
+                            });
                         }
                     });
-                }
+                });
+                ui.add_space(10.0);
             });
+            measured_header_h = (hdr_resp.response.rect.bottom() - content_top).max(0.0);
+
+            // Reserve exact flow height for the sticky tab + channel search bar rendered on top.
+            ui.allocate_space(Vec2::new(ui.available_width(), sticky.tab_bar_h));
+            ui.add_space(8.0);
+
+            grid_action = super::cards::draw_video_grid_body(
+                ui,
+                &heading,
+                &items,
+                loading,
+                cont.is_some(),
+            );
         });
 
-        ui.add_space(10.0);
+        let cur_scroll_y = scroll_out.state.clamped_offset().y;
         let tabs = if !info.tabs.is_empty() {
             info.tabs
         } else {
@@ -790,113 +849,176 @@ impl YtApp {
             })
             .map(|t| t.title.clone())
             .unwrap_or_default();
-        ui.horizontal(|ui| {
-            for tab in &tabs {
-                let is_active = self.channel_search_active.is_empty()
-                    && match (&self.channel_tab_params, &tab.params) {
-                        (Some(cur), Some(p)) => cur == p,
-                        (None, _) => tab.selected,
-                        _ => false,
-                    };
-                let resp = ui.add(
-                    egui::Button::new(
-                        RichText::new(&tab.title)
-                            .font(if is_active {
-                                theme::semibold(14.0)
-                            } else {
-                                theme::medium(14.0)
-                            })
-                            .color(if is_active {
-                                Color32::WHITE
-                            } else {
-                                theme::TEXT_DIM
-                            }),
-                    )
-                    .fill(Color32::TRANSPARENT),
-                );
-                if is_active {
-                    let r = resp.rect;
-                    ui.painter().line_segment(
-                        [
-                            pos2(r.left() + 4.0, r.bottom()),
-                            pos2(r.right() - 4.0, r.bottom()),
-                        ],
-                        Stroke::new(2.0, Color32::WHITE),
-                    );
-                }
-                if resp.clicked() && !is_active {
-                    if let Some(cid) = self.channel_id.clone() {
-                        self.channel_search_active.clear();
-                        self.channel_tab_params = tab.params.clone();
-                        self.channel_items.clear();
-                        self.channel_continuation = None;
-                        self.channel_loading = true;
-                        let _ = self.backend.tx.send(Request::LoadChannel {
-                            channel_id: cid,
-                            params: tab.params.clone(),
-                            continuation: None,
-                        });
-                    }
-                }
-                ui.add_space(6.0);
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if !self.channel_search_active.is_empty()
-                    && icon_circle_button(ui, icon::X, 13.0, "Clear channel search")
-                {
-                    self.channel_search_input.clear();
-                    self.channel_search_active.clear();
-                    if let Some(cid) = self.channel_id.clone() {
-                        self.channel_items.clear();
-                        self.channel_continuation = None;
-                        self.channel_loading = true;
-                        let _ = self.backend.tx.send(Request::LoadChannel {
-                            channel_id: cid,
-                            params: self.channel_tab_params.clone(),
-                            continuation: None,
-                        });
-                    }
-                }
-                let search_clicked = icon_circle_button(ui, icon::SEARCH, 14.0, "Search channel");
-                let te = ui.add_sized(
-                    Vec2::new(190.0_f32.min(ui.available_width().max(90.0)), 28.0),
-                    egui::TextEdit::singleline(&mut self.channel_search_input)
-                        .hint_text("Search channel..."),
-                );
-                if search_clicked || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                {
-                    let q = self.channel_search_input.trim().to_owned();
-                    if !q.is_empty() {
-                        if let Some(cid) = self.channel_id.clone() {
-                            self.channel_search_active = q.clone();
-                            self.channel_items.clear();
-                            self.channel_continuation = None;
-                            self.channel_loading = true;
-                            let _ = self.backend.tx.send(Request::SearchChannel {
-                                channel_id: cid,
-                                query: q,
-                                continuation: None,
-                            });
-                        }
-                    }
-                }
-            });
-        });
-        ui.separator();
-        ui.add_space(8.0);
 
-        let items = self.channel_items.clone();
-        let loading = self.channel_loading;
-        let cont = self.channel_continuation.clone();
-        let tab_params = self.channel_tab_params.clone();
-        let search_active = self.channel_search_active.clone();
-        let heading = if search_active.is_empty() {
-            String::new()
+        // Sticky tabs + channel search bar: slides up with the header until pinned at page top.
+        let tab_top_y = page_rect.top() + (measured_header_h - cur_scroll_y).max(0.0);
+        let tab_full_rect = Rect::from_min_max(
+            pos2(page_rect.left(), tab_top_y),
+            pos2(
+                page_rect.right(),
+                (tab_top_y + sticky.tab_bar_h).min(page_rect.bottom()),
+            ),
+        );
+        let tab_content_right = scroll_out.inner_rect.right().min(page_rect.right());
+        let tab_inner_rect = Rect::from_min_max(
+            pos2(page_rect.left(), tab_top_y),
+            pos2(tab_content_right, tab_top_y + sticky.tab_bar_h + 24.0),
+        );
+
+        let is_pinned = cur_scroll_y >= measured_header_h - 0.5;
+        let sticky_bg = if theme::is_translucent() {
+            if cur_scroll_y > 1.0 {
+                Color32::from_rgba_unmultiplied(15, 15, 19, 232)
+            } else {
+                Color32::TRANSPARENT
+            }
         } else {
-            format!("Results in channel for \"{search_active}\"")
+            theme::BG
         };
-        let is_shorts_tab = search_active.is_empty() && active_tab_title.eq_ignore_ascii_case("Shorts");
-        if let Some(act) = draw_video_grid(ui, &heading, &items, loading, cont.is_some()) {
+        if sticky_bg != Color32::TRANSPARENT {
+            ui.painter().rect_filled(tab_full_rect, 0.0, sticky_bg);
+        }
+        // Block pointer clicks/hovers from hitting scrolled video cards underneath the sticky bar.
+        ui.interact(
+            tab_full_rect,
+            ui.scope_id().with(("channel_sticky_blocker", cid_key.as_str())),
+            Sense::click(),
+        );
+
+        let mut measured_tab_bar_h = sticky.tab_bar_h;
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(tab_inner_rect)
+                .layout(Layout::top_down(Align::LEFT)),
+            |ui| {
+                ui.set_clip_rect(ui.clip_rect().intersect(page_rect));
+                let bar_resp = ui.vertical(|ui| {
+                    ui.add_space(if is_pinned { 4.0 } else { 0.0 });
+                    ui.horizontal(|ui| {
+                        for tab in &tabs {
+                            let is_active = self.channel_search_active.is_empty()
+                                && match (&self.channel_tab_params, &tab.params) {
+                                    (Some(cur), Some(p)) => cur == p,
+                                    (None, _) => tab.selected,
+                                    _ => false,
+                                };
+                            let resp = ui.add(
+                                egui::Button::new(
+                                    RichText::new(&tab.title)
+                                        .font(if is_active {
+                                            theme::semibold(14.0)
+                                        } else {
+                                            theme::medium(14.0)
+                                        })
+                                        .color(if is_active {
+                                            Color32::WHITE
+                                        } else {
+                                            theme::TEXT_DIM
+                                        }),
+                                )
+                                .fill(Color32::TRANSPARENT),
+                            );
+                            if is_active {
+                                let r = resp.rect;
+                                ui.painter().line_segment(
+                                    [
+                                        pos2(r.left() + 4.0, r.bottom()),
+                                        pos2(r.right() - 4.0, r.bottom()),
+                                    ],
+                                    Stroke::new(2.0, Color32::WHITE),
+                                );
+                            }
+                            if resp.clicked() && !is_active {
+                                if let Some(cid) = self.channel_id.clone() {
+                                    self.channel_search_active.clear();
+                                    self.channel_tab_params = tab.params.clone();
+                                    self.channel_items.clear();
+                                    self.channel_continuation = None;
+                                    self.channel_loading = true;
+                                    if cur_scroll_y > measured_header_h {
+                                        sticky.pending_scroll_y = Some(measured_header_h);
+                                    }
+                                    let _ = self.backend.tx.send(Request::LoadChannel {
+                                        channel_id: cid,
+                                        params: tab.params.clone(),
+                                        continuation: None,
+                                    });
+                                }
+                            }
+                            ui.add_space(6.0);
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if !self.channel_search_active.is_empty()
+                                && icon_circle_button(ui, icon::X, 13.0, "Clear channel search")
+                            {
+                                self.channel_search_input.clear();
+                                self.channel_search_active.clear();
+                                if let Some(cid) = self.channel_id.clone() {
+                                    self.channel_items.clear();
+                                    self.channel_continuation = None;
+                                    self.channel_loading = true;
+                                    if cur_scroll_y > measured_header_h {
+                                        sticky.pending_scroll_y = Some(measured_header_h);
+                                    }
+                                    let _ = self.backend.tx.send(Request::LoadChannel {
+                                        channel_id: cid,
+                                        params: self.channel_tab_params.clone(),
+                                        continuation: None,
+                                    });
+                                }
+                            }
+                            let search_clicked =
+                                icon_circle_button(ui, icon::SEARCH, 14.0, "Search channel");
+                            let te = ui.add_sized(
+                                Vec2::new(190.0_f32.min(ui.available_width().max(90.0)), 28.0),
+                                egui::TextEdit::singleline(&mut self.channel_search_input)
+                                    .hint_text("Search channel..."),
+                            );
+                            if search_clicked
+                                || (te.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                            {
+                                let q = self.channel_search_input.trim().to_owned();
+                                if !q.is_empty() {
+                                    if let Some(cid) = self.channel_id.clone() {
+                                        self.channel_search_active = q.clone();
+                                        self.channel_items.clear();
+                                        self.channel_continuation = None;
+                                        self.channel_loading = true;
+                                        if cur_scroll_y > measured_header_h {
+                                            sticky.pending_scroll_y = Some(measured_header_h);
+                                        }
+                                        let _ = self.backend.tx.send(Request::SearchChannel {
+                                            channel_id: cid,
+                                            query: q,
+                                            continuation: None,
+                                        });
+                                    }
+                                }
+                            }
+                        });
+                    });
+                    ui.separator();
+                });
+                measured_tab_bar_h = bar_resp.response.rect.height().max(38.0);
+            },
+        );
+
+        sticky.header_h = measured_header_h;
+        sticky.tab_bar_h = measured_tab_bar_h;
+        ctx.data_mut(|d| d.insert_temp(sticky_id, sticky));
+
+        if cont.is_some() && !loading && grid_action.is_none() {
+            let remaining = scroll_out.content_size.y
+                - (scroll_out.state.clamped_offset().y + scroll_out.inner_rect.height());
+            if remaining < 450.0 {
+                grid_action = Some(super::cards::GridAction::LoadMore);
+            }
+        }
+
+        let is_shorts_tab =
+            search_active.is_empty() && active_tab_title.eq_ignore_ascii_case("Shorts");
+        if let Some(act) = grid_action {
             if is_shorts_tab {
                 if let super::cards::GridAction::Open(ref it) = act {
                     if it.playlist_browse_id.is_none() {

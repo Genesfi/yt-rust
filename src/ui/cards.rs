@@ -620,6 +620,134 @@ pub(super) fn draw_shorts_portrait_grid(
     action
 }
 
+pub(super) fn draw_video_grid_body(
+    ui: &mut egui::Ui,
+    heading: &str,
+    items: &[VideoItem],
+    loading: bool,
+    has_more: bool,
+) -> Option<GridAction> {
+    let mut action = None;
+    if !heading.is_empty() || loading {
+        ui.horizontal(|ui| {
+            if !heading.is_empty() {
+                ui.label(RichText::new(heading).font(theme::bold(20.0)));
+            }
+            if loading {
+                ui.add_space(8.0);
+                ui.spinner();
+            }
+        });
+        ui.add_space(10.0);
+    }
+
+    if items.is_empty() && !loading {
+        ui.label(
+            RichText::new("No videos found.")
+                .font(theme::regular(14.0))
+                .color(theme::TEXT_DIM),
+        );
+        return None;
+    }
+
+    draw_feed_grid_body_inner(
+        ui,
+        heading,
+        items,
+        None,
+        loading,
+        has_more,
+        false,
+        false,
+        false,
+        &mut action,
+    );
+    action
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_feed_grid_body_inner(
+    ui: &mut egui::Ui,
+    heading: &str,
+    items: &[VideoItem],
+    prioritized_shorts: Option<&[VideoItem]>,
+    loading: bool,
+    has_more: bool,
+    show_remove_history: bool,
+    show_remove_playlist: bool,
+    split_shorts_shelf: bool,
+    action: &mut Option<GridAction>,
+) {
+    let avail = (ui.available_width() - 8.0).max(200.0);
+    let cols = ((avail / 305.0).floor() as usize).clamp(1, 5);
+    let spacing = 16.0;
+    let card_w = ((avail - spacing * (cols as f32 - 1.0)) / cols as f32).max(180.0);
+    let thumb_h = card_w * 9.0 / 16.0;
+
+    let (regulars, fallback_shorts): (Vec<&VideoItem>, Vec<&VideoItem>) = if split_shorts_shelf {
+        items.iter().partition(|it| !it.is_short())
+    } else {
+        (items.iter().collect(), Vec::new())
+    };
+    let shorts: Vec<&VideoItem> = match prioritized_shorts {
+        Some(ov) if !ov.is_empty() => ov.iter().collect(),
+        _ => fallback_shorts,
+    };
+
+    let split_at = if !shorts.is_empty() {
+        cols.min(regulars.len())
+    } else {
+        regulars.len()
+    };
+
+    for row in regulars[..split_at].chunks(cols) {
+        draw_video_card_row(
+            ui,
+            row,
+            card_w,
+            thumb_h,
+            spacing,
+            show_remove_history,
+            show_remove_playlist,
+            action,
+        );
+        ui.add_space(18.0);
+    }
+
+    if !shorts.is_empty() {
+        draw_shorts_shelf(ui, heading, &shorts, action);
+        ui.add_space(20.0);
+    }
+
+    for row in regulars[split_at..].chunks(cols) {
+        draw_video_card_row(
+            ui,
+            row,
+            card_w,
+            thumb_h,
+            spacing,
+            show_remove_history,
+            show_remove_playlist,
+            action,
+        );
+        ui.add_space(18.0);
+    }
+
+    if has_more && !loading {
+        ui.add_space(8.0);
+        if ui
+            .add(
+                egui::Button::new(RichText::new("Load more").font(theme::medium(13.0)))
+                    .fill(theme::CHIP)
+                    .corner_radius(18),
+            )
+            .clicked()
+        {
+            *action = Some(GridAction::LoadMore);
+        }
+    }
+}
+
 fn draw_feed_grid_inner(
     ui: &mut egui::Ui,
     heading: &str,
@@ -655,74 +783,18 @@ fn draw_feed_grid_inner(
     }
 
     let scroll_out = ScrollArea::vertical().id_salt(heading).show(ui, |ui| {
-        let avail = (ui.available_width() - 8.0).max(200.0);
-        let cols = ((avail / 305.0).floor() as usize).clamp(1, 5);
-        let spacing = 16.0;
-        let card_w = ((avail - spacing * (cols as f32 - 1.0)) / cols as f32).max(180.0);
-        let thumb_h = card_w * 9.0 / 16.0;
-
-        let (regulars, fallback_shorts): (Vec<&VideoItem>, Vec<&VideoItem>) = if split_shorts_shelf {
-            items.iter().partition(|it| !it.is_short())
-        } else {
-            (items.iter().collect(), Vec::new())
-        };
-        let shorts: Vec<&VideoItem> = match prioritized_shorts {
-            Some(ov) if !ov.is_empty() => ov.iter().collect(),
-            _ => fallback_shorts,
-        };
-
-        let split_at = if !shorts.is_empty() {
-            cols.min(regulars.len())
-        } else {
-            regulars.len()
-        };
-
-        for row in regulars[..split_at].chunks(cols) {
-            draw_video_card_row(
-                ui,
-                row,
-                card_w,
-                thumb_h,
-                spacing,
-                show_remove_history,
-                show_remove_playlist,
-                &mut action,
-            );
-            ui.add_space(18.0);
-        }
-
-        if !shorts.is_empty() {
-            draw_shorts_shelf(ui, heading, &shorts, &mut action);
-            ui.add_space(20.0);
-        }
-
-        for row in regulars[split_at..].chunks(cols) {
-            draw_video_card_row(
-                ui,
-                row,
-                card_w,
-                thumb_h,
-                spacing,
-                show_remove_history,
-                show_remove_playlist,
-                &mut action,
-            );
-            ui.add_space(18.0);
-        }
-
-        if has_more && !loading {
-            ui.add_space(8.0);
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("Load more").font(theme::medium(13.0)))
-                        .fill(theme::CHIP)
-                        .corner_radius(18),
-                )
-                .clicked()
-            {
-                action = Some(GridAction::LoadMore);
-            }
-        }
+        draw_feed_grid_body_inner(
+            ui,
+            heading,
+            items,
+            prioritized_shorts,
+            loading,
+            has_more,
+            show_remove_history,
+            show_remove_playlist,
+            split_shorts_shelf,
+            &mut action,
+        );
     });
 
     if has_more && !loading && action.is_none() {
@@ -739,6 +811,9 @@ fn draw_feed_grid_inner(
 #[derive(Clone, Default)]
 struct ShortsShelfDrag {
     scroll_x: f32,
+    max_scroll: f32,
+    visible_w: f32,
+    has_layout: bool,
     dragging: bool,
     drag_dist: f32,
     suppress_click: bool,
@@ -759,44 +834,69 @@ fn draw_shorts_shelf(
     let mut step_right = false;
 
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        let (irec, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
-        theme::draw_shorts_icon(ui.painter(), irec.center(), 18.0, theme::YT_RED);
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new("Shorts")
-                .font(theme::bold(19.0))
-                .color(theme::TEXT),
-        );
-        if let Some(first) = shorts.first() {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new(format!("{}  Play Shorts", icon::PLAY))
-                                .font(theme::medium(12.5))
-                                .color(theme::TEXT),
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), 34.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            let (irec, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
+            theme::draw_shorts_icon(ui.painter(), irec.center(), 18.0, theme::YT_RED);
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Shorts")
+                    .font(theme::bold(19.0))
+                    .color(theme::TEXT),
+            );
+            if let Some(first) = shorts.first() {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(format!("{}  Play Shorts", icon::PLAY))
+                                    .font(theme::medium(12.5))
+                                    .color(theme::TEXT),
+                            )
+                            .min_size(Vec2::new(0.0, 32.0))
+                            .fill(theme::CHIP)
+                            .corner_radius(16),
                         )
-                        .fill(theme::CHIP)
-                        .corner_radius(16),
-                    )
-                    .clicked()
-                {
-                    *action = Some(GridAction::Open((*first).clone()));
-                }
-                if icon_circle_button(ui, icon::CHEVRON_RIGHT, 15.0, "Scroll Shorts right") {
-                    step_right = true;
-                }
-                if icon_circle_button(ui, icon::CHEVRON_LEFT, 15.0, "Scroll Shorts left") {
-                    step_left = true;
-                }
-            });
-        }
-    });
+                        .clicked()
+                    {
+                        *action = Some(GridAction::Open((*first).clone()));
+                    }
+                    ui.add_space(6.0);
+                    if icon_circle_button(ui, icon::CHEVRON_RIGHT, 15.0, "Scroll Shorts right") {
+                        step_right = true;
+                    }
+                    ui.add_space(2.0);
+                    if icon_circle_button(ui, icon::CHEVRON_LEFT, 15.0, "Scroll Shorts left") {
+                        step_left = true;
+                    }
+                });
+            }
+        },
+    );
     ui.add_space(10.0);
 
     let card_w = 172.0;
     let thumb_h = 304.0;
+    let step_px = if drag_state.visible_w > 0.0 {
+        (drag_state.visible_w * 0.75).max(368.0)
+    } else {
+        368.0
+    };
+    if step_left {
+        drag_state.scroll_x = (drag_state.scroll_x - step_px).max(0.0);
+        ui.ctx().request_repaint();
+    }
+    if step_right {
+        drag_state.scroll_x = if drag_state.has_layout {
+            (drag_state.scroll_x + step_px).min(drag_state.max_scroll)
+        } else {
+            drag_state.scroll_x + step_px
+        };
+        ui.ctx().request_repaint();
+    }
+
     let drag_blocked = drag_state.suppress_click || (drag_state.dragging && drag_state.drag_dist >= 6.0);
     let mut sa = ScrollArea::horizontal().id_salt(("home_shorts_shelf", id_salt));
     if drag_state.dragging || step_left || step_right {
@@ -817,6 +917,9 @@ fn draw_shorts_shelf(
     let scroll_out = shelf_out.inner;
     let shelf_rect = shelf_out.response.rect;
     let max_scroll = (scroll_out.content_size.x - scroll_out.inner_rect.width()).max(0.0);
+    drag_state.max_scroll = max_scroll;
+    drag_state.visible_w = scroll_out.inner_rect.width();
+    drag_state.has_layout = true;
 
     let hovered_shelf = ui.rect_contains_pointer(shelf_rect);
     let (primary_down, primary_pressed, secondary_down, delta_x, wheel_y) =
@@ -830,14 +933,8 @@ fn draw_shorts_shelf(
             )
         });
 
-    if !drag_state.dragging && !step_left && !step_right {
+    if !drag_state.dragging {
         drag_state.scroll_x = scroll_out.state.clamped_offset().x;
-    }
-    if step_left {
-        drag_state.scroll_x = (drag_state.scroll_x - 380.0).clamp(0.0, max_scroll);
-    }
-    if step_right {
-        drag_state.scroll_x = (drag_state.scroll_x + 380.0).clamp(0.0, max_scroll);
     }
 
     if hovered_shelf && primary_pressed {

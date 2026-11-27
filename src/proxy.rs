@@ -3,15 +3,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
 const FIRST_BLOCK: u64 = 64 * 1024;
 const BLOCK_SIZE: u64 = 512 * 1024;
 const WORKERS: usize = 4;
-const PREFETCH_AHEAD: usize = 16;
-const KEEP_BEHIND: usize = 2;
+const PREFETCH_AHEAD: usize = 24;
+const KEEP_BEHIND: usize = 8;
+const MAX_ACTIVE_RETAIN_SPAN: usize = 64;
+const MAX_SESSIONS: usize = 32;
 const VISIONOS_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
 const WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 
@@ -35,7 +37,10 @@ struct StreamSession {
     num_blocks: usize,
     blocks: Mutex<HashMap<usize, Vec<u8>>>,
     in_flight: Mutex<HashMap<usize, bool>>,
-    want_block: AtomicUsize,
+    cursors: Mutex<HashMap<u64, usize>>,
+    latest_conn: AtomicU64,
+    next_conn_id: AtomicU64,
+    last_cursor: AtomicUsize,
     head_limit: AtomicUsize,
     active_readers: AtomicUsize,
     cancelled: AtomicBool,
@@ -54,7 +59,10 @@ impl StreamSession {
             num_blocks,
             blocks: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
-            want_block: AtomicUsize::new(0),
+            cursors: Mutex::new(HashMap::new()),
+            latest_conn: AtomicU64::new(0),
+            next_conn_id: AtomicU64::new(0),
+            last_cursor: AtomicUsize::new(0),
             head_limit: AtomicUsize::new(head_limit),
             active_readers: AtomicUsize::new(0),
             cancelled: AtomicBool::new(false),
@@ -69,18 +77,86 @@ impl StreamSession {
         self.notify.notify_waiters();
     }
 
+    fn register_cursor(&self, idx: usize) -> u64 {
+        let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let clamped = idx.min(self.num_blocks.saturating_sub(1));
+        self.cursors.lock().unwrap().insert(conn_id, clamped);
+        self.latest_conn.store(conn_id, Ordering::Release);
+        self.last_cursor.store(clamped, Ordering::Release);
+        conn_id
+    }
+
+    fn update_cursor(&self, conn_id: u64, idx: usize) {
+        let clamped = idx.min(self.num_blocks.saturating_sub(1));
+        self.cursors.lock().unwrap().insert(conn_id, clamped);
+        if self.latest_conn.load(Ordering::Acquire) == conn_id {
+            self.last_cursor.store(clamped, Ordering::Release);
+        }
+    }
+
+    fn remove_cursor(&self, conn_id: u64) {
+        let mut cursors = self.cursors.lock().unwrap();
+        cursors.remove(&conn_id);
+        if self.latest_conn.load(Ordering::Acquire) == conn_id {
+            let next_latest = cursors.keys().copied().max().unwrap_or(0);
+            self.latest_conn.store(next_latest, Ordering::Release);
+            if let Some(&c) = cursors.get(&next_latest) {
+                self.last_cursor.store(c, Ordering::Release);
+            }
+        }
+    }
+
+    fn primary_cursor_locked(&self, cursors: &HashMap<u64, usize>) -> usize {
+        let latest = self.latest_conn.load(Ordering::Acquire);
+        let raw = cursors
+            .get(&latest)
+            .copied()
+            .or_else(|| cursors.iter().max_by_key(|&(&id, _)| id).map(|(_, &c)| c))
+            .unwrap_or_else(|| self.last_cursor.load(Ordering::Acquire));
+        raw.min(self.num_blocks.saturating_sub(1))
+    }
+
     fn claim_next(&self) -> Option<(usize, u64, u64)> {
         if self.cancelled.load(Ordering::Acquire) || self.failed.load(Ordering::Acquire) {
             return None;
         }
-        let want = self.want_block.load(Ordering::Acquire).min(self.num_blocks.saturating_sub(1));
         let cap = self.head_limit.load(Ordering::Acquire);
-        let end = (want + PREFETCH_AHEAD).min(cap).min(self.num_blocks);
+        let (primary, other_needs) = {
+            let cursors = self.cursors.lock().unwrap();
+            let primary = self.primary_cursor_locked(&cursors);
+            let mut others: Vec<usize> = cursors.values().copied().collect();
+            others.sort_unstable();
+            others.dedup();
+            (primary, others)
+        };
 
         let blocks = self.blocks.lock().unwrap();
         let mut flight = self.in_flight.lock().unwrap();
 
-        for idx in want..end {
+        // First ensure the primary (newest) reader's immediate block is claimed, then any
+        // concurrent reader's immediate block (so simultaneous reads never starve), then prefetch ahead.
+        let primary_end = (primary + PREFETCH_AHEAD).min(cap).min(self.num_blocks);
+        if primary < primary_end
+            && !blocks.contains_key(&primary)
+            && !flight.get(&primary).copied().unwrap_or(false)
+        {
+            flight.insert(primary, true);
+            let (a, b) = block_range(primary, self.size);
+            return Some((primary, a, b));
+        }
+
+        for base in other_needs {
+            let end = (base + 2).min(cap).min(self.num_blocks);
+            for idx in base..end {
+                if !blocks.contains_key(&idx) && !flight.get(&idx).copied().unwrap_or(false) {
+                    flight.insert(idx, true);
+                    let (a, b) = block_range(idx, self.size);
+                    return Some((idx, a, b));
+                }
+            }
+        }
+
+        for idx in primary..primary_end {
             if !blocks.contains_key(&idx) && !flight.get(&idx).copied().unwrap_or(false) {
                 flight.insert(idx, true);
                 let (a, b) = block_range(idx, self.size);
@@ -92,13 +168,23 @@ impl StreamSession {
 
     fn finish_block(&self, idx: usize, data: Vec<u8>) {
         {
+            let min_keep = {
+                let cursors = self.cursors.lock().unwrap();
+                let primary = self.primary_cursor_locked(&cursors);
+                let floor = primary.saturating_sub(MAX_ACTIVE_RETAIN_SPAN);
+                let active_min = cursors
+                    .values()
+                    .copied()
+                    .min()
+                    .map(|m| m.saturating_sub(2).max(floor))
+                    .unwrap_or_else(|| primary.saturating_sub(KEEP_BEHIND));
+                primary.saturating_sub(KEEP_BEHIND).min(active_min)
+            };
             let mut flight = self.in_flight.lock().unwrap();
             flight.remove(&idx);
             let mut blocks = self.blocks.lock().unwrap();
             blocks.insert(idx, data);
-            // Evict old blocks far behind the current reader cursor to bound RAM
-            let want = self.want_block.load(Ordering::Acquire);
-            let min_keep = want.saturating_sub(KEEP_BEHIND);
+            // Evict old blocks far behind the active reader cursor(s) to bound RAM
             blocks.retain(|&k, _| k >= min_keep);
         }
         self.notify.notify_waiters();
@@ -207,12 +293,32 @@ impl StreamProxy {
             let mut st = self.state.lock().unwrap();
             let id = st.next_id;
             st.next_id += 1;
-            // Retain active watch + active short + prefetched upcoming shorts
-            if st.sessions.len() >= 10 {
-                if let Some(&oldest) = st.sessions.keys().min() {
-                    if let Some(old) = st.sessions.remove(&oldest) {
+            // Retain active watch tabs + active short + prefetched upcoming shorts.
+            // Never evict an actively read session while idle/prefetch sessions exist.
+            while st.sessions.len() >= MAX_SESSIONS {
+                let evict_id = st
+                    .sessions
+                    .iter()
+                    .filter(|(_, s)| {
+                        s.active_readers.load(Ordering::Acquire) == 0
+                            && s.head_limit.load(Ordering::Acquire) <= 2
+                    })
+                    .map(|(&k, _)| k)
+                    .min()
+                    .or_else(|| {
+                        st.sessions
+                            .iter()
+                            .filter(|(_, s)| s.active_readers.load(Ordering::Acquire) == 0)
+                            .map(|(&k, _)| k)
+                            .min()
+                    })
+                    .or_else(|| st.sessions.keys().min().copied());
+                if let Some(victim) = evict_id {
+                    if let Some(old) = st.sessions.remove(&victim) {
                         old.cancel();
                     }
+                } else {
+                    break;
                 }
             }
             st.sessions.insert(id, session.clone());
@@ -291,10 +397,12 @@ async fn worker_loop(http: reqwest::Client, sess: Arc<StreamSession>) {
             }
         };
 
+        let expected_len = (b - a + 1) as usize;
+        let is_last_block = idx + 1 >= sess.num_blocks;
         let mut ok_data = None;
         let mut try_alt_ua = false;
         let mut saw_403 = false;
-        for attempt in 0..4 {
+        for attempt in 0..6 {
             if sess.cancelled.load(Ordering::Acquire) {
                 sess.release_flight(idx);
                 return;
@@ -320,7 +428,12 @@ async fn worker_loop(http: reqwest::Client, sess: Arc<StreamSession>) {
             match res {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(bytes) = resp.bytes().await {
-                        if !bytes.is_empty() {
+                        let complete = if is_last_block {
+                            !bytes.is_empty()
+                        } else {
+                            bytes.len() == expected_len
+                        };
+                        if complete {
                             saw_403 = false;
                             ok_data = Some(bytes.to_vec());
                             break;
@@ -338,7 +451,8 @@ async fn worker_loop(http: reqwest::Client, sess: Arc<StreamSession>) {
                 }
                 _ => {}
             }
-            tokio::time::sleep(Duration::from_millis(150 * (attempt + 1))).await;
+            let backoff_ms = (150 * (attempt + 1)).min(1200);
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         }
 
         if let Some(data) = ok_data {
@@ -443,25 +557,42 @@ async fn handle_conn(
     if sess.head_limit.swap(usize::MAX, Ordering::AcqRel) != usize::MAX {
         sess.notify.notify_waiters();
     }
+    struct CursorGuard {
+        sess: Arc<StreamSession>,
+        conn_id: u64,
+    }
+    impl Drop for CursorGuard {
+        fn drop(&mut self) {
+            self.sess.remove_cursor(self.conn_id);
+        }
+    }
+    let conn_id = sess.register_cursor(block_of(start));
+    let _cursor_guard = CursorGuard {
+        sess: sess.clone(),
+        conn_id,
+    };
+
     let mut headers_sent = false;
     let mut pos = start;
+    let mut eof_buf = [0u8; 16];
     while pos <= end {
         if sess.cancelled.load(Ordering::Acquire) {
             break;
         }
         let idx = block_of(pos);
-        sess.want_block.store(idx, Ordering::Release);
+        sess.update_cursor(conn_id, idx);
         sess.notify.notify_waiters();
 
         let (b_start, _) = block_range(idx, total);
         let chunk = loop {
             if sess.cancelled.load(Ordering::Acquire) || sess.failed.load(Ordering::Acquire) {
                 if !headers_sent {
-                    let redir = format!(
-                        "HTTP/1.1 307 Temporary Redirect\r\nLocation: {}\r\nConnection: close\r\n\r\n",
-                        sess.url
-                    );
-                    let _ = write_half.write_all(redir.as_bytes()).await;
+                    let resp = if sess.forbidden.load(Ordering::Acquire) {
+                        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    } else {
+                        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    };
+                    let _ = write_half.write_all(resp.as_bytes()).await;
                 }
                 return Ok(());
             }
@@ -472,7 +603,17 @@ async fn handle_conn(
             if let Some(data) = sess.blocks.lock().unwrap().get(&idx).cloned() {
                 break data;
             }
-            notified.await;
+            // Wake immediately if the player closed the TCP socket (e.g. during a seek),
+            // otherwise wait for the next fetched block notification.
+            tokio::select! {
+                () = notified => {}
+                res = reader.read(&mut eof_buf) => {
+                    match res {
+                        Ok(0) | Err(_) => return Ok(()),
+                        Ok(_) => {}
+                    }
+                }
+            }
         };
 
         if !headers_sent {
@@ -574,5 +715,54 @@ mod tests {
                 .store(true, Ordering::Release);
             assert!(proxy.is_session_forbidden(&url));
         }
+    }
+
+    #[test]
+    fn latest_seek_cursor_takes_priority_over_old_reader() {
+        let sess = StreamSession::new(
+            "https://example.com/v.mp4".to_owned(),
+            VISIONOS_UA.to_owned(),
+            50 * 1024 * 1024,
+            usize::MAX,
+        );
+        let old_conn = sess.register_cursor(1);
+        let new_conn = sess.register_cursor(40);
+        // Simulate old closing reader updating its cursor after new seek already registered.
+        sess.update_cursor(old_conn, 2);
+        let claimed = sess.claim_next().expect("primary cursor block should be claimed");
+        assert_eq!(claimed.0, 40);
+        // Secondary reader's immediate block can still be claimed while primary is in flight.
+        let claimed_other = sess.claim_next().expect("other active cursor block should be claimed");
+        assert_eq!(claimed_other.0, 2);
+        sess.remove_cursor(old_conn);
+        sess.remove_cursor(new_conn);
+    }
+
+    #[test]
+    fn eviction_preserves_active_sessions_over_idle_prefetches() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let proxy = rt.block_on(async {
+            StreamProxy::start(reqwest::Client::new()).await.unwrap()
+        });
+        let active_url = proxy.register("https://example.com/active.mp4", 1024 * 1024);
+        let active_id = proxy.session_id_from_url(&active_url).unwrap();
+        proxy
+            .state
+            .lock()
+            .unwrap()
+            .sessions
+            .get(&active_id)
+            .unwrap()
+            .active_readers
+            .store(1, Ordering::Release);
+
+        for i in 0..(MAX_SESSIONS + 4) {
+            let u = format!("https://example.com/short_{i}.mp4");
+            let _ = proxy.register_prefetch_with_ua(&u, 1024 * 1024, VISIONOS_UA);
+        }
+
+        let st = proxy.state.lock().unwrap();
+        assert!(st.sessions.contains_key(&active_id));
+        assert!(st.sessions.len() <= MAX_SESSIONS);
     }
 }
