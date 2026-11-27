@@ -11,12 +11,12 @@ use crate::innertube::{self, FeedPage, WebConfig};
 use crate::model::{
     AudioTrack, ChannelInfo, ChannelNotificationParams, CommentItem, FeedChip, LiveChatEmote,
     LiveChatMessage, NotificationLevel, NotificationMenuItem, PlaylistOption, PlaylistSummary,
-    PoTokenMode, PreferredQuality, SearchChannelResult, SidebarChannel, SponsorSegment,
-    VideoFormat, VideoItem, WatchData,
+    PoTokenMode, PreferredQuality, SearchChannelResult, SearchFilter, SidebarChannel,
+    SponsorSegment, UpNextFilterMode, VideoFormat, VideoItem, WatchData,
 };
 use crate::potoken::PoTokenClient;
 use crate::proxy::StreamProxy;
-use crate::{login, mpv, sponsorblock, ytdlp};
+use crate::{login, mpv, sponsorblock, win_shell, ytdlp};
 
 pub enum Request {
     LoadHome {
@@ -86,6 +86,7 @@ pub enum Request {
     PrefetchShort {
         video_id: String,
         quality: PreferredQuality,
+        head_blocks: usize,
     },
     ResolveHoverPreview {
         video_id: String,
@@ -198,6 +199,21 @@ pub enum Request {
     LoadAmbientArt {
         key: String,
         url: String,
+    },
+    CheckDropBoard,
+    SendScreenshot {
+        png_bytes: Vec<u8>,
+        title: String,
+    },
+    LoadRelatedChip {
+        video_id: String,
+        mode: UpNextFilterMode,
+        chip_title: String,
+        continuation: Option<String>,
+        channel_name: String,
+        video_title: String,
+        base_related: Vec<VideoItem>,
+        home_fallback: Vec<VideoItem>,
     },
 }
 
@@ -424,6 +440,17 @@ pub enum Response {
         tiled_height: u32,
         tiled_rgba: Vec<u8>,
     },
+    DropBoardStatus(bool),
+    ScreenshotDone {
+        sent_to_dropboard: bool,
+        error: Option<String>,
+    },
+    RelatedChipLoaded {
+        video_id: String,
+        mode: UpNextFilterMode,
+        chip_title: String,
+        items: Vec<VideoItem>,
+    },
     Error(String),
 }
 
@@ -613,6 +640,10 @@ impl Backend {
         self.proxy
             .as_ref()
             .is_some_and(|p| p.is_session_failed(url))
+    }
+
+    pub fn estimated_bandwidth_bps(&self) -> Option<(u64, std::time::Duration)> {
+        self.proxy.as_ref().and_then(|p| p.estimated_bps())
     }
 
     pub fn spawn(data_dir: PathBuf, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
@@ -2209,7 +2240,7 @@ impl Backend {
                                                 &po_cli,
                                                 &jsc_cli,
                                                 po_mode,
-                                                false,
+                                                0,
                                             )
                                             .await
                                         }
@@ -2244,7 +2275,11 @@ impl Backend {
                                     }
                                 });
                             }
-                            Request::PrefetchShort { video_id, quality } => {
+                            Request::PrefetchShort {
+                                video_id,
+                                quality,
+                                head_blocks,
+                            } => {
                                 let cfg_clone = cfg.clone();
                                 let sess_clone = session.clone();
                                 let proxy_clone = proxy.clone();
@@ -2281,7 +2316,7 @@ impl Backend {
                                         &po_cli,
                                         &jsc_cli,
                                         po_mode,
-                                        true,
+                                        head_blocks.max(2),
                                     )
                                     .await
                                     {
@@ -2366,7 +2401,7 @@ impl Backend {
                                         &po_cli,
                                         &jsc_cli,
                                         po_mode,
-                                        false,
+                                        0,
                                     )
                                     .await
                                     {
@@ -2454,7 +2489,7 @@ impl Backend {
                                         &po_cli,
                                         &jsc_cli,
                                         po_mode,
-                                        false,
+                                        0,
                                     )
                                     .await
                                     {
@@ -2734,6 +2769,103 @@ impl Backend {
                                     }
                                 });
                             }
+                            Request::CheckDropBoard => {
+                                tokio::spawn(async move {
+                                    let online = http
+                                        .get("http://127.0.0.1:28888/ping")
+                                        .timeout(std::time::Duration::from_millis(350))
+                                        .send()
+                                        .await
+                                        .is_ok_and(|r| r.status().is_success());
+                                    let _ = resp_tx.send(Response::DropBoardStatus(online));
+                                    wake();
+                                });
+                            }
+                            Request::SendScreenshot { png_bytes, title } => {
+                                tokio::spawn(async move {
+                                    let b64 = encode_base64(&png_bytes);
+                                    let payload = serde_json::json!({
+                                        "url": format!("data:image/png;base64,{b64}"),
+                                        "title": title,
+                                    });
+                                    let sent_to_dropboard = http
+                                        .post("http://127.0.0.1:28888/add")
+                                        .json(&payload)
+                                        .timeout(std::time::Duration::from_secs(2))
+                                        .send()
+                                        .await
+                                        .is_ok_and(|r| r.status().is_success());
+                                    if sent_to_dropboard {
+                                        let _ = resp_tx.send(Response::ScreenshotDone {
+                                            sent_to_dropboard: true,
+                                            error: None,
+                                        });
+                                    } else {
+                                        let err = tokio::task::spawn_blocking(move || {
+                                            win_shell::copy_png_to_clipboard(&png_bytes)
+                                        })
+                                        .await
+                                        .map_err(|e| format!("{e}"))
+                                        .and_then(|r| r.map_err(|e| format!("{e:#}")))
+                                        .err();
+                                        let _ = resp_tx.send(Response::ScreenshotDone {
+                                            sent_to_dropboard: false,
+                                            error: err,
+                                        });
+                                    }
+                                    wake();
+                                });
+                            }
+                            Request::LoadRelatedChip {
+                                video_id,
+                                mode,
+                                chip_title,
+                                continuation,
+                                channel_name,
+                                video_title,
+                                base_related,
+                                home_fallback,
+                            } => {
+                                let cfg_clone = cfg.clone();
+                                let sess_clone = session.clone();
+                                tokio::spawn(async move {
+                                    let mut items = Vec::new();
+                                    if let Some(tok) = continuation.as_deref() {
+                                        if let Ok(list) = innertube::fetch_next_chip(
+                                            &http,
+                                            &video_id,
+                                            tok,
+                                            &cfg_clone,
+                                            sess_clone.as_ref(),
+                                        )
+                                        .await
+                                        {
+                                            items = list;
+                                        }
+                                    }
+                                    if items.is_empty() {
+                                        items = resolve_related_chip_fallback(
+                                            &http,
+                                            &cfg_clone,
+                                            sess_clone.as_ref(),
+                                            &video_id,
+                                            mode,
+                                            &channel_name,
+                                            &video_title,
+                                            &base_related,
+                                            &home_fallback,
+                                        )
+                                        .await;
+                                    }
+                                    let _ = resp_tx.send(Response::RelatedChipLoaded {
+                                        video_id,
+                                        mode,
+                                        chip_title,
+                                        items,
+                                    });
+                                    wake();
+                                });
+                            }
                         }
                     }
                 });
@@ -2884,15 +3016,15 @@ fn apply_ytdlp_streams(
     yt: ytdlp::YtdlpStreams,
     quality: PreferredQuality,
     proxy: Option<&StreamProxy>,
-    prefetch: bool,
+    prefetch_blocks: usize,
 ) -> (String, Option<String>, Option<usize>) {
     let ua = yt.user_agent.as_deref().unwrap_or("");
     let wrap_yt = |url: &str, len: u64| -> String {
         let is_hls = url.contains(".m3u8") || url.contains("/manifest/hls");
         match proxy {
             Some(p) if !is_hls => {
-                if prefetch {
-                    p.register_prefetch_with_ua(url, len, ua)
+                if prefetch_blocks > 0 {
+                    p.register_prefetch_blocks_with_ua(url, len, ua, prefetch_blocks)
                 } else {
                     p.register_with_ua(url, len, ua)
                 }
@@ -3105,9 +3237,16 @@ fn select_and_wrap_watch(
     quality: PreferredQuality,
     proxy: Option<&StreamProxy>,
     ua: Option<&str>,
-    prefetch: bool,
+    prefetch_blocks: usize,
 ) -> Option<(String, Option<String>, Option<usize>, String, Option<String>)> {
-    select_and_wrap_watch_height(data, quality.max_height(), quality != PreferredQuality::Best4K, proxy, ua, prefetch)
+    select_and_wrap_watch_height(
+        data,
+        quality.max_height(),
+        quality != PreferredQuality::Best4K,
+        proxy,
+        ua,
+        prefetch_blocks,
+    )
 }
 
 fn select_and_wrap_watch_height(
@@ -3116,14 +3255,19 @@ fn select_and_wrap_watch_height(
     hint_non_4k: bool,
     proxy: Option<&StreamProxy>,
     ua: Option<&str>,
-    prefetch: bool,
+    prefetch_blocks: usize,
 ) -> Option<(String, Option<String>, Option<usize>, String, Option<String>)> {
     let wrap = |url: &str, len: u64| -> String {
         let is_hls = url.contains(".m3u8") || url.contains("/manifest/hls");
         match proxy {
-            Some(p) if !is_hls => match (prefetch, ua) {
-                (true, Some(u)) => p.register_prefetch_with_ua(url, len, u),
-                (true, None) => p.register_prefetch_with_ua(url, len, crate::innertube::VISIONOS_UA),
+            Some(p) if !is_hls => match (prefetch_blocks > 0, ua) {
+                (true, Some(u)) => p.register_prefetch_blocks_with_ua(url, len, u, prefetch_blocks),
+                (true, None) => p.register_prefetch_blocks_with_ua(
+                    url,
+                    len,
+                    crate::innertube::VISIONOS_UA,
+                    prefetch_blocks,
+                ),
                 (false, Some(u)) => p.register_with_ua(url, len, u),
                 (false, None) => p.register(url, len),
             },
@@ -3173,7 +3317,7 @@ async fn resolve_web_native(
     po_mode: PoTokenMode,
     need_pot: bool,
     strict_auth: bool,
-    prefetch: bool,
+    prefetch_blocks: usize,
 ) -> (Option<Response>, Option<serde_json::Value>, Option<(String, crate::potoken::PoTokens)>) {
     let want_pot = po_mode != PoTokenMode::Off && need_pot;
     let (next_json, js_res, (mut vd, mut pot)) = tokio::join!(
@@ -3224,9 +3368,13 @@ async fn resolve_web_native(
         {
             Ok(mut data) => {
                 populate_hls_variants_if_needed(http, &mut data).await;
-                if let Some((v_url, a_url, idx, raw_v, raw_a)) =
-                    select_and_wrap_watch(&data, quality, proxy, Some(innertube::WEB_UA), prefetch)
-                {
+                if let Some((v_url, a_url, idx, raw_v, raw_a)) = select_and_wrap_watch(
+                    &data,
+                    quality,
+                    proxy,
+                    Some(innertube::WEB_UA),
+                    prefetch_blocks,
+                ) {
                     let ok = match raw_a.as_deref() {
                         Some(a) => {
                             let (vo, ao) = tokio::join!(
@@ -3284,7 +3432,7 @@ async fn resolve_web_native(
                                     quality,
                                     proxy,
                                     Some(innertube::WEB_UA),
-                                    prefetch,
+                                    prefetch_blocks,
                                 ) {
                                     let ok = match raw_a.as_deref() {
                                         Some(a) => {
@@ -3333,7 +3481,7 @@ async fn resolve_watch(
     potoken: &PoTokenClient,
     jsc: &crate::jsc::Solver,
     po_mode: PoTokenMode,
-    prefetch: bool,
+    prefetch_blocks: usize,
 ) -> anyhow::Result<Response> {
     resolve_watch_with_height(
         http,
@@ -3347,7 +3495,7 @@ async fn resolve_watch(
         potoken,
         jsc,
         po_mode,
-        prefetch,
+        prefetch_blocks,
     )
     .await
 }
@@ -3365,7 +3513,7 @@ async fn resolve_watch_with_height(
     potoken: &PoTokenClient,
     jsc: &crate::jsc::Solver,
     po_mode: PoTokenMode,
-    prefetch: bool,
+    prefetch_blocks: usize,
 ) -> anyhow::Result<Response> {
     let target_h = height_override.unwrap_or_else(|| quality.max_height());
     let mut blocked_hint = po_mode == PoTokenMode::On;
@@ -3401,7 +3549,7 @@ async fn resolve_watch_with_height(
                     quality != PreferredQuality::Best4K,
                     proxy,
                     None,
-                    prefetch,
+                    prefetch_blocks,
                 ) {
                     if po_mode == PoTokenMode::Auto {
                         potoken.close_if_running();
@@ -3441,7 +3589,7 @@ async fn resolve_watch_with_height(
         po_mode,
         blocked_hint || po_mode == PoTokenMode::On,
         strict_auth,
-        prefetch,
+        prefetch_blocks,
     )
     .await;
     if let Some(resp) = web_res {
@@ -3491,6 +3639,7 @@ async fn resolve_watch_with_height(
         comments_token: None,
         live_chat_token: None,
         related: Vec::new(),
+        related_chips: Vec::new(),
         is_live: false,
         is_members_only: false,
         resume_secs: None,
@@ -3515,7 +3664,7 @@ async fn resolve_watch_with_height(
         data.duration_secs = yt.duration_secs;
     }
     let (selected_video_url, selected_audio_url, fmt_idx) =
-        apply_ytdlp_streams(&mut data, yt, quality, proxy, prefetch);
+        apply_ytdlp_streams(&mut data, yt, quality, proxy, prefetch_blocks);
     Ok(Response::WatchReady {
         selected_video_url,
         selected_audio_url,
@@ -3661,6 +3810,155 @@ fn blur_ambient_art(bytes: &[u8]) -> Option<((u32, u32, Vec<u8>), (u32, u32, Vec
     Some(((N, N, soft_rgba), (tw as u32, tw as u32, tiled_rgba)))
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn resolve_related_chip_fallback(
+    http: &reqwest::Client,
+    cfg: &WebConfig,
+    session: Option<&Session>,
+    video_id: &str,
+    mode: UpNextFilterMode,
+    channel_name: &str,
+    video_title: &str,
+    base_related: &[VideoItem],
+    home_fallback: &[VideoItem],
+) -> Vec<VideoItem> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(video_id.to_owned());
+
+    fn push_unique(
+        out: &mut Vec<VideoItem>,
+        seen: &mut std::collections::HashSet<String>,
+        list: &[VideoItem],
+    ) {
+        for it in list {
+            if !it.id.is_empty() && it.playlist_browse_id.is_none() && seen.insert(it.id.clone()) {
+                out.push(it.clone());
+            }
+        }
+    }
+
+    match mode {
+        UpNextFilterMode::All => {
+            push_unique(&mut out, &mut seen, base_related);
+        }
+        UpNextFilterMode::FromChannel => {
+            let ch_low = channel_name.trim().to_ascii_lowercase();
+            let matching: Vec<VideoItem> = base_related
+                .iter()
+                .filter(|it| {
+                    !ch_low.is_empty() && it.channel.trim().to_ascii_lowercase() == ch_low
+                })
+                .cloned()
+                .collect();
+            push_unique(&mut out, &mut seen, &matching);
+            if out.len() < 8 && !channel_name.trim().is_empty() {
+                if let Ok(page) = innertube::search(
+                    http,
+                    channel_name,
+                    innertube::encode_search_params(SearchFilter::default()).as_deref(),
+                    None,
+                    cfg,
+                    session,
+                )
+                .await
+                {
+                    let exact: Vec<VideoItem> = page
+                        .items
+                        .iter()
+                        .filter(|it| it.channel.trim().to_ascii_lowercase() == ch_low)
+                        .cloned()
+                        .collect();
+                    push_unique(&mut out, &mut seen, &exact);
+                    if out.len() < 5 {
+                        push_unique(&mut out, &mut seen, &page.items);
+                    }
+                }
+            }
+            if out.is_empty() {
+                push_unique(&mut out, &mut seen, base_related);
+            }
+        }
+        UpNextFilterMode::Related => {
+            let query = extract_related_topic_query(video_title, channel_name);
+            if !query.is_empty() {
+                if let Ok(page) = innertube::search(
+                    http,
+                    &query,
+                    innertube::encode_search_params(SearchFilter::default()).as_deref(),
+                    None,
+                    cfg,
+                    session,
+                )
+                .await
+                {
+                    push_unique(&mut out, &mut seen, &page.items);
+                }
+            }
+            push_unique(&mut out, &mut seen, base_related);
+        }
+        UpNextFilterMode::ForYou => {
+            push_unique(&mut out, &mut seen, home_fallback);
+            push_unique(&mut out, &mut seen, base_related);
+        }
+    }
+    out
+}
+
+pub fn extract_related_topic_query(title: &str, channel: &str) -> String {
+    let mut cleaned = String::with_capacity(title.len());
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    for ch in title.chars() {
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '|' | '｜' | '•' | '/' if paren_depth == 0 && bracket_depth == 0 => {
+                cleaned.push(' ');
+            }
+            _ if paren_depth == 0 && bracket_depth == 0 => cleaned.push(ch),
+            _ => {}
+        }
+    }
+    let words: Vec<&str> = cleaned
+        .split_whitespace()
+        .filter(|w| !w.starts_with('#') && w.chars().any(|c| c.is_alphanumeric()))
+        .take(7)
+        .collect();
+    let base = words.join(" ");
+    if base.is_empty() {
+        channel.trim().to_owned()
+    } else {
+        base
+    }
+}
+
+pub fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(n >> 18) & 0x3F] as char);
+        out.push(TABLE[(n >> 12) & 0x3F] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) & 0x3F] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n & 0x3F] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3682,5 +3980,19 @@ mod tests {
         assert_eq!(pick_format_index(&formats, 1080), Some(1));
         assert_eq!(pick_format_index(&formats, 720), Some(2));
         assert_eq!(pick_format_index(&[], 1080), None);
+    }
+
+    #[test]
+    fn encodes_base64_and_extracts_topic_query() {
+        assert_eq!(encode_base64(b"Man"), "TWFu");
+        assert_eq!(encode_base64(b"Ma"), "TWE=");
+        assert_eq!(encode_base64(b"M"), "TQ==");
+        assert_eq!(
+            extract_related_topic_query(
+                "Tips Jaga Jantung & Tidur (Full Podcast) [4K] #kesehatan | Dr. Tirta",
+                "Tirta PengPengPeng",
+            ),
+            "Tips Jaga Jantung Tidur Dr. Tirta"
+        );
     }
 }

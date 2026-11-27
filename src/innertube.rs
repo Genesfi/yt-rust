@@ -573,6 +573,29 @@ fn extract_first_playlist_video_thumb(v: &Value) -> Option<String> {
     walk(v)
 }
 
+fn find_first_browse_id(v: &Value) -> Option<String> {
+    match v {
+        Value::Object(map) => {
+            if let Some(bid) = map
+                .get("browseEndpoint")
+                .and_then(|b| b.get("browseId"))
+                .and_then(Value::as_str)
+                .filter(|s| s.starts_with("UC"))
+            {
+                return Some(bid.to_owned());
+            }
+            for val in map.values() {
+                if let Some(bid) = find_first_browse_id(val) {
+                    return Some(bid);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => arr.iter().find_map(find_first_browse_id),
+        _ => None,
+    }
+}
+
 fn find_first_thumb_url(v: &Value) -> Option<String> {
     match v {
         Value::Object(map) => {
@@ -3694,6 +3717,28 @@ pub async fn fetch_next_json(
         .ok()
 }
 
+pub async fn fetch_next_chip(
+    http: &reqwest::Client,
+    current_id: &str,
+    continuation: &str,
+    cfg: &WebConfig,
+    session: Option<&Session>,
+) -> anyhow::Result<Vec<VideoItem>> {
+    let v = post_web(
+        http,
+        "next",
+        json!({ "continuation": continuation }),
+        cfg,
+        session,
+    )
+    .await?;
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    seen.insert(current_id.to_owned());
+    collect_videos(&v, &mut items, &mut seen);
+    Ok(items)
+}
+
 pub fn watch_data_from_next(video_id: &str, next: &Value) -> Option<WatchData> {
     let contents = next["contents"]["twoColumnWatchNextResults"]["results"]["results"]["contents"]
         .as_array()?;
@@ -3711,7 +3756,12 @@ pub fn watch_data_from_next(video_id: &str, next: &Value) -> Option<WatchData> {
         .to_owned();
     let channel_id = owner_run
         .and_then(|r| r["navigationEndpoint"]["browseEndpoint"]["browseId"].as_str())
-        .map(str::to_owned);
+        .map(str::to_owned)
+        .or_else(|| {
+            contents.iter().find_map(|c| {
+                find_first_browse_id(&c["videoSecondaryInfoRenderer"]["owner"])
+            })
+        });
     let (
         views_text,
         published_text,
@@ -3725,6 +3775,7 @@ pub fn watch_data_from_next(video_id: &str, next: &Value) -> Option<WatchData> {
         comments_token,
         live_chat_token,
         related,
+        related_chips,
         is_members_only,
     ) = parse_next_metadata(&next, video_id);
     let resume_secs = as_secs_f64(&next["currentVideoEndpoint"]["watchEndpoint"]["startTimeSeconds"])
@@ -3757,6 +3808,7 @@ pub fn watch_data_from_next(video_id: &str, next: &Value) -> Option<WatchData> {
         comments_token,
         live_chat_token,
         related,
+        related_chips,
         is_live: is_next_live(&next),
         is_members_only,
         resume_secs,
@@ -3863,6 +3915,7 @@ fn build_watch_data(video_id: &str, player: Value, next: Option<Value>) -> Watch
         comments_token,
         live_chat_token,
         related,
+        related_chips,
         is_members_only,
     ) = if let Some(ref n) = next {
         parse_next_metadata(n, video_id)
@@ -3882,6 +3935,7 @@ fn build_watch_data(video_id: &str, player: Value, next: Option<Value>) -> Watch
             None,
             None,
             None,
+            Vec::new(),
             Vec::new(),
             false,
         )
@@ -4005,6 +4059,7 @@ fn build_watch_data(video_id: &str, player: Value, next: Option<Value>) -> Watch
         comments_token,
         live_chat_token,
         related,
+        related_chips,
         is_live,
         is_members_only,
         resume_secs,
@@ -4696,6 +4751,7 @@ fn parse_next_metadata(
     Option<String>,
     Option<String>,
     Vec<VideoItem>,
+    Vec<FeedChip>,
     bool,
 ) {
     let contents = &next["contents"]["twoColumnWatchNextResults"]["results"]["results"]["contents"];
@@ -4848,8 +4904,10 @@ fn parse_next_metadata(
                     .as_array()
                     .and_then(|a| a.first())
                     .and_then(|t| t["url"].as_str())
+                    .map(normalize_url)
+                    .or_else(|| find_first_thumb_url(&s["owner"]))
                 {
-                    avatar_url = Some(normalize_url(url));
+                    avatar_url = Some(url);
                 }
                 if let Some(subbed) = s["subscribeButton"]["subscribeButtonRenderer"]["subscribed"].as_bool() {
                     is_subscribed = subbed;
@@ -4894,6 +4952,7 @@ fn parse_next_metadata(
     seen.insert(current_id.to_owned());
     let sec = &next["contents"]["twoColumnWatchNextResults"]["secondaryResults"];
     collect_videos(sec, &mut related, &mut seen);
+    let related_chips = collect_chips(sec);
 
     (
         views_text,
@@ -4908,6 +4967,7 @@ fn parse_next_metadata(
         comments_token,
         live_chat_token,
         related,
+        related_chips,
         is_members_only,
     )
 }
@@ -5647,7 +5707,8 @@ fn parse_video_renderer(vr: &Value) -> Option<VideoItem> {
         .and_then(|t| t["url"].as_str())
         .map(normalize_url)
         .or_else(|| find_first_thumb_url(&vr["channelThumbnailSupportedRenderers"]))
-        .or_else(|| find_first_thumb_url(&vr["channelThumbnail"]));
+        .or_else(|| find_first_thumb_url(&vr["channelThumbnail"]))
+        .or_else(|| find_first_thumb_url(&vr["avatar"]));
     let views_text = text(&vr["shortViewCountText"])
         .or_else(|| text(&vr["viewCountText"]))
         .unwrap_or_default();
@@ -6174,7 +6235,7 @@ mod tests {
                 }
             }
         });
-        let (_, _, likes, liked, disliked, _, _, _, _, _, _, _, _) =
+        let (_, _, likes, liked, disliked, _, _, _, _, _, _, _, _, _) =
             parse_next_metadata(&next, "abc12345678");
         assert_eq!(likes, "313");
         assert!(liked);

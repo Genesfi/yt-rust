@@ -267,6 +267,18 @@ mod imp {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetModuleHandleW(name: *const u16) -> Hmodule;
+        fn GlobalAlloc(flags: u32, bytes: usize) -> *mut c_void;
+        fn GlobalLock(hmem: *mut c_void) -> *mut u8;
+        fn GlobalUnlock(hmem: *mut c_void) -> i32;
+        fn GlobalFree(hmem: *mut c_void) -> *mut c_void;
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn OpenClipboard(hwnd_new_owner: Hwnd) -> i32;
+        fn EmptyClipboard() -> i32;
+        fn SetClipboardData(format: u32, mem: *mut c_void) -> *mut c_void;
+        fn CloseClipboard() -> i32;
     }
 
     #[link(name = "shell32")]
@@ -328,6 +340,94 @@ mod imp {
         right: i32,
         top: i32,
         bottom: i32,
+    }
+
+    #[repr(C)]
+    struct BitmapInfoHeader {
+        bi_size: u32,
+        bi_width: i32,
+        bi_height: i32,
+        bi_planes: u16,
+        bi_bit_count: u16,
+        bi_compression: u32,
+        bi_size_image: u32,
+        bi_x_pels_per_meter: i32,
+        bi_y_pels_per_meter: i32,
+        bi_clr_used: u32,
+        bi_clr_important: u32,
+    }
+
+    pub fn copy_png_to_clipboard(png_bytes: &[u8]) -> anyhow::Result<()> {
+        const CF_DIB: u32 = 8;
+        const GMEM_MOVEABLE: u32 = 0x0002;
+        const BI_RGB: u32 = 0;
+
+        let rgba = image::load_from_memory(png_bytes)?.to_rgba8();
+        let w = rgba.width() as usize;
+        let h = rgba.height() as usize;
+        anyhow::ensure!(w > 0 && h > 0, "Empty image");
+
+        let hdr_size = std::mem::size_of::<BitmapInfoHeader>();
+        let pixel_bytes = w.saturating_mul(h).saturating_mul(4);
+        let total_bytes = hdr_size.saturating_add(pixel_bytes);
+
+        let hdr = BitmapInfoHeader {
+            bi_size: hdr_size as u32,
+            bi_width: w as i32,
+            bi_height: h as i32,
+            bi_planes: 1,
+            bi_bit_count: 32,
+            bi_compression: BI_RGB,
+            bi_size_image: pixel_bytes as u32,
+            bi_x_pels_per_meter: 0,
+            bi_y_pels_per_meter: 0,
+            bi_clr_used: 0,
+            bi_clr_important: 0,
+        };
+
+        unsafe {
+            let hmem = GlobalAlloc(GMEM_MOVEABLE, total_bytes);
+            anyhow::ensure!(!hmem.is_null(), "GlobalAlloc failed");
+            let dst = GlobalLock(hmem);
+            if dst.is_null() {
+                GlobalFree(hmem);
+                anyhow::bail!("GlobalLock failed");
+            }
+            std::ptr::copy_nonoverlapping(
+                (&hdr as *const BitmapInfoHeader) as *const u8,
+                dst,
+                hdr_size,
+            );
+            let px_dst = std::slice::from_raw_parts_mut(dst.add(hdr_size), pixel_bytes);
+            let src = rgba.as_raw();
+            for y in 0..h {
+                // Bottom-up DIB row order
+                let src_row = (h - 1 - y) * w * 4;
+                let dst_row = y * w * 4;
+                for x in 0..w {
+                    let s = src_row + x * 4;
+                    let d = dst_row + x * 4;
+                    px_dst[d] = src[s + 2];
+                    px_dst[d + 1] = src[s + 1];
+                    px_dst[d + 2] = src[s];
+                    px_dst[d + 3] = src[s + 3];
+                }
+            }
+            GlobalUnlock(hmem);
+
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
+                GlobalFree(hmem);
+                anyhow::bail!("OpenClipboard failed");
+            }
+            EmptyClipboard();
+            let res = SetClipboardData(CF_DIB, hmem);
+            CloseClipboard();
+            if res.is_null() {
+                GlobalFree(hmem);
+                anyhow::bail!("SetClipboardData failed");
+            }
+        }
+        Ok(())
     }
 
     pub fn windows_backdrop_supported() -> bool {
@@ -1053,7 +1153,12 @@ mod imp {
     pub fn windows_backdrop_supported() -> bool {
         false
     }
+
+    pub fn copy_png_to_clipboard(_png_bytes: &[u8]) -> anyhow::Result<()> {
+        anyhow::bail!("Clipboard image copy is only implemented on Windows")
+    }
 }
 
 pub use imp::WinShell;
+pub use imp::copy_png_to_clipboard;
 pub use imp::windows_backdrop_supported;

@@ -500,20 +500,48 @@ impl YtApp {
             };
             let vid_left = (full_rect.center().x - sw * 0.5).clamp(min_vid_left, max_vid_left);
             let vid_top = body_rect.top() + ((body_rect.height() - sh) * 0.5).max(0.0);
-            let (slide_offset_y, slide_alpha) = if let Some((dir, started)) = self.shorts_slide_anim {
-                let t = (started.elapsed().as_secs_f32() / 0.24).clamp(0.0, 1.0);
+            let base_vid_rect = Rect::from_min_size(pos2(vid_left, vid_top), Vec2::new(sw, sh));
+            let travel = sh + 20.0;
+            let anim_state = if let Some((dir, started)) = self.shorts_slide_anim {
+                let t = (started.elapsed().as_secs_f32() / 0.28).clamp(0.0, 1.0);
                 if t >= 1.0 {
                     self.shorts_slide_anim = None;
-                    (0.0, 1.0)
+                    self.shorts_outgoing = None;
+                    None
                 } else {
                     ctx.request_repaint();
                     let ease = 1.0 - (1.0 - t).powi(3);
-                    ((dir as f32) * (1.0 - ease) * (sh * 0.16), 0.35 + 0.65 * ease)
+                    Some((dir, ease))
                 }
             } else {
-                (0.0, 1.0)
+                None
             };
-            let base_vid_rect = Rect::from_min_size(pos2(vid_left, vid_top), Vec2::new(sw, sh));
+
+            let carousel_clip = Rect::from_min_max(
+                pos2(base_vid_rect.left() - 2.0, body_rect.top()),
+                pos2(base_vid_rect.right() + 2.0, body_rect.bottom()),
+            );
+
+            if let Some((dir, ease)) = anim_state {
+                if let Some(out) = self.shorts_outgoing.clone() {
+                    let out_offset_y = -(dir as f32) * ease * travel;
+                    let out_rect = base_vid_rect.translate(vec2(0.0, out_offset_y));
+                    if out_rect.intersects(carousel_clip) {
+                        let mut out_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(out_rect)
+                                .layout(Layout::top_down(Align::LEFT)),
+                        );
+                        out_ui.set_clip_rect(out_ui.clip_rect().intersect(carousel_clip));
+                        out_ui.set_opacity((1.0 - ease * 0.25).clamp(0.0, 1.0));
+                        draw_shorts_transition_card(&mut out_ui, out_rect, 14.0, &out);
+                    }
+                }
+            }
+
+            let slide_offset_y = anim_state
+                .map(|(dir, ease)| (dir as f32) * (1.0 - ease) * travel)
+                .unwrap_or(0.0);
             let vid_rect = base_vid_rect.translate(vec2(0.0, slide_offset_y));
 
             let mut vid_ui = ui.new_child(
@@ -521,9 +549,9 @@ impl YtApp {
                     .max_rect(vid_rect)
                     .layout(Layout::top_down(Align::LEFT)),
             );
-            vid_ui.set_clip_rect(vid_ui.clip_rect().intersect(body_rect));
-            if slide_alpha < 0.99 {
-                vid_ui.set_opacity(slide_alpha);
+            vid_ui.set_clip_rect(vid_ui.clip_rect().intersect(carousel_clip));
+            if let Some((_, ease)) = anim_state {
+                vid_ui.set_opacity((0.75 + 0.25 * ease).clamp(0.0, 1.0));
             }
             if let Some((cid, cname)) =
                 self.draw_video_surface_inner(&mut vid_ui, ctx, Vec2::new(sw, sh), false, true)
@@ -545,7 +573,7 @@ impl YtApp {
             }
 
             let rail_rect = Rect::from_min_size(
-                pos2(vid_rect.right() + rail_gap, vid_top),
+                pos2(base_vid_rect.right() + rail_gap, vid_top),
                 Vec2::new(rail_w, sh),
             );
             let mut rail_ui = ui.new_child(
@@ -794,7 +822,8 @@ impl YtApp {
         is_shorts: bool,
     ) -> Option<(String, String)> {
         let mut open_channel: Option<(String, String)> = None;
-        let radius = if is_fullscreen || self.theater_mode {
+        let is_sliding_short = is_shorts && self.shorts_slide_anim.is_some();
+        let radius = if is_fullscreen || (!is_shorts && self.theater_mode) {
             0.0
         } else if is_shorts {
             14.0
@@ -802,7 +831,7 @@ impl YtApp {
             12.0
         };
         let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-        if !is_fullscreen && self.ambient_glow && self.watch.is_some() {
+        if !is_fullscreen && self.ambient_glow && self.watch.is_some() && !is_sliding_short {
             // Soft feathered multi-ring cinema bloom behind the active video surface
             for step in (1..=6).rev() {
                 let frac = step as f32 / 6.0;
@@ -820,7 +849,8 @@ impl YtApp {
         ui.painter().rect_filled(rect, radius, Color32::BLACK);
 
         if let Some(mpv) = &self.mpv {
-            if is_shorts && (self.watch.is_none() || self.playback.video_h == 0) {
+            if is_shorts && (is_sliding_short || self.watch.is_none() || self.playback.video_h == 0)
+            {
                 if let Some(thumb) = self
                     .shorts_queue
                     .get(self.shorts_idx)
@@ -830,7 +860,7 @@ impl YtApp {
                     theme::paint_image_cover_rounded(ui, &thumb, rect, radius.round() as u8);
                 }
             }
-            if self.watch.is_some() {
+            if self.watch.is_some() && !is_sliding_short {
                 ui.painter().add(mpv.paint_callback(rect));
             }
         } else if (self.watch_loading || crate::mpv::find_libmpv(&self.backend.data_dir).is_some())
@@ -938,16 +968,26 @@ impl YtApp {
             && self.playback.video_h == 0
             && !self.playback.paused
             && !self.playback.idle;
-        if self.watch_loading || self.playback.buffering || is_initial_wait {
+        let shorts_grace = is_shorts
+            && self
+                .shorts_opened_at
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(550))
+            && !self.playback.buffering;
+        if (self.watch_loading || self.playback.buffering || is_initial_wait) && !is_sliding_short
+        {
             ctx.request_repaint();
-            let label = if self.watch_loading {
-                "Resolving stream...".to_owned()
-            } else if self.playback.cache_duration > 0.05 {
-                format!("Buffering · {:.1}s", self.playback.cache_duration)
+            if shorts_grace {
+                draw_shorts_bottom_shimmer(ui, ctx, rect);
             } else {
-                "Buffering...".to_owned()
-            };
-            draw_buffering_overlay(ui, ctx, rect, radius, &label);
+                let label = if self.watch_loading {
+                    "Resolving stream...".to_owned()
+                } else if self.playback.cache_duration > 0.05 {
+                    format!("Buffering · {:.1}s", self.playback.cache_duration)
+                } else {
+                    "Buffering...".to_owned()
+                };
+                draw_buffering_overlay(ui, ctx, rect, radius, &label);
+            }
         }
 
         // Center HUD feedback (Play/Pause/Seek pulse)
@@ -1410,9 +1450,9 @@ impl YtApp {
         let row_w = cui.available_width();
         let (row_rect, _) = cui.allocate_exact_size(Vec2::new(row_w, 36.0), Sense::hover());
         let right_w = if is_shorts && !self.fullscreen {
-            82.0_f32.min(row_w * 0.35)
+            156.0_f32.min(row_w * 0.48)
         } else {
-            240.0_f32.min(row_w * 0.45)
+            340.0_f32.min(row_w * 0.56)
         };
         let left_w = (row_w - right_w - 6.0).max(80.0);
 
@@ -1659,6 +1699,7 @@ impl YtApp {
         );
         let rclip = right_ui.clip_rect().intersect(right_rect);
         right_ui.set_clip_rect(rclip);
+        right_ui.spacing_mut().item_spacing.x = 3.0;
         {
             let ui = &mut right_ui;
 
@@ -1690,6 +1731,32 @@ impl YtApp {
                     any_interacted = true;
                     self.toggle_win_pip(ctx);
                 }
+            }
+
+            // Screenshot (sends to DropBoard when running, otherwise copies to Windows clipboard)
+            let (ss_rect, ss_resp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
+            paint_hover_circle(ui, ss_rect, &ss_resp, alpha);
+            theme::draw_camera_icon(
+                ui.painter(),
+                ss_rect.center(),
+                17.0,
+                white,
+                self.dropboard_online,
+            );
+            let ss_tip = if self.dropboard_online {
+                format!(
+                    "Screenshot -> DropBoard ({})",
+                    self.shortcuts.screenshot.display()
+                )
+            } else {
+                format!(
+                    "Screenshot to Clipboard ({})",
+                    self.shortcuts.screenshot.display()
+                )
+            };
+            if ss_resp.on_hover_text(ss_tip).clicked() {
+                any_interacted = true;
+                self.capture_video_screenshot();
             }
 
             // Theater mode (hidden in fullscreen and Shorts mode)
@@ -4438,6 +4505,65 @@ impl YtApp {
             return;
         }
 
+        let chips = build_up_next_chips(w);
+        let mut clicked_chip: Option<(usize, crate::model::UpNextFilterMode, String, Option<String>)> =
+            None;
+        if !chips.is_empty() {
+            ScrollArea::horizontal()
+                .id_salt("up_next_chips_scroll")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        for (idx, (mode, title, cont)) in chips.iter().enumerate() {
+                            let selected = if self.up_next_active_chip < chips.len() {
+                                idx == self.up_next_active_chip
+                            } else {
+                                *mode == self.up_next_mode
+                            };
+                            let fill = if selected {
+                                Color32::from_rgb(241, 241, 241)
+                            } else {
+                                theme::CHIP
+                            };
+                            let text_col = if selected {
+                                Color32::from_rgb(15, 15, 15)
+                            } else {
+                                theme::TEXT
+                            };
+                            let btn = egui::Button::new(
+                                RichText::new(title)
+                                    .font(theme::medium(12.0))
+                                    .color(text_col),
+                            )
+                            .fill(fill)
+                            .corner_radius(8)
+                            .min_size(vec2(0.0, 28.0));
+                            let resp = ui.add(btn);
+                            if resp.hovered() {
+                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                            }
+                            if resp.clicked() {
+                                clicked_chip =
+                                    Some((idx, *mode, title.clone(), cont.clone()));
+                            }
+                        }
+                    });
+                });
+            ui.add_space(6.0);
+        }
+        if self.up_next_loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    RichText::new("Updating recommendations...")
+                        .font(theme::regular(11.5))
+                        .color(theme::TEXT_DIM),
+                );
+            });
+            ui.add_space(4.0);
+        }
+
         let related = w.related.clone();
         let mut right_action: Option<GridAction> = None;
         ScrollArea::vertical().id_salt("related_scroll").show(ui, |ui| {
@@ -4524,6 +4650,9 @@ impl YtApp {
                 ui.add_space(4.0);
             }
         });
+        if let Some((idx, mode, title, cont)) = clicked_chip {
+            self.select_up_next_chip(idx, mode, title, cont);
+        }
         if let Some(act) = right_action {
             self.handle_grid_action(ctx, act, |_| {});
         }
@@ -5852,6 +5981,111 @@ fn paint_rounded_corners_mask(
             pts.push(pos2(cx + r * ang.cos(), cy + r * ang.sin()));
         }
         painter.add(egui::Shape::convex_polygon(pts, bg, Stroke::NONE));
+    }
+}
+
+fn build_up_next_chips(
+    w: &WatchData,
+) -> Vec<(crate::model::UpNextFilterMode, String, Option<String>)> {
+    use crate::model::UpNextFilterMode;
+
+    let find_tok = |target: UpNextFilterMode| -> Option<(String, Option<String>)> {
+        w.related_chips
+            .iter()
+            .find(|c| UpNextFilterMode::classify_chip(&c.title, &w.channel) == Some(target))
+            .map(|c| (c.title.clone(), c.continuation.clone()))
+    };
+
+    let mut out = Vec::new();
+    let (all_title, all_tok) = find_tok(UpNextFilterMode::All)
+        .unwrap_or_else(|| ("All".to_owned(), None));
+    out.push((UpNextFilterMode::All, all_title, all_tok));
+
+    if !w.channel.trim().is_empty() && w.channel != "Unknown" {
+        let (ch_title, ch_tok) = find_tok(UpNextFilterMode::FromChannel)
+            .unwrap_or_else(|| (format!("From {}", w.channel), None));
+        out.push((UpNextFilterMode::FromChannel, ch_title, ch_tok));
+    }
+
+    let (rel_title, rel_tok) = find_tok(UpNextFilterMode::Related)
+        .unwrap_or_else(|| ("Related".to_owned(), None));
+    out.push((UpNextFilterMode::Related, rel_title, rel_tok));
+
+    let (fy_title, fy_tok) = find_tok(UpNextFilterMode::ForYou)
+        .unwrap_or_else(|| ("For you".to_owned(), None));
+    out.push((UpNextFilterMode::ForYou, fy_title, fy_tok));
+
+    for c in &w.related_chips {
+        if UpNextFilterMode::classify_chip(&c.title, &w.channel).is_none()
+            && c.continuation.is_some()
+        {
+            out.push((
+                UpNextFilterMode::Related,
+                c.title.clone(),
+                c.continuation.clone(),
+            ));
+        }
+    }
+    out
+}
+
+fn draw_shorts_transition_card(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    radius: f32,
+    out: &super::ShortsOutgoing,
+) {
+    ui.painter().rect_filled(rect, radius, Color32::BLACK);
+    if !out.thumbnail_url.is_empty() {
+        theme::paint_image_cover_rounded(ui, &out.thumbnail_url, rect, radius.round() as u8);
+    }
+    let scrim_h = 148.0_f32.min(rect.height() * 0.45);
+    let scrim = Rect::from_min_max(pos2(rect.left(), rect.bottom() - scrim_h), rect.max);
+    paint_vertical_gradient(
+        ui.painter(),
+        scrim,
+        Color32::TRANSPARENT,
+        Color32::from_black_alpha(180),
+    );
+    let text_painter = ui.painter().with_clip_rect(rect.shrink2(vec2(14.0, 8.0)));
+    if !out.channel.is_empty() {
+        text_painter.text(
+            pos2(rect.left() + 14.0, (rect.bottom() - 44.0).max(rect.top() + 16.0)),
+            Align2::LEFT_BOTTOM,
+            &out.channel,
+            theme::medium(12.5),
+            Color32::from_white_alpha(210),
+        );
+    }
+    if !out.title.is_empty() {
+        text_painter.text(
+            pos2(rect.left() + 14.0, (rect.bottom() - 18.0).max(rect.top() + 34.0)),
+            Align2::LEFT_BOTTOM,
+            &out.title,
+            theme::semibold(13.5),
+            Color32::WHITE,
+        );
+    }
+    paint_rounded_corners_mask(ui.painter(), rect, radius, theme::BG, true);
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.0, Color32::from_white_alpha(22)),
+        egui::StrokeKind::Inside,
+    );
+}
+
+fn draw_shorts_bottom_shimmer(ui: &mut egui::Ui, ctx: &egui::Context, rect: Rect) {
+    let t = (ctx.input(|i| i.time) as f32 * 1.8) % 1.0;
+    let bar_y = rect.bottom() - 3.0;
+    let bar_w = rect.width() * 0.36;
+    let x0 = rect.left() - bar_w + (rect.width() + bar_w) * t;
+    let bar = Rect::from_min_max(
+        pos2(x0.max(rect.left()), bar_y),
+        pos2((x0 + bar_w).min(rect.right()), rect.bottom()),
+    );
+    if bar.width() > 1.0 {
+        ui.painter().rect_filled(bar, 1.5, theme::YT_RED);
     }
 }
 

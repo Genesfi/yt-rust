@@ -547,6 +547,40 @@ pub fn draw_miniplayer_icon(painter: &egui::Painter, c: egui::Pos2, s: f32, colo
     painter.rect_filled(inner, 1.0, color);
 }
 
+/// Camera screenshot icon with optional DropBoard live cyan/blue status dot.
+pub fn draw_camera_icon(
+    painter: &egui::Painter,
+    c: egui::Pos2,
+    s: f32,
+    color: Color32,
+    dropboard_online: bool,
+) {
+    let stroke = Stroke::new(1.5, color);
+    let body = egui::Rect::from_center_size(
+        egui::pos2(c.x, c.y + s * 0.06),
+        egui::vec2(s * 0.94, s * 0.66),
+    );
+    painter.rect_stroke(body, 2.4, stroke, egui::StrokeKind::Middle);
+
+    // Top camera hump
+    let bump = [
+        egui::pos2(c.x - s * 0.22, body.top()),
+        egui::pos2(c.x - s * 0.14, body.top() - s * 0.14),
+        egui::pos2(c.x + s * 0.14, body.top() - s * 0.14),
+        egui::pos2(c.x + s * 0.22, body.top()),
+    ];
+    painter.add(egui::Shape::line(bump.to_vec(), stroke));
+
+    // Lens circle
+    painter.circle_stroke(body.center(), s * 0.18, stroke);
+
+    // DropBoard connected indicator dot (top-right inside camera body)
+    if dropboard_online {
+        let dot_pos = egui::pos2(body.right() - s * 0.18, body.top() + s * 0.16);
+        painter.circle_filled(dot_pos, s * 0.085, Color32::from_rgb(56, 189, 248));
+    }
+}
+
 /// YouTube-style Fullscreen corner brackets icon.
 pub fn draw_fullscreen_icon(
     painter: &egui::Painter,

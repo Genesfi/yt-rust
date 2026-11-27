@@ -200,6 +200,7 @@ pub struct PlaybackState {
     pub video_codec: String,
     pub audio_codec: String,
     pub cache_duration: f64,
+    pub cache_speed_bps: u64,
 }
 
 struct GlSurface {
@@ -352,6 +353,7 @@ impl MpvPlayer {
             set_opt("vd-lavc-threads", "0");
             set_opt("ytdl", "no");
             set_opt("keep-open", "yes");
+            set_opt("screenshot-format", "png");
             set_opt("cache", "yes");
             if is_preview {
                 set_opt("demuxer-max-bytes", "20MiB");
@@ -601,6 +603,34 @@ impl MpvPlayer {
         self.set_property_str("cache-pause-wait", &format!("{secs:.2}"));
     }
 
+    /// Capture the current clean video frame as PNG bytes via libmpv `screenshot-to-file`.
+    pub fn capture_frame_png(&self, temp_dir: &Path) -> anyhow::Result<Vec<u8>> {
+        std::fs::create_dir_all(temp_dir)?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let tmp_path = temp_dir.join(format!("yt_rust_shot_{stamp}.png"));
+        let path_str = tmp_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid screenshot temp path"))?;
+        self.set_property_str("screenshot-format", "png");
+        self.command(&["screenshot-to-file", path_str, "video"]);
+
+        let mut bytes = Vec::new();
+        for _ in 0..20 {
+            if let Ok(b) = std::fs::read(&tmp_path) {
+                if !b.is_empty() {
+                    bytes = b;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_file(&tmp_path);
+        anyhow::ensure!(!bytes.is_empty(), "No video frame available to capture");
+        Ok(bytes)
+    }
+
     pub fn poll_state(&self) -> PlaybackState {
         // Drain libmpv's event queue so internal buffers never stall
         unsafe {
@@ -637,6 +667,11 @@ impl MpvPlayer {
                     .map(|t| (t - st.time_pos).max(0.0))
             })
             .unwrap_or(0.0);
+        st.cache_speed_bps = self
+            .get_double("cache-speed")
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .map(|bytes_per_sec| (bytes_per_sec * 8.0) as u64)
+            .unwrap_or(0);
         st
     }
 

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -17,12 +17,56 @@ const MAX_SESSIONS: usize = 32;
 const VISIONOS_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
 const WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 
+struct BandwidthMeter {
+    origin: Instant,
+    ewma_bps: AtomicU64,
+    last_sample_ms: AtomicU64,
+}
+
+impl BandwidthMeter {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            ewma_bps: AtomicU64::new(0),
+            last_sample_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, bytes: usize, elapsed: Duration) {
+        if bytes < 16 * 1024 {
+            return;
+        }
+        let us = elapsed.as_micros().max(500) as u128;
+        let sample_bps = ((bytes as u128) * 8 * 1_000_000 / us) as u64;
+        let now_ms = self.origin.elapsed().as_millis().max(1) as u64;
+        let prev_ms = self.last_sample_ms.swap(now_ms, Ordering::AcqRel);
+        let prev = self.ewma_bps.load(Ordering::Acquire);
+        let next = if prev == 0 || now_ms.saturating_sub(prev_ms) > 10_000 {
+            sample_bps
+        } else {
+            ((prev as u128 * 7 + sample_bps as u128 * 3) / 10) as u64
+        };
+        self.ewma_bps.store(next, Ordering::Release);
+    }
+
+    fn estimate(&self) -> Option<(u64, Duration)> {
+        let bps = self.ewma_bps.load(Ordering::Acquire);
+        let last = self.last_sample_ms.load(Ordering::Acquire);
+        if bps == 0 || last == 0 {
+            return None;
+        }
+        let now_ms = self.origin.elapsed().as_millis() as u64;
+        Some((bps, Duration::from_millis(now_ms.saturating_sub(last))))
+    }
+}
+
 #[derive(Clone)]
 pub struct StreamProxy {
     port: u16,
     http: reqwest::Client,
     state: Arc<Mutex<ProxyState>>,
     handle: tokio::runtime::Handle,
+    bandwidth: Arc<BandwidthMeter>,
 }
 
 struct ProxyState {
@@ -240,6 +284,7 @@ impl StreamProxy {
             http: http.clone(),
             state: state.clone(),
             handle: tokio::runtime::Handle::current(),
+            bandwidth: Arc::new(BandwidthMeter::new()),
         };
 
         tokio::spawn(async move {
@@ -270,7 +315,19 @@ impl StreamProxy {
     /// Registers a stream for background head-only prefetch (first 2 blocks = ~576 KB)
     /// until a player actually opens the local proxy URL.
     pub fn register_prefetch_with_ua(&self, url: &str, size: u64, user_agent: &str) -> String {
-        self.register_inner(url, size, user_agent, 2)
+        self.register_prefetch_blocks_with_ua(url, size, user_agent, 2)
+    }
+
+    /// Registers a stream for background prefetch of up to `blocks` blocks (~512 KB/block)
+    /// until a player actually opens the local proxy URL.
+    pub fn register_prefetch_blocks_with_ua(
+        &self,
+        url: &str,
+        size: u64,
+        user_agent: &str,
+        blocks: usize,
+    ) -> String {
+        self.register_inner(url, size, user_agent, blocks.max(1))
     }
 
     fn register_inner(
@@ -301,7 +358,7 @@ impl StreamProxy {
                     .iter()
                     .filter(|(_, s)| {
                         s.active_readers.load(Ordering::Acquire) == 0
-                            && s.head_limit.load(Ordering::Acquire) <= 2
+                            && s.head_limit.load(Ordering::Acquire) < usize::MAX
                     })
                     .map(|(&k, _)| k)
                     .min()
@@ -325,16 +382,27 @@ impl StreamProxy {
             id
         };
 
-        let workers = if head_limit <= 2 { 2 } else { WORKERS };
+        let workers = if head_limit <= 2 {
+            2
+        } else if head_limit < usize::MAX {
+            3
+        } else {
+            WORKERS
+        };
         for _ in 0..workers {
             let http = self.http.clone();
             let sess = session.clone();
+            let bw = self.bandwidth.clone();
             self.handle.spawn(async move {
-                worker_loop(http, sess).await;
+                worker_loop(http, sess, bw).await;
             });
         }
 
         format!("http://127.0.0.1:{}/s/{id}", self.port)
+    }
+
+    pub fn estimated_bps(&self) -> Option<(u64, Duration)> {
+        self.bandwidth.estimate()
     }
 
     fn session_id_from_url(&self, url: &str) -> Option<u64> {
@@ -381,7 +449,11 @@ impl StreamProxy {
     }
 }
 
-async fn worker_loop(http: reqwest::Client, sess: Arc<StreamSession>) {
+async fn worker_loop(
+    http: reqwest::Client,
+    sess: Arc<StreamSession>,
+    bandwidth: Arc<BandwidthMeter>,
+) {
     loop {
         if sess.cancelled.load(Ordering::Acquire) || sess.failed.load(Ordering::Acquire) {
             return;
@@ -418,6 +490,7 @@ async fn worker_loop(http: reqwest::Client, sess: Arc<StreamSession>) {
             } else {
                 sess.user_agent.as_str()
             };
+            let chunk_start = Instant::now();
             let res = http
                 .get(&ranged_url)
                 .header("User-Agent", ua)
@@ -434,6 +507,7 @@ async fn worker_loop(http: reqwest::Client, sess: Arc<StreamSession>) {
                             bytes.len() == expected_len
                         };
                         if complete {
+                            bandwidth.record(bytes.len(), chunk_start.elapsed());
                             saw_403 = false;
                             ok_data = Some(bytes.to_vec());
                             break;

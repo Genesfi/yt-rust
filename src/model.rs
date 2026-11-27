@@ -301,8 +301,8 @@ pub struct VideoFormat {
 }
 
 impl VideoFormat {
-    pub fn label(&self) -> String {
-        let codec = if self.mime.contains("av01") {
+    pub fn codec_family(&self) -> &'static str {
+        if self.mime.contains("av01") {
             "AV1"
         } else if self.mime.contains("vp9") || self.mime.contains("vp09") {
             "VP9"
@@ -310,7 +310,11 @@ impl VideoFormat {
             "H.264"
         } else {
             "Video"
-        };
+        }
+    }
+
+    pub fn label(&self) -> String {
+        let codec = self.codec_family();
         if self.fps > 30 {
             format!("{}p{} ({codec})", self.height, self.fps)
         } else {
@@ -475,9 +479,60 @@ pub struct WatchData {
     pub comments_token: Option<String>,
     pub live_chat_token: Option<String>,
     pub related: Vec<VideoItem>,
+    pub related_chips: Vec<FeedChip>,
     pub is_live: bool,
     pub is_members_only: bool,
     pub resume_secs: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum UpNextFilterMode {
+    #[default]
+    All,
+    FromChannel,
+    Related,
+    ForYou,
+}
+
+impl UpNextFilterMode {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::FromChannel => "from_channel",
+            Self::Related => "related",
+            Self::ForYou => "for_you",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Self {
+        match s {
+            "from_channel" => Self::FromChannel,
+            "related" => Self::Related,
+            "for_you" => Self::ForYou,
+            _ => Self::All,
+        }
+    }
+
+    pub fn classify_chip(title: &str, channel_name: &str) -> Option<Self> {
+        let low = title.trim().to_ascii_lowercase();
+        if low == "all" || low == "semua" {
+            return Some(Self::All);
+        }
+        if low == "related" || low == "terkait" {
+            return Some(Self::Related);
+        }
+        if low == "for you" || low == "untuk anda" {
+            return Some(Self::ForYou);
+        }
+        let ch = channel_name.trim().to_ascii_lowercase();
+        if low.starts_with("from ")
+            || low.starts_with("dari ")
+            || (!ch.is_empty() && low == ch)
+        {
+            return Some(Self::FromChannel);
+        }
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -870,6 +925,7 @@ pub struct ShortcutConfig {
     pub volume_down: KeyBinding,
     pub stats_for_nerds: KeyBinding,
     pub toggle_captions: KeyBinding,
+    pub screenshot: KeyBinding,
 }
 
 impl Default for ShortcutConfig {
@@ -888,6 +944,7 @@ impl Default for ShortcutConfig {
             volume_down: KeyBinding::simple("Down"),
             stats_for_nerds: KeyBinding::ctrl("I"),
             toggle_captions: KeyBinding::simple("C"),
+            screenshot: KeyBinding::simple("S"),
         }
     }
 }
@@ -907,6 +964,7 @@ pub enum ShortcutSlot {
     VolumeDown,
     StatsForNerds,
     ToggleCaptions,
+    Screenshot,
 }
 
 impl ShortcutSlot {
@@ -924,6 +982,7 @@ impl ShortcutSlot {
         Self::VolumeDown,
         Self::StatsForNerds,
         Self::ToggleCaptions,
+        Self::Screenshot,
     ];
 
     pub fn label(self) -> &'static str {
@@ -941,6 +1000,7 @@ impl ShortcutSlot {
             Self::VolumeDown => "Volume Down (-5%)",
             Self::StatsForNerds => "Stats for Nerds",
             Self::ToggleCaptions => "Subtitles / Captions",
+            Self::Screenshot => "Screenshot (DropBoard / Clipboard)",
         }
     }
 }
@@ -961,6 +1021,7 @@ impl ShortcutConfig {
             ShortcutSlot::VolumeDown => &self.volume_down,
             ShortcutSlot::StatsForNerds => &self.stats_for_nerds,
             ShortcutSlot::ToggleCaptions => &self.toggle_captions,
+            ShortcutSlot::Screenshot => &self.screenshot,
         }
     }
 
@@ -979,6 +1040,7 @@ impl ShortcutConfig {
             ShortcutSlot::VolumeDown => self.volume_down = binding,
             ShortcutSlot::StatsForNerds => self.stats_for_nerds = binding,
             ShortcutSlot::ToggleCaptions => self.toggle_captions = binding,
+            ShortcutSlot::Screenshot => self.screenshot = binding,
         }
     }
 }
@@ -1006,7 +1068,36 @@ pub struct LastWatched {
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyBinding, ShortcutConfig, ShortcutSlot};
+    use super::{KeyBinding, ShortcutConfig, ShortcutSlot, UpNextFilterMode};
+
+    #[test]
+    fn classifies_up_next_filter_chips() {
+        assert_eq!(
+            UpNextFilterMode::classify_chip("All", "Dr. Tirta"),
+            Some(UpNextFilterMode::All)
+        );
+        assert_eq!(
+            UpNextFilterMode::classify_chip("Semua", "Dr. Tirta"),
+            Some(UpNextFilterMode::All)
+        );
+        assert_eq!(
+            UpNextFilterMode::classify_chip("From Dr. Tirta", "Dr. Tirta"),
+            Some(UpNextFilterMode::FromChannel)
+        );
+        assert_eq!(
+            UpNextFilterMode::classify_chip("Dari Ado", "Ado"),
+            Some(UpNextFilterMode::FromChannel)
+        );
+        assert_eq!(
+            UpNextFilterMode::classify_chip("Terkait", "Ado"),
+            Some(UpNextFilterMode::Related)
+        );
+        assert_eq!(
+            UpNextFilterMode::classify_chip("Untuk Anda", "Ado"),
+            Some(UpNextFilterMode::ForYou)
+        );
+        assert_eq!(UpNextFilterMode::classify_chip("Anime", "Ado"), None);
+    }
 
     #[test]
     fn parses_and_formats_key_bindings() {

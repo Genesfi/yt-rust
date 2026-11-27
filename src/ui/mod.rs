@@ -19,7 +19,7 @@ use crate::model::{
     HoverPreviewQuality, HwdecMode, KeyBinding, LastWatched, LiveChatEmote, LiveChatMessage,
     NotificationMenuItem, PlaylistOption, PlaylistSummary, PoTokenMode, PreferredQuality,
     SearchChannelResult, SearchFilter, ShortcutConfig, ShortcutSlot, SidebarChannel,
-    SponsorCategory, SponsorSegment, VideoItem, WatchData, WindowMaterial,
+    SponsorCategory, SponsorSegment, UpNextFilterMode, VideoItem, WatchData, WindowMaterial,
 };
 use crate::mpv::{GlProcAddrFn, MpvPlayer, PlaybackState};
 use crate::os_media::OsMedia;
@@ -162,6 +162,13 @@ pub(super) struct ActiveDownload {
     pub status: String,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct ShortsOutgoing {
+    pub thumbnail_url: String,
+    pub title: String,
+    pub channel: String,
+}
+
 pub(super) struct PlayerSlot {
     pub mpv: Option<MpvPlayer>,
     pub watch: Option<WatchData>,
@@ -174,6 +181,15 @@ pub(super) struct PlayerSlot {
     pub pending_hls_target_height: Option<u32>,
     pub stream_recovery_attempts: u8,
     pub stream_recovering: Option<String>,
+    pub buffering_since: Option<Instant>,
+    pub last_abr_switch_at: Option<Instant>,
+    pub stable_playback_since: Option<Instant>,
+    pub last_abr_progress_pos: f64,
+    pub abr_initial_format_idx: Option<usize>,
+    pub abr_target_height: Option<u32>,
+    pub abr_downgraded: bool,
+    pub abr_upgrade_attempts: u8,
+    pub abr_tried_formats: HashSet<usize>,
     pub seeking_pos: Option<f64>,
     pub muted: bool,
     pub speed: f64,
@@ -211,6 +227,9 @@ pub(super) struct PlayerSlot {
     pub live_chat_emote_picker_open: bool,
     pub right_tab: RightTab,
     pub start_paused: bool,
+    pub related_base: Vec<VideoItem>,
+    pub up_next_active_chip: usize,
+    pub up_next_loading: bool,
 }
 
 impl PlayerSlot {
@@ -227,6 +246,15 @@ impl PlayerSlot {
             pending_hls_target_height: None,
             stream_recovery_attempts: 0,
             stream_recovering: None,
+            buffering_since: None,
+            last_abr_switch_at: None,
+            stable_playback_since: None,
+            last_abr_progress_pos: 0.0,
+            abr_initial_format_idx: None,
+            abr_target_height: None,
+            abr_downgraded: false,
+            abr_upgrade_attempts: 0,
+            abr_tried_formats: HashSet::new(),
             seeking_pos: None,
             muted: false,
             speed,
@@ -264,6 +292,9 @@ impl PlayerSlot {
             live_chat_emote_picker_open: false,
             right_tab: RightTab::UpNext,
             start_paused: false,
+            related_base: Vec::new(),
+            up_next_active_chip: 0,
+            up_next_loading: false,
         }
     }
 
@@ -284,6 +315,15 @@ impl PlayerSlot {
         self.pending_hls_target_height = None;
         self.stream_recovery_attempts = 0;
         self.stream_recovering = None;
+        self.buffering_since = None;
+        self.last_abr_switch_at = None;
+        self.stable_playback_since = None;
+        self.last_abr_progress_pos = 0.0;
+        self.abr_initial_format_idx = None;
+        self.abr_target_height = None;
+        self.abr_downgraded = false;
+        self.abr_upgrade_attempts = 0;
+        self.abr_tried_formats.clear();
         self.sponsor_segments.clear();
         self.last_skipped_end = -1.0;
         self.seeking_pos = None;
@@ -311,6 +351,9 @@ impl PlayerSlot {
         self.live_chat_replay_initial_token = None;
         self.live_chat_last_replay_pos = 0.0;
         self.live_chat_emote_picker_open = false;
+        self.related_base.clear();
+        self.up_next_active_chip = usize::MAX;
+        self.up_next_loading = false;
     }
 
     pub fn ensure_mpv(
@@ -482,12 +525,20 @@ pub struct YtApp {
     pub(super) live_chat_last_replay_pos: f64,
     pub(super) live_chat_emote_picker_open: bool,
     pub(super) right_tab: RightTab,
+    pub(super) related_base: Vec<VideoItem>,
+    pub(super) up_next_mode: UpNextFilterMode,
+    pub(super) up_next_active_chip: usize,
+    pub(super) up_next_loading: bool,
+    pub(super) dropboard_online: bool,
+    pub(super) dropboard_last_check: Option<Instant>,
     pub(super) active_player_tab: usize,
     pub(super) bg_player_tab: Option<Box<PlayerSlot>>,
     pub(super) shorts_slot: Box<PlayerSlot>,
     pub(super) shorts_queue: Vec<VideoItem>,
     pub(super) shorts_idx: usize,
     pub(super) shorts_slide_anim: Option<(i8, Instant)>,
+    pub(super) shorts_outgoing: Option<ShortsOutgoing>,
+    pub(super) shorts_opened_at: Option<Instant>,
     pub(super) shorts_last_wheel_at: Option<Instant>,
     pub(super) shorts_comments_open: bool,
     pub(super) shorts_grid_view: bool,
@@ -502,6 +553,15 @@ pub struct YtApp {
     pub(super) pending_hls_target_height: Option<u32>,
     pub(super) stream_recovery_attempts: u8,
     pub(super) stream_recovering: Option<String>,
+    pub(super) buffering_since: Option<Instant>,
+    pub(super) last_abr_switch_at: Option<Instant>,
+    pub(super) stable_playback_since: Option<Instant>,
+    pub(super) last_abr_progress_pos: f64,
+    pub(super) abr_initial_format_idx: Option<usize>,
+    pub(super) abr_target_height: Option<u32>,
+    pub(super) abr_downgraded: bool,
+    pub(super) abr_upgrade_attempts: u8,
+    pub(super) abr_tried_formats: HashSet<usize>,
     pub(super) seeking_pos: Option<f64>,
     pub(super) volume: f64,
     pub(super) muted: bool,
@@ -635,6 +695,8 @@ impl YtApp {
         let mut sync_history = true;
         let mut autoplay_next = true;
         let mut auto_resume_on_start = false;
+        let mut theater_mode = false;
+        let mut up_next_mode = UpNextFilterMode::All;
         let mut always_on_top = false;
         let mut close_to_tray = false;
         let mut minimize_to_tray = false;
@@ -685,6 +747,12 @@ impl YtApp {
             }
             if let Some(ar) = storage.get_string("auto_resume_on_start") {
                 auto_resume_on_start = ar == "1";
+            }
+            if let Some(tm) = storage.get_string("theater_mode") {
+                theater_mode = tm == "1";
+            }
+            if let Some(um) = storage.get_string("up_next_mode") {
+                up_next_mode = UpNextFilterMode::from_key(&um);
             }
             if let Some(aot) = storage.get_string("always_on_top") {
                 always_on_top = aot == "1";
@@ -936,6 +1004,8 @@ impl YtApp {
             shorts_queue: Vec::new(),
             shorts_idx: 0,
             shorts_slide_anim: None,
+            shorts_outgoing: None,
+            shorts_opened_at: None,
             shorts_last_wheel_at: None,
             shorts_comments_open: false,
             shorts_grid_view: false,
@@ -948,6 +1018,12 @@ impl YtApp {
             channel_avatars: HashMap::new(),
             avatar_requested: HashSet::new(),
             right_tab: RightTab::UpNext,
+            related_base: Vec::new(),
+            up_next_mode,
+            up_next_active_chip: 0,
+            up_next_loading: false,
+            dropboard_online: false,
+            dropboard_last_check: None,
             playback: PlaybackState::default(),
             watch_started_at: None,
             active_stream_urls: (String::new(), None),
@@ -955,6 +1031,15 @@ impl YtApp {
             pending_hls_target_height: None,
             stream_recovery_attempts: 0,
             stream_recovering: None,
+            buffering_since: None,
+            last_abr_switch_at: None,
+            stable_playback_since: None,
+            last_abr_progress_pos: 0.0,
+            abr_initial_format_idx: None,
+            abr_target_height: None,
+            abr_downgraded: false,
+            abr_upgrade_attempts: 0,
+            abr_tried_formats: HashSet::new(),
             seeking_pos: None,
             volume,
             muted: false,
@@ -980,7 +1065,7 @@ impl YtApp {
             sync_history,
             autoplay_next,
             auto_resume_on_start,
-            theater_mode: false,
+            theater_mode,
             fullscreen: false,
             win_pip_mode: false,
             win_pip_saved_rect: None,
@@ -1171,6 +1256,7 @@ impl YtApp {
                         comments_token: None,
                         live_chat_token: None,
                         related: Vec::new(),
+                        related_chips: Vec::new(),
                         is_live: false,
                         is_members_only: false,
                         resume_secs: (bg_lw.position_secs > 2.0).then_some(bg_lw.position_secs),
@@ -1453,6 +1539,18 @@ impl YtApp {
             &mut slot.stream_recovery_attempts,
         );
         std::mem::swap(&mut self.stream_recovering, &mut slot.stream_recovering);
+        std::mem::swap(&mut self.buffering_since, &mut slot.buffering_since);
+        std::mem::swap(&mut self.last_abr_switch_at, &mut slot.last_abr_switch_at);
+        std::mem::swap(&mut self.stable_playback_since, &mut slot.stable_playback_since);
+        std::mem::swap(&mut self.last_abr_progress_pos, &mut slot.last_abr_progress_pos);
+        std::mem::swap(
+            &mut self.abr_initial_format_idx,
+            &mut slot.abr_initial_format_idx,
+        );
+        std::mem::swap(&mut self.abr_target_height, &mut slot.abr_target_height);
+        std::mem::swap(&mut self.abr_downgraded, &mut slot.abr_downgraded);
+        std::mem::swap(&mut self.abr_upgrade_attempts, &mut slot.abr_upgrade_attempts);
+        std::mem::swap(&mut self.abr_tried_formats, &mut slot.abr_tried_formats);
         std::mem::swap(&mut self.seeking_pos, &mut slot.seeking_pos);
         std::mem::swap(&mut self.muted, &mut slot.muted);
         std::mem::swap(&mut self.speed, &mut slot.speed);
@@ -1517,6 +1615,9 @@ impl YtApp {
         );
         std::mem::swap(&mut self.right_tab, &mut slot.right_tab);
         std::mem::swap(&mut self.start_paused, &mut slot.start_paused);
+        std::mem::swap(&mut self.related_base, &mut slot.related_base);
+        std::mem::swap(&mut self.up_next_active_chip, &mut slot.up_next_active_chip);
+        std::mem::swap(&mut self.up_next_loading, &mut slot.up_next_loading);
     }
 
     pub(super) fn switch_player_tab(&mut self) {
@@ -1735,11 +1836,28 @@ impl YtApp {
     }
 
     fn shorts_quality(&self) -> PreferredQuality {
-        match self.preferred_quality {
+        let cap = match self.preferred_quality {
             PreferredQuality::Best4K | PreferredQuality::P1440 | PreferredQuality::P1080 => {
-                PreferredQuality::P720
+                PreferredQuality::P1080
             }
             q => q,
+        };
+        let bw = self
+            .backend
+            .estimated_bandwidth_bps()
+            .map(|(bps, _)| bps)
+            .unwrap_or(0);
+        let net_q = if bw >= 15_000_000 {
+            PreferredQuality::P1080
+        } else if bw == 0 || bw >= 4_000_000 {
+            PreferredQuality::P720
+        } else {
+            PreferredQuality::P480
+        };
+        if net_q.max_height() < cap.max_height() {
+            net_q
+        } else {
+            cap
         }
     }
 
@@ -1750,9 +1868,11 @@ impl YtApp {
         let quality = self.shorts_quality();
         for offset in 1..=2 {
             if let Some(next_item) = self.shorts_queue.get(self.shorts_idx + offset) {
+                let head_blocks = if offset == 1 { 10 } else { 2 };
                 let _ = self.backend.tx.send(Request::PrefetchShort {
                     video_id: next_item.id.clone(),
                     quality,
+                    head_blocks,
                 });
             }
         }
@@ -1787,6 +1907,10 @@ impl YtApp {
         let seed = item.id.clone();
 
         self.record_history(item.clone());
+        if let Some(m) = &self.shorts_slot.mpv {
+            m.set_paused(true);
+        }
+        self.shorts_opened_at = Some(Instant::now());
         self.shorts_slot.clear_for_new_video(&item.id);
         self.shorts_slot.pending_resume = None;
         let _ = self.backend.tx.send(Request::Watch {
@@ -1794,6 +1918,7 @@ impl YtApp {
             quality: self.shorts_quality(),
             sync_history: self.sync_history,
         });
+        self.trigger_shorts_prefetch();
         if need_seq {
             let _ = self
                 .backend
@@ -1802,10 +1927,40 @@ impl YtApp {
         }
     }
 
+    fn capture_shorts_outgoing(&mut self) {
+        let queue_item = self.shorts_queue.get(self.shorts_idx);
+        let watch = self.shorts_slot.watch.as_ref();
+        let id = watch
+            .map(|w| w.id.as_str())
+            .or_else(|| queue_item.map(|q| q.id.as_str()))
+            .or(self.shorts_slot.active_watch_id.as_deref());
+        let Some(id) = id else {
+            return;
+        };
+        let thumb = queue_item
+            .map(|q| q.thumbnail_url.clone())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"));
+        let title = watch
+            .map(|w| w.title.clone())
+            .or_else(|| queue_item.map(|q| q.title.clone()))
+            .unwrap_or_default();
+        let channel = watch
+            .map(|w| w.channel.clone())
+            .or_else(|| queue_item.map(|q| q.channel.clone()))
+            .unwrap_or_default();
+        self.shorts_outgoing = Some(ShortsOutgoing {
+            thumbnail_url: thumb,
+            title,
+            channel,
+        });
+    }
+
     pub(super) fn step_short(&mut self, delta: isize) {
         if delta < 0 && self.shorts_idx > 0 {
             let next_i = self.shorts_idx - 1;
             if let Some(item) = self.shorts_queue.get(next_i).cloned() {
+                self.capture_shorts_outgoing();
                 self.shorts_idx = next_i;
                 self.shorts_slide_anim = Some((-1, Instant::now()));
                 let list = self.shorts_queue.clone();
@@ -1815,6 +1970,7 @@ impl YtApp {
             if !self.shorts_queue.is_empty() && self.shorts_idx + 1 < self.shorts_queue.len() {
                 let next_i = self.shorts_idx + 1;
                 if let Some(item) = self.shorts_queue.get(next_i).cloned() {
+                    self.capture_shorts_outgoing();
                     self.shorts_idx = next_i;
                     self.shorts_slide_anim = Some((1, Instant::now()));
                     let list = self.shorts_queue.clone();
@@ -1827,6 +1983,7 @@ impl YtApp {
                 .and_then(|w| w.related.first())
                 .cloned()
             {
+                self.capture_shorts_outgoing();
                 self.shorts_slide_anim = Some((1, Instant::now()));
                 self.open_short(next, Vec::new());
             }
@@ -1895,6 +2052,33 @@ impl YtApp {
     ) {
         if let (Some(cid), Some(av)) = (&data.channel_id, &data.channel_avatar_url) {
             self.channel_avatars.insert(cid.clone(), av.clone());
+        } else if data.channel_avatar_url.is_none() {
+            if let Some(cid) = data.channel_id.as_ref().filter(|c| c.starts_with("UC")) {
+                if let Some(cached) = self.channel_avatars.get(cid) {
+                    data.channel_avatar_url = Some(cached.clone());
+                } else if self.avatar_requested.insert(cid.clone()) {
+                    let _ = self.backend.tx.send(Request::ResolveChannelAvatars {
+                        channel_ids: vec![cid.clone()],
+                    });
+                }
+            } else {
+                let ch_low = data.channel.trim().to_ascii_lowercase();
+                if !ch_low.is_empty() {
+                    let fallback = self
+                        .home_items
+                        .iter()
+                        .chain(self.subs_items.iter())
+                        .chain(self.history.iter())
+                        .find(|it| {
+                            it.channel_avatar_url.is_some()
+                                && it.channel.trim().to_ascii_lowercase() == ch_low
+                        })
+                        .and_then(|it| it.channel_avatar_url.clone());
+                    if fallback.is_some() {
+                        data.channel_avatar_url = fallback;
+                    }
+                }
+            }
         }
         self.ingest_and_request_avatars(&mut data.related);
         self.watch_loading = false;
@@ -1908,6 +2092,20 @@ impl YtApp {
         let initial_audio_url = selected_audio_url;
         let initial_format_idx = selected_format_idx;
         self.selected_format_idx = initial_format_idx;
+        self.abr_initial_format_idx = initial_format_idx;
+        self.abr_target_height = initial_format_idx
+            .and_then(|i| data.video_formats.get(i))
+            .map(|f| f.height)
+            .or_else(|| {
+                (!is_shorts && !data.is_live).then_some(self.preferred_quality.max_height())
+            });
+        self.abr_downgraded = false;
+        self.abr_upgrade_attempts = 0;
+        self.abr_tried_formats.clear();
+        self.buffering_since = None;
+        self.last_abr_switch_at = None;
+        self.stable_playback_since = None;
+        self.last_abr_progress_pos = 0.0;
 
         let start_at = if data.is_live || is_shorts {
             None
@@ -2033,10 +2231,45 @@ impl YtApp {
                 });
             }
         }
+        self.related_base = data.related.clone();
+        self.up_next_active_chip = usize::MAX;
+        self.up_next_loading = false;
+        let auto_chip_req = if !is_shorts && !data.is_live && self.up_next_mode != UpNextFilterMode::All
+        {
+            let matching_chip = data.related_chips.iter().find(|c| {
+                UpNextFilterMode::classify_chip(&c.title, &data.channel) == Some(self.up_next_mode)
+            });
+            let chip_title = matching_chip
+                .map(|c| c.title.clone())
+                .unwrap_or_else(|| match self.up_next_mode {
+                    UpNextFilterMode::All => "All".to_owned(),
+                    UpNextFilterMode::FromChannel => format!("From {}", data.channel),
+                    UpNextFilterMode::Related => "Related".to_owned(),
+                    UpNextFilterMode::ForYou => "For you".to_owned(),
+                });
+            let cont = matching_chip.and_then(|c| c.continuation.clone());
+            Some(Request::LoadRelatedChip {
+                video_id: data.id.clone(),
+                mode: self.up_next_mode,
+                chip_title,
+                continuation: cont,
+                channel_name: data.channel.clone(),
+                video_title: data.title.clone(),
+                base_related: self.related_base.clone(),
+                home_fallback: self.home_items.clone(),
+            })
+        } else {
+            None
+        };
         self.watch = Some(*data);
+        if let Some(req) = auto_chip_req {
+            self.up_next_loading = true;
+            let _ = self.backend.tx.send(req);
+        }
         if is_shorts {
             self.trigger_shorts_prefetch();
         }
+        self.maybe_check_dropboard(true);
     }
 
     pub(super) fn open_local_file(&mut self, path: &std::path::Path) {
@@ -2060,6 +2293,15 @@ impl YtApp {
         self.pending_hls_target_height = None;
         self.stream_recovery_attempts = 0;
         self.stream_recovering = None;
+        self.buffering_since = None;
+        self.last_abr_switch_at = None;
+        self.stable_playback_since = None;
+        self.last_abr_progress_pos = 0.0;
+        self.abr_initial_format_idx = None;
+        self.abr_target_height = None;
+        self.abr_downgraded = false;
+        self.abr_upgrade_attempts = 0;
+        self.abr_tried_formats.clear();
         self.last_error = None;
         self.sponsor_segments.clear();
         self.last_skipped_end = -1.0;
@@ -2091,6 +2333,9 @@ impl YtApp {
         self.live_chat_replay_initial_token = None;
         self.live_chat_last_replay_pos = 0.0;
         self.live_chat_emote_picker_open = false;
+        self.related_base.clear();
+        self.up_next_active_chip = usize::MAX;
+        self.up_next_loading = false;
         if !(self.right_tab == RightTab::Queue && !self.queue.is_empty()) {
             self.right_tab = RightTab::UpNext;
         }
@@ -2122,6 +2367,7 @@ impl YtApp {
             comments_token: None,
             live_chat_token: None,
             related: Vec::new(),
+            related_chips: Vec::new(),
             is_live: false,
             is_members_only: false,
             resume_secs: None,
@@ -2148,6 +2394,15 @@ impl YtApp {
         self.pending_hls_target_height = None;
         self.stream_recovery_attempts = 0;
         self.stream_recovering = None;
+        self.buffering_since = None;
+        self.last_abr_switch_at = None;
+        self.stable_playback_since = None;
+        self.last_abr_progress_pos = 0.0;
+        self.abr_initial_format_idx = None;
+        self.abr_target_height = None;
+        self.abr_downgraded = false;
+        self.abr_upgrade_attempts = 0;
+        self.abr_tried_formats.clear();
         self.last_error = None;
         self.sponsor_segments.clear();
         self.last_skipped_end = -1.0;
@@ -2177,6 +2432,9 @@ impl YtApp {
         self.live_chat_replay_initial_token = None;
         self.live_chat_last_replay_pos = 0.0;
         self.live_chat_emote_picker_open = false;
+        self.related_base.clear();
+        self.up_next_active_chip = usize::MAX;
+        self.up_next_loading = false;
         if !(self.right_tab == RightTab::Queue && !self.queue.is_empty()) {
             self.right_tab = RightTab::UpNext;
         }
@@ -2269,16 +2527,26 @@ impl YtApp {
     }
 
     pub(super) fn switch_quality(&mut self, idx: usize) {
-        self.switch_quality_inner(idx, true);
+        self.switch_quality_inner(idx, true, true);
     }
 
-    fn switch_quality_inner(&mut self, idx: usize, notify_toast: bool) {
+    fn switch_quality_inner(&mut self, idx: usize, notify_toast: bool, is_manual: bool) {
         let Some(w) = &self.watch else { return };
         let Some(fmt) = w.video_formats.get(idx) else { return };
         let label = fmt.label();
         let target_h = fmt.height;
         let target_fps = fmt.fps;
         let target_bps = fmt.bitrate;
+
+        if is_manual {
+            self.abr_initial_format_idx = Some(idx);
+            self.abr_target_height = Some(target_h);
+            self.abr_downgraded = false;
+            self.abr_upgrade_attempts = 0;
+            self.abr_tried_formats.clear();
+            self.buffering_since = None;
+            self.stable_playback_since = None;
+        }
 
         if self.playing_hls_master {
             if let Some(mpv) = &self.mpv {
@@ -2341,8 +2609,21 @@ impl YtApp {
     }
 
     pub(super) fn switch_quality_auto(&mut self) {
+        self.switch_quality_auto_inner(true, true);
+    }
+
+    fn switch_quality_auto_inner(&mut self, notify_toast: bool, is_manual: bool) {
         let Some(w) = &self.watch else { return };
         let Some(hls) = w.hls_url.as_deref() else { return };
+        if is_manual {
+            self.abr_initial_format_idx = None;
+            self.abr_target_height = None;
+            self.abr_downgraded = false;
+            self.abr_upgrade_attempts = 0;
+            self.abr_tried_formats.clear();
+            self.buffering_since = None;
+            self.stable_playback_since = None;
+        }
         if let Some(mpv) = &self.mpv {
             mpv.set_hls_bitrate(None);
             if self.playing_hls_master {
@@ -2356,7 +2637,9 @@ impl YtApp {
         }
         self.pending_hls_target_height = None;
         self.selected_format_idx = None;
-        self.toast("Quality: Auto");
+        if notify_toast {
+            self.toast("Quality: Auto");
+        }
     }
 
     fn selected_audio_stream(&self, w: &WatchData) -> Option<String> {
@@ -2452,14 +2735,35 @@ impl YtApp {
         patch(&mut self.shorts_items);
         patch(&mut self.shorts_queue);
         if let Some(w) = &mut self.watch {
+            if w.channel_avatar_url.is_none() {
+                if let Some(cid) = &w.channel_id {
+                    if let Some(av) = map.get(cid) {
+                        w.channel_avatar_url = Some(av.clone());
+                    }
+                }
+            }
             patch(&mut w.related);
         }
         if let Some(bg) = &mut self.bg_player_tab {
             if let Some(w) = &mut bg.watch {
+                if w.channel_avatar_url.is_none() {
+                    if let Some(cid) = &w.channel_id {
+                        if let Some(av) = map.get(cid) {
+                            w.channel_avatar_url = Some(av.clone());
+                        }
+                    }
+                }
                 patch(&mut w.related);
             }
         }
         if let Some(w) = &mut self.shorts_slot.watch {
+            if w.channel_avatar_url.is_none() {
+                if let Some(cid) = &w.channel_id {
+                    if let Some(av) = map.get(cid) {
+                        w.channel_avatar_url = Some(av.clone());
+                    }
+                }
+            }
             patch(&mut w.related);
         }
         for n in &mut self.notifications {
@@ -3226,6 +3530,8 @@ impl YtApp {
                             }
                             app.active_stream_urls = (selected_video_url, selected_audio_url);
                             app.watch_started_at = Some(Instant::now());
+                            app.buffering_since = None;
+                            app.stable_playback_since = None;
                             app.toast("Refreshed expired stream");
                         }
                     });
@@ -3754,6 +4060,44 @@ impl YtApp {
                         self.ambient_changed_at = Some(Instant::now());
                     }
                 }
+                Response::DropBoardStatus(online) => {
+                    self.dropboard_online = online;
+                }
+                Response::ScreenshotDone {
+                    sent_to_dropboard,
+                    error,
+                } => {
+                    if sent_to_dropboard {
+                        self.dropboard_online = true;
+                        self.toast("Screenshot sent to DropBoard");
+                    } else if let Some(err) = error {
+                        self.toast(format!("Screenshot failed: {err}"));
+                    } else {
+                        self.dropboard_online = false;
+                        self.toast("Screenshot copied to clipboard");
+                    }
+                }
+                Response::RelatedChipLoaded {
+                    video_id,
+                    mode,
+                    chip_title,
+                    mut items,
+                } => {
+                    let home_avatars = &mut items;
+                    let _ = home_avatars;
+                    self.with_matching_slot(&video_id, |app, _is_shorts| {
+                        app.up_next_loading = false;
+                        app.ingest_and_request_avatars(&mut items);
+                        if let Some(w) = &mut app.watch {
+                            if !items.is_empty() || mode == UpNextFilterMode::All {
+                                w.related = items;
+                            }
+                            for c in &mut w.related_chips {
+                                c.selected = c.title.eq_ignore_ascii_case(&chip_title);
+                            }
+                        }
+                    });
+                }
                 Response::Error(msg) => {
                     self.home_loading = false;
                     self.subs_loading = false;
@@ -3840,6 +4184,7 @@ impl YtApp {
         }
         let mut hud_msg: Option<(HudIcon, &'static str)> = None;
         let mut wake_controls = false;
+        let mut take_screenshot = false;
         let mut step_short_delta: isize = 0;
         let mut reload_home = false;
         let mut exit_pip = false;
@@ -3905,10 +4250,16 @@ impl YtApp {
                         wake_controls = true;
                     }
                 }
+                if self.shortcuts.screenshot.matches(i) {
+                    take_screenshot = true;
+                }
                 return;
             }
             if self.page != Page::Watch {
                 return;
+            }
+            if self.shortcuts.screenshot.matches(i) {
+                take_screenshot = true;
             }
             if self.shortcuts.stats_for_nerds.matches(i) {
                 self.show_stats_for_nerds = !self.show_stats_for_nerds;
@@ -4016,12 +4367,92 @@ impl YtApp {
         if step_short_delta != 0 {
             self.step_short(step_short_delta);
         }
+        if take_screenshot {
+            self.capture_current_page_screenshot();
+        }
         if let Some((ico, msg)) = hud_msg {
             self.trigger_hud(ico, msg);
         }
         if wake_controls {
             self.last_pointer_move = Instant::now();
         }
+    }
+
+    pub(super) fn maybe_check_dropboard(&mut self, force: bool) {
+        let due = force
+            || self
+                .dropboard_last_check
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(5));
+        if due {
+            self.dropboard_last_check = Some(Instant::now());
+            let _ = self.backend.tx.send(Request::CheckDropBoard);
+        }
+    }
+
+    pub(super) fn capture_current_page_screenshot(&mut self) {
+        if self.page == Page::Shorts && !self.shorts_grid_view {
+            let mut slot = Box::new(PlayerSlot::new(1.0));
+            std::mem::swap(&mut self.shorts_slot, &mut slot);
+            self.swap_active_with(&mut slot);
+            self.capture_video_screenshot();
+            self.swap_active_with(&mut slot);
+            std::mem::swap(&mut self.shorts_slot, &mut slot);
+        } else {
+            self.capture_video_screenshot();
+        }
+    }
+
+    pub(super) fn capture_video_screenshot(&mut self) {
+        let Some(mpv) = &self.mpv else {
+            self.toast("No active video player");
+            return;
+        };
+        let title = match &self.watch {
+            Some(w) if self.playback.time_pos > 0.5 => {
+                format!("{} @ {}", w.title, format_duration(self.playback.time_pos))
+            }
+            Some(w) => w.title.clone(),
+            None => "YouTube Screenshot".to_owned(),
+        };
+        match mpv.capture_frame_png(&self.backend.data_dir) {
+            Ok(png_bytes) => {
+                let _ = self.backend.tx.send(Request::SendScreenshot { png_bytes, title });
+            }
+            Err(e) => {
+                self.toast(format!("Screenshot failed: {e:#}"));
+            }
+        }
+    }
+
+    pub(super) fn select_up_next_chip(
+        &mut self,
+        idx: usize,
+        mode: UpNextFilterMode,
+        chip_title: String,
+        continuation: Option<String>,
+    ) {
+        self.up_next_active_chip = idx;
+        self.up_next_mode = mode;
+        let Some(w) = &mut self.watch else {
+            return;
+        };
+        if mode == UpNextFilterMode::All && continuation.is_none() && !self.related_base.is_empty() {
+            w.related = self.related_base.clone();
+            self.up_next_loading = false;
+            return;
+        }
+        let req = Request::LoadRelatedChip {
+            video_id: w.id.clone(),
+            mode,
+            chip_title,
+            continuation,
+            channel_name: w.channel.clone(),
+            video_title: w.title.clone(),
+            base_related: self.related_base.clone(),
+            home_fallback: self.home_items.clone(),
+        };
+        self.up_next_loading = true;
+        let _ = self.backend.tx.send(req);
     }
 
     pub(super) fn set_always_on_top(&mut self, ctx: &egui::Context, on: bool) {
@@ -4413,6 +4844,212 @@ impl YtApp {
                         .to_owned(),
                 );
             }
+            return;
+        }
+
+        self.poll_adaptive_quality(is_remote_watch, is_live);
+    }
+
+    fn measured_network_bps(&self) -> u64 {
+        let proxy_bps = self
+            .backend
+            .estimated_bandwidth_bps()
+            .filter(|(_, age)| *age <= Duration::from_secs(20))
+            .map(|(bps, _)| bps)
+            .unwrap_or(0);
+        proxy_bps.max(self.playback.cache_speed_bps)
+    }
+
+    fn poll_adaptive_quality(&mut self, is_remote_watch: bool, is_live: bool) {
+        const PROLONGED_BUFFER_WAIT: Duration = Duration::from_millis(5500);
+        const ABR_SWITCH_COOLDOWN: Duration = Duration::from_secs(6);
+        const UPGRADE_STABLE_WAIT: Duration = Duration::from_secs(10);
+        const UPGRADE_COOLDOWN: Duration = Duration::from_secs(12);
+
+        if self.watch_loading
+            || !is_remote_watch
+            || is_live
+            || self.stream_recovering.is_some()
+            || self.last_error.is_some()
+            || self.seeking_pos.is_some()
+            || self.playback.paused
+            || self.playback.idle
+            || self.playback.eof
+        {
+            self.buffering_since = None;
+            if self.playback.paused || self.seeking_pos.is_some() {
+                self.stable_playback_since = None;
+            }
+            return;
+        }
+
+        let is_stalled_buffering = self.playback.buffering
+            || (self.watch.is_some() && self.playback.video_h == 0);
+
+        if is_stalled_buffering {
+            self.stable_playback_since = None;
+            if (self.playback.time_pos - self.last_abr_progress_pos).abs() > 0.25 {
+                self.last_abr_progress_pos = self.playback.time_pos;
+                self.buffering_since = Some(Instant::now());
+                return;
+            }
+            let stalled_for = self
+                .buffering_since
+                .get_or_insert_with(Instant::now)
+                .elapsed();
+            let cooldown_ok = self
+                .last_abr_switch_at
+                .is_none_or(|t| t.elapsed() >= ABR_SWITCH_COOLDOWN);
+            if stalled_for >= PROLONGED_BUFFER_WAIT && cooldown_ok {
+                self.try_abr_fallback();
+            }
+            return;
+        }
+
+        self.buffering_since = None;
+        self.last_abr_progress_pos = self.playback.time_pos;
+        let stable_for = self
+            .stable_playback_since
+            .get_or_insert_with(Instant::now)
+            .elapsed();
+
+        if self.abr_downgraded
+            && self.abr_upgrade_attempts < 2
+            && stable_for >= UPGRADE_STABLE_WAIT
+            && self
+                .last_abr_switch_at
+                .is_none_or(|t| t.elapsed() >= UPGRADE_COOLDOWN)
+        {
+            self.try_abr_upgrade();
+        }
+    }
+
+    fn try_abr_fallback(&mut self) {
+        let Some(w) = self.watch.as_ref() else {
+            return;
+        };
+        if let Some(cur_idx) = self.selected_format_idx {
+            self.abr_tried_formats.insert(cur_idx);
+            if self.abr_initial_format_idx.is_none() {
+                self.abr_initial_format_idx = Some(cur_idx);
+            }
+            if self.abr_target_height.is_none() {
+                if let Some(cur_fmt) = w.video_formats.get(cur_idx) {
+                    self.abr_target_height = Some(cur_fmt.height);
+                }
+            }
+        } else if self.abr_target_height.is_none() {
+            self.abr_target_height = Some(self.preferred_quality.max_height());
+        }
+
+        let action = pick_abr_fallback_action(
+            &w.video_formats,
+            self.selected_format_idx,
+            &self.abr_tried_formats,
+            w.hls_url.is_some(),
+            self.playing_hls_master,
+        );
+        let Some(action) = action else {
+            return;
+        };
+
+        self.buffering_since = None;
+        self.stable_playback_since = None;
+        self.last_abr_switch_at = Some(Instant::now());
+
+        match action {
+            AbrFallbackAction::SwitchFormat {
+                idx,
+                same_height_codec_swap,
+            } => {
+                let (label, next_h) = {
+                    let f = &w.video_formats[idx];
+                    (f.label(), f.height)
+                };
+                if !same_height_codec_swap
+                    || self.abr_target_height.is_some_and(|th| next_h < th)
+                {
+                    self.abr_downgraded = true;
+                }
+                self.switch_quality_inner(idx, false, false);
+                let msg = if same_height_codec_swap {
+                    format!("Buffering >5s — switched to {label}")
+                } else {
+                    format!("Buffering >5s — Auto lowered to {label}")
+                };
+                self.toast(msg);
+            }
+            AbrFallbackAction::SwitchHlsAuto => {
+                self.abr_downgraded = true;
+                self.switch_quality_auto_inner(false, false);
+                self.toast("Buffering >5s — switched to Auto");
+            }
+        }
+    }
+
+    fn try_abr_upgrade(&mut self) {
+        let Some(target_h) = self.abr_target_height else {
+            return;
+        };
+        let Some(w) = self.watch.as_ref() else {
+            return;
+        };
+        let cur_h = self
+            .selected_format_idx
+            .and_then(|i| w.video_formats.get(i))
+            .map(|f| f.height)
+            .unwrap_or(0);
+        if self.selected_format_idx.is_some() && cur_h >= target_h {
+            self.abr_downgraded = false;
+            return;
+        }
+
+        let allow_retried = self
+            .last_abr_switch_at
+            .is_some_and(|t| t.elapsed() >= Duration::from_secs(24));
+        let next_idx = pick_abr_recovery_idx(
+            &w.video_formats,
+            target_h,
+            self.abr_initial_format_idx,
+            &self.abr_tried_formats,
+            allow_retried,
+        )
+        .or_else(|| {
+            pick_abr_recovery_idx(
+                &w.video_formats,
+                target_h,
+                self.abr_initial_format_idx,
+                &self.abr_tried_formats,
+                true,
+            )
+            .filter(|_| self.measured_network_bps() >= default_bitrate_for_height(target_h) * 4)
+        });
+        let Some(idx) = next_idx else {
+            return;
+        };
+        let target_fmt = &w.video_formats[idx];
+        if target_fmt.height <= cur_h && self.selected_format_idx.is_some() {
+            return;
+        }
+
+        let measured_bps = self.measured_network_bps();
+        if !should_upgrade_to_target(target_fmt, measured_bps, self.playback.cache_duration) {
+            return;
+        }
+
+        let label = target_fmt.label();
+        self.abr_upgrade_attempts += 1;
+        self.abr_downgraded = false;
+        self.abr_tried_formats.clear();
+        self.buffering_since = None;
+        self.stable_playback_since = None;
+        self.last_abr_switch_at = Some(Instant::now());
+        self.switch_quality_inner(idx, false, false);
+        if measured_bps >= 1_000_000 {
+            let mbps = measured_bps as f64 / 1_000_000.0;
+            self.toast(format!("Fast network ({mbps:.0} Mbps) — restored {label}"));
+        } else {
+            self.toast(format!("Network recovered — restored {label}"));
         }
     }
 
@@ -4510,6 +5147,9 @@ impl YtApp {
 
         if !self.playback.paused && self.page == Page::Watch {
             ctx.request_repaint_after(Duration::from_millis(200));
+        }
+        if self.page == Page::Watch || (self.page == Page::Shorts && !self.shorts_grid_view) {
+            self.maybe_check_dropboard(false);
         }
 
         if self.page == Page::Watch && self.right_tab == RightTab::LiveChat {
@@ -4823,6 +5463,11 @@ impl eframe::App for YtApp {
             "auto_resume_on_start",
             if self.auto_resume_on_start { "1" } else { "0" }.into(),
         );
+        storage.set_string(
+            "theater_mode",
+            if self.theater_mode { "1" } else { "0" }.into(),
+        );
+        storage.set_string("up_next_mode", self.up_next_mode.key().into());
         storage.set_string(
             "always_on_top",
             if self.always_on_top { "1" } else { "0" }.into(),
@@ -5418,9 +6063,155 @@ pub(super) fn parse_sleep_timer_input(raw: &str) -> Option<Duration> {
     (secs >= 10).then(|| Duration::from_secs(secs.min(24 * 3600)))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AbrFallbackAction {
+    SwitchFormat {
+        idx: usize,
+        same_height_codec_swap: bool,
+    },
+    SwitchHlsAuto,
+}
+
+fn default_bitrate_for_height(height: u32) -> u64 {
+    match height {
+        2160.. => 18_000_000,
+        1440.. => 9_000_000,
+        1080.. => 4_500_000,
+        720.. => 2_500_000,
+        480.. => 1_200_000,
+        _ => 700_000,
+    }
+}
+
+fn pick_abr_fallback_action(
+    formats: &[crate::model::VideoFormat],
+    current_idx: Option<usize>,
+    tried: &HashSet<usize>,
+    has_hls: bool,
+    playing_hls_master: bool,
+) -> Option<AbrFallbackAction> {
+    if let Some(cur_idx) = current_idx {
+        if let Some(cur) = formats.get(cur_idx) {
+            let cur_codec = cur.codec_family();
+            if let Some((alt_idx, _)) = formats
+                .iter()
+                .enumerate()
+                .filter(|(i, f)| {
+                    *i != cur_idx
+                        && !tried.contains(i)
+                        && f.height == cur.height
+                        && f.codec_family() != cur_codec
+                        && f.has_audio == cur.has_audio
+                })
+                .min_by_key(|(_, f)| {
+                    let fps_diff = (f.fps as i32 - cur.fps as i32).abs();
+                    let codec_prio = match f.codec_family() {
+                        "VP9" => 0,
+                        "H.264" => 1,
+                        "AV1" => 2,
+                        _ => 3,
+                    };
+                    (fps_diff, codec_prio)
+                })
+            {
+                return Some(AbrFallbackAction::SwitchFormat {
+                    idx: alt_idx,
+                    same_height_codec_swap: true,
+                });
+            }
+
+            if let Some((low_idx, _)) = formats
+                .iter()
+                .enumerate()
+                .filter(|(i, f)| *i != cur_idx && !tried.contains(i) && f.height < cur.height)
+                .max_by_key(|(_, f)| {
+                    let codec_prio = match f.codec_family() {
+                        "H.264" => 3,
+                        "VP9" => 2,
+                        "AV1" => 1,
+                        _ => 0,
+                    };
+                    (f.height, !f.has_audio, codec_prio, f.fps)
+                })
+            {
+                return Some(AbrFallbackAction::SwitchFormat {
+                    idx: low_idx,
+                    same_height_codec_swap: false,
+                });
+            }
+        }
+    } else if has_hls && playing_hls_master {
+        if let Some((low_idx, _)) = formats
+            .iter()
+            .enumerate()
+            .filter(|(i, f)| !tried.contains(i) && f.height <= 480)
+            .max_by_key(|(_, f)| (f.height, !f.has_audio))
+            .or_else(|| {
+                formats
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, f)| !tried.contains(i) && f.height <= 720)
+                    .max_by_key(|(_, f)| (f.height, !f.has_audio))
+            })
+        {
+            return Some(AbrFallbackAction::SwitchFormat {
+                idx: low_idx,
+                same_height_codec_swap: false,
+            });
+        }
+    }
+
+    if has_hls && !playing_hls_master {
+        return Some(AbrFallbackAction::SwitchHlsAuto);
+    }
+    None
+}
+
+fn pick_abr_recovery_idx(
+    formats: &[crate::model::VideoFormat],
+    target_height: u32,
+    initial_idx: Option<usize>,
+    tried: &HashSet<usize>,
+    allow_retried: bool,
+) -> Option<usize> {
+    if let Some(init_i) = initial_idx {
+        if formats.get(init_i).is_some_and(|f| f.height == target_height)
+            && (allow_retried || !tried.contains(&init_i))
+        {
+            return Some(init_i);
+        }
+    }
+    formats
+        .iter()
+        .enumerate()
+        .filter(|(i, f)| f.height <= target_height && (allow_retried || !tried.contains(i)))
+        .max_by_key(|(_, f)| (f.height, !f.has_audio, f.fps))
+        .map(|(i, _)| i)
+}
+
+fn should_upgrade_to_target(
+    target_fmt: &crate::model::VideoFormat,
+    measured_bps: u64,
+    cache_duration: f64,
+) -> bool {
+    let req_bps = target_fmt
+        .bitrate
+        .max(default_bitrate_for_height(target_fmt.height));
+    if measured_bps > 0 {
+        measured_bps >= req_bps.saturating_mul(2) && cache_duration >= 5.0
+    } else {
+        cache_duration >= 18.0
+    }
+}
+
 #[cfg(test)]
 mod ui_tests {
-    use super::{parse_sleep_timer_input, shuffle_vec};
+    use super::{
+        AbrFallbackAction, parse_sleep_timer_input, pick_abr_fallback_action,
+        pick_abr_recovery_idx, should_upgrade_to_target, shuffle_vec,
+    };
+    use crate::model::VideoFormat;
+    use std::collections::HashSet;
     use std::time::Duration;
 
     #[test]
@@ -5442,5 +6233,61 @@ mod ui_tests {
         assert_eq!(parse_sleep_timer_input("45 menit"), Some(Duration::from_secs(2700)));
         assert_eq!(parse_sleep_timer_input("0"), None);
         assert_eq!(parse_sleep_timer_input("abc"), None);
+    }
+
+    #[test]
+    fn abr_fallback_swaps_codec_at_same_res_then_drops_resolution() {
+        let fmt = |height: u32, mime: &str, bitrate: u64| VideoFormat {
+            itag: 0,
+            url: format!("u{height}"),
+            mime: mime.to_owned(),
+            width: height * 16 / 9,
+            height,
+            fps: 30,
+            bitrate,
+            content_length: 0,
+            has_audio: false,
+        };
+        let formats = vec![
+            fmt(1080, "video/mp4; codecs=\"avc1.640028\"", 4_000_000),
+            fmt(1080, "video/webm; codecs=\"vp9\"", 3_500_000),
+            fmt(720, "video/mp4; codecs=\"avc1.4d401f\"", 2_000_000),
+            fmt(480, "video/mp4; codecs=\"avc1.4d401e\"", 1_000_000),
+        ];
+
+        let mut tried = HashSet::from([0usize]);
+        assert_eq!(
+            pick_abr_fallback_action(&formats, Some(0), &tried, false, false),
+            Some(AbrFallbackAction::SwitchFormat {
+                idx: 1,
+                same_height_codec_swap: true
+            })
+        );
+
+        tried.insert(1);
+        assert_eq!(
+            pick_abr_fallback_action(&formats, Some(1), &tried, false, false),
+            Some(AbrFallbackAction::SwitchFormat {
+                idx: 2,
+                same_height_codec_swap: false
+            })
+        );
+
+        tried.insert(2);
+        assert_eq!(
+            pick_abr_fallback_action(&formats, Some(2), &tried, false, false),
+            Some(AbrFallbackAction::SwitchFormat {
+                idx: 3,
+                same_height_codec_swap: false
+            })
+        );
+
+        // 300 Mbps restores 1080p from 480p; 3 Mbps stays at 480p.
+        assert!(should_upgrade_to_target(&formats[0], 300_000_000, 6.0));
+        assert!(!should_upgrade_to_target(&formats[0], 3_000_000, 6.0));
+        assert_eq!(
+            pick_abr_recovery_idx(&formats, 1080, Some(0), &tried, true),
+            Some(0)
+        );
     }
 }
