@@ -53,6 +53,10 @@ pub enum Request {
         successor_set_video_id: Option<String>,
     },
     LoadTrending,
+    LoadShorts,
+    LoadShortsQueue {
+        seed_video_id: String,
+    },
     LoadChannel {
         channel_id: String,
         params: Option<String>,
@@ -217,6 +221,13 @@ pub enum Response {
     PlaylistItemRemoved,
     PlaylistReordered,
     TrendingLoaded {
+        items: Vec<VideoItem>,
+    },
+    ShortsLoaded {
+        items: Vec<VideoItem>,
+    },
+    ShortsQueueLoaded {
+        seed_video_id: String,
         items: Vec<VideoItem>,
     },
     ChannelLoaded {
@@ -988,6 +999,39 @@ impl Backend {
                                     }
                                 }
                                 wake();
+                            }
+                            Request::LoadShorts => {
+                                match innertube::shorts_feed(&http, &cfg, session.as_ref()).await {
+                                    Ok(items) => {
+                                        let _ = resp_tx.send(Response::ShortsLoaded { items });
+                                    }
+                                    Err(e) => {
+                                        let _ = resp_tx.send(Response::Error(format!(
+                                            "Shorts load failed: {e:#}"
+                                        )));
+                                    }
+                                }
+                                wake();
+                            }
+                            Request::LoadShortsQueue { seed_video_id } => {
+                                let cfg_clone = cfg.clone();
+                                let sess_clone = session.clone();
+                                tokio::spawn(async move {
+                                    if let Ok(items) = innertube::fetch_shorts_sequence(
+                                        &http,
+                                        &seed_video_id,
+                                        &cfg_clone,
+                                        sess_clone.as_ref(),
+                                    )
+                                    .await
+                                    {
+                                        let _ = resp_tx.send(Response::ShortsQueueLoaded {
+                                            seed_video_id,
+                                            items,
+                                        });
+                                        wake();
+                                    }
+                                });
                             }
                             Request::LoadChannel {
                                 channel_id,

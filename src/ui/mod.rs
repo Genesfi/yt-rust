@@ -31,6 +31,7 @@ use cards::{GridAction, draw_video_grid};
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Page {
     Home,
+    Shorts,
     Subscriptions,
     Trending,
     Playlists,
@@ -61,6 +62,7 @@ pub(super) enum SubsFilter {
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum NavEntry {
     Home,
+    Shorts,
     Subscriptions,
     Trending,
     Playlists,
@@ -177,6 +179,9 @@ pub struct YtApp {
     pub(super) trending_items: Vec<VideoItem>,
     pub(super) trending_loading: bool,
 
+    pub(super) shorts_items: Vec<VideoItem>,
+    pub(super) shorts_loading: bool,
+
     pub(super) channel_id: Option<String>,
     pub(super) channel_name: String,
     pub(super) channel_info: Option<ChannelInfo>,
@@ -240,6 +245,7 @@ pub struct YtApp {
     pub(super) shorts_mode: bool,
     pub(super) shorts_queue: Vec<VideoItem>,
     pub(super) shorts_idx: usize,
+    pub(super) shorts_comments_open: bool,
     pub(super) history_feedback_tokens: HashMap<String, String>,
     pub(super) active_downloads: Vec<ActiveDownload>,
 
@@ -544,6 +550,8 @@ impl YtApp {
             subs_filter: SubsFilter::All,
             trending_items: Vec::new(),
             trending_loading: false,
+            shorts_items: Vec::new(),
+            shorts_loading: false,
             channel_id: None,
             channel_name: String::new(),
             channel_info: None,
@@ -601,6 +609,7 @@ impl YtApp {
             shorts_mode: false,
             shorts_queue: Vec::new(),
             shorts_idx: 0,
+            shorts_comments_open: false,
             history_feedback_tokens: HashMap::new(),
             active_downloads: Vec::new(),
             channel_avatars: HashMap::new(),
@@ -931,11 +940,76 @@ impl YtApp {
         self.open_video_id(&item.id);
     }
 
+    pub(super) fn open_shorts_page(&mut self) {
+        if self.shorts_items.is_empty() {
+            let from_home: Vec<VideoItem> = self
+                .home_items
+                .iter()
+                .filter(|it| it.is_short())
+                .cloned()
+                .collect();
+            if !from_home.is_empty() {
+                self.shorts_items = from_home;
+            }
+        }
+        if !self.shorts_loading {
+            self.shorts_loading = true;
+            let _ = self.backend.tx.send(Request::LoadShorts);
+        }
+        if let Some(first) = self.shorts_items.first().cloned() {
+            let list = self.shorts_items.clone();
+            self.open_short(first, list);
+        } else {
+            self.page = Page::Shorts;
+        }
+    }
+
     pub(super) fn open_short(&mut self, item: VideoItem, list: Vec<VideoItem>) {
-        self.shorts_idx = list.iter().position(|x| x.id == item.id).unwrap_or(0);
-        self.shorts_queue = list;
+        let mut shorts_only: Vec<VideoItem> = list
+            .into_iter()
+            .filter(|x| x.duration_text == "Short" || x.id == item.id)
+            .collect();
+        if shorts_only.is_empty() {
+            shorts_only.push(item.clone());
+        }
+        self.shorts_idx = shorts_only
+            .iter()
+            .position(|x| x.id == item.id)
+            .unwrap_or(0);
+        self.shorts_queue = shorts_only;
+        let need_seq = self.shorts_queue.len() <= 2;
+        let seed = item.id.clone();
         self.open_video(item);
         self.shorts_mode = true;
+        if need_seq {
+            let _ = self
+                .backend
+                .tx
+                .send(Request::LoadShortsQueue { seed_video_id: seed });
+        }
+    }
+
+    pub(super) fn step_short(&mut self, delta: isize) {
+        if delta < 0 && self.shorts_idx > 0 {
+            let next_i = self.shorts_idx - 1;
+            if let Some(item) = self.shorts_queue.get(next_i).cloned() {
+                self.shorts_idx = next_i;
+                let list = self.shorts_queue.clone();
+                self.open_short(item, list);
+            }
+        } else if delta > 0 {
+            if !self.shorts_queue.is_empty() && self.shorts_idx + 1 < self.shorts_queue.len() {
+                let next_i = self.shorts_idx + 1;
+                if let Some(item) = self.shorts_queue.get(next_i).cloned() {
+                    self.shorts_idx = next_i;
+                    let list = self.shorts_queue.clone();
+                    self.open_short(item, list);
+                }
+            } else if let Some(next) = self.watch.as_ref().and_then(|w| w.related.first()).cloned()
+            {
+                self.open_short(next, Vec::new());
+            }
+        }
     }
 
     pub(super) fn open_local_file(&mut self, path: &std::path::Path) {
@@ -1366,6 +1440,17 @@ impl YtApp {
             GridAction::Open(it) => {
                 if let Some(bid) = it.playlist_browse_id.clone() {
                     self.open_playlist(bid, it.title);
+                } else if it.duration_text == "Short" || self.page == Page::Shorts {
+                    let list = match self.page {
+                        Page::Shorts => self.shorts_items.clone(),
+                        Page::Home => self.home_items.clone(),
+                        Page::Subscriptions => self.subs_items.clone(),
+                        Page::Trending => self.trending_items.clone(),
+                        Page::Channel => self.channel_items.clone(),
+                        Page::Search => self.search_items.clone(),
+                        _ => Vec::new(),
+                    };
+                    self.open_short(it, list);
                 } else {
                     self.open_video(it);
                 }
@@ -1449,6 +1534,7 @@ impl YtApp {
     fn current_nav_entry(&self) -> NavEntry {
         match self.page {
             Page::Home => NavEntry::Home,
+            Page::Shorts => NavEntry::Shorts,
             Page::Subscriptions => NavEntry::Subscriptions,
             Page::Trending => NavEntry::Trending,
             Page::Playlists => NavEntry::Playlists,
@@ -1489,6 +1575,9 @@ impl YtApp {
                         append: false,
                     });
                 }
+            }
+            NavEntry::Shorts => {
+                self.open_shorts_page();
             }
             NavEntry::Subscriptions => {
                 self.page = Page::Subscriptions;
@@ -1763,6 +1852,38 @@ impl YtApp {
                     self.ingest_and_request_avatars(&mut items);
                     self.trending_items = items;
                 }
+                Response::ShortsLoaded { mut items } => {
+                    self.shorts_loading = false;
+                    self.ingest_resume_metadata(&mut items);
+                    self.ingest_and_request_avatars(&mut items);
+                    self.shorts_items = items.clone();
+                    if self.page == Page::Shorts {
+                        if let Some(first) = items.first().cloned() {
+                            self.open_short(first, items);
+                        }
+                    } else if self.page == Page::Watch && self.shorts_mode {
+                        for it in items {
+                            if !self.shorts_queue.iter().any(|q| q.id == it.id) {
+                                self.shorts_queue.push(it);
+                            }
+                        }
+                    }
+                }
+                Response::ShortsQueueLoaded {
+                    seed_video_id,
+                    mut items,
+                } => {
+                    if self.watch.as_ref().is_some_and(|w| w.id == seed_video_id)
+                        || self.active_watch_id.as_deref() == Some(seed_video_id.as_str())
+                    {
+                        self.ingest_and_request_avatars(&mut items);
+                        for it in items {
+                            if !self.shorts_queue.iter().any(|x| x.id == it.id) {
+                                self.shorts_queue.push(it);
+                            }
+                        }
+                    }
+                }
                 Response::ChannelLoaded {
                     channel_id,
                     info,
@@ -1921,6 +2042,7 @@ impl YtApp {
                             mpv_start,
                         );
                         mpv.set_speed(self.speed);
+                        mpv.set_loop_file(self.shorts_mode);
                     }
                     self.active_stream_urls = (selected_video_url, selected_audio_url);
                     self.watch_started_at = Some(Instant::now());
@@ -2448,6 +2570,7 @@ impl YtApp {
                     self.playlist_loading = false;
                     self.remote_history_loading = false;
                     self.trending_loading = false;
+                    self.shorts_loading = false;
                     self.channel_loading = false;
                     self.search_loading = false;
                     self.watch_loading = false;
@@ -2523,6 +2646,7 @@ impl YtApp {
         }
         let mut hud_msg: Option<(HudIcon, &'static str)> = None;
         let mut wake_controls = false;
+        let mut step_short_delta: isize = 0;
         ctx.input(|i| {
             if i.key_pressed(Key::Escape) {
                 if self.notifications_open {
@@ -2536,6 +2660,12 @@ impl YtApp {
             }
             if self.page != Page::Watch {
                 return;
+            }
+            if self.shorts_mode && i.key_pressed(Key::ArrowUp) {
+                step_short_delta = -1;
+            }
+            if self.shorts_mode && i.key_pressed(Key::ArrowDown) {
+                step_short_delta = 1;
             }
             if self.shortcuts.stats_for_nerds.matches(i) {
                 self.show_stats_for_nerds = !self.show_stats_for_nerds;
@@ -2616,14 +2746,14 @@ impl YtApp {
                     }
                 }
             }
-            if self.shortcuts.volume_up.matches(i) {
+            if self.shortcuts.volume_up.matches(i) && !self.shorts_mode {
                 self.volume = (self.volume + 5.0).min(100.0);
                 if let Some(m) = &self.mpv {
                     m.set_volume(self.volume);
                 }
                 wake_controls = true;
             }
-            if self.shortcuts.volume_down.matches(i) {
+            if self.shortcuts.volume_down.matches(i) && !self.shorts_mode {
                 self.volume = (self.volume - 5.0).max(0.0);
                 if let Some(m) = &self.mpv {
                     m.set_volume(self.volume);
@@ -2631,6 +2761,9 @@ impl YtApp {
                 wake_controls = true;
             }
         });
+        if step_short_delta != 0 {
+            self.step_short(step_short_delta);
+        }
         if let Some((ico, msg)) = hud_msg {
             self.trigger_hud(ico, msg);
         }
@@ -3226,6 +3359,7 @@ impl eframe::App for YtApp {
 
                 match self.page {
                     Page::Home => self.draw_home_page(ui),
+                    Page::Shorts => self.draw_shorts_page(ui),
                     Page::Subscriptions => self.draw_subscriptions_page(ui),
                     Page::Trending => {
                         let items = self.trending_items.clone();

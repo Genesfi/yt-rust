@@ -61,6 +61,18 @@ impl YtApp {
                             }
                         }
 
+                        if sidebar_item_painted(
+                            ui,
+                            "Shorts",
+                            "Shorts",
+                            self.page == Page::Shorts,
+                            expand_t,
+                            1.0,
+                            |p, c, s, col| theme::draw_shorts_icon(p, c, s, col),
+                        ) {
+                            self.open_shorts_page();
+                        }
+
                         // When collapsed, keep a quick mini-icon for Subscriptions feed
                         if expand_t <= 0.12
                             && sidebar_item(
@@ -860,6 +872,20 @@ fn sidebar_item_alpha(
     expand_t: f32,
     alpha: f32,
 ) -> bool {
+    sidebar_item_painted(ui, label, short_label, active, expand_t, alpha, |p, c, s, col| {
+        theme::draw_icon_centered(p, c, ico, s, col);
+    })
+}
+
+fn sidebar_item_painted(
+    ui: &mut egui::Ui,
+    label: &str,
+    short_label: &str,
+    active: bool,
+    expand_t: f32,
+    alpha: f32,
+    paint_icon: impl FnOnce(&egui::Painter, egui::Pos2, f32, Color32),
+) -> bool {
     let w = ui.available_width();
     let h = 56.0 + (38.0 - 56.0) * expand_t;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
@@ -898,7 +924,7 @@ fn sidebar_item_alpha(
     let icon_y = mini_y + (exp_y - mini_y) * expand_t;
     let icon_size = 18.5 + (17.0 - 18.5) * expand_t;
 
-    theme::draw_icon_centered(ui.painter(), pos2(icon_x, icon_y), ico, icon_size, col);
+    paint_icon(ui.painter(), pos2(icon_x, icon_y), icon_size, col);
 
     // Mini label underneath icon when collapsed
     if has_short && expand_t < 0.35 {

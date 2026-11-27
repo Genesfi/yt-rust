@@ -132,11 +132,26 @@ impl YtApp {
     }
 
     fn draw_shorts_player(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let sh = (ui.available_height() - 28.0).clamp(360.0, 820.0);
-        let sw = (sh * 9.0 / 16.0).min((ui.available_width() - 180.0).max(240.0));
+        let drawer_w = 360.0_f32;
+        let has_wide_info = ui.available_width() >= if self.shorts_comments_open { 1040.0 } else { 760.0 };
+        let info_w = if has_wide_info {
+            (ui.available_width() * 0.22).clamp(200.0, 280.0)
+        } else {
+            0.0
+        };
+        let comments_reserve = if self.shorts_comments_open {
+            drawer_w + 16.0
+        } else {
+            0.0
+        };
+        let height_reserve = if has_wide_info { 60.0 } else { 142.0 };
+        let sh = (ui.available_height() - height_reserve).clamp(360.0, 820.0);
+        let sw = (sh * 9.0 / 16.0).min(
+            (ui.available_width() - 160.0 - info_w - comments_reserve).max(220.0),
+        );
         let mut step_delta: isize = 0;
 
-        ui.vertical_centered(|ui| {
+        ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 if ui
                     .add(
@@ -151,91 +166,353 @@ impl YtApp {
                     .clicked()
                 {
                     self.shorts_mode = false;
+                    if let Some(mpv) = &self.mpv {
+                        mpv.set_loop_file(false);
+                    }
                 }
-                ui.add_space(8.0);
-                if let Some(w) = &self.watch {
-                    ui.label(
-                        RichText::new(format!("{} · {}", w.title, w.channel))
-                            .font(theme::medium(13.0))
-                            .color(theme::TEXT_DIM),
-                    );
-                }
+                ui.add_space(10.0);
+                let (irec, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                theme::draw_shorts_icon(ui.painter(), irec.center(), 16.0, theme::YT_RED);
+                let pos_text = if self.shorts_queue.len() > 1 {
+                    format!("Shorts  ·  {} / {}", self.shorts_idx + 1, self.shorts_queue.len())
+                } else {
+                    "Shorts".to_owned()
+                };
+                ui.label(
+                    RichText::new(pos_text)
+                        .font(theme::medium(13.0))
+                        .color(theme::TEXT_DIM),
+                );
             });
             ui.add_space(8.0);
 
-            let total_row_w = sw + 116.0;
+            let rail_w = 60.0_f32;
+            let nav_w = 48.0_f32;
+            let total_row_w = (if has_wide_info { info_w + 16.0 } else { 0.0 })
+                + sw
+                + 12.0
+                + rail_w
+                + comments_reserve
+                + 16.0
+                + nav_w;
             let side_pad = ((ui.available_width() - total_row_w) * 0.5).max(0.0);
-            ui.horizontal(|ui| {
+
+            ui.horizontal_top(|ui| {
                 ui.add_space(side_pad);
+
+                if has_wide_info {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(info_w, sh),
+                        Layout::top_down(Align::LEFT),
+                        |ui| {
+                            if let Some(w) = self.watch.clone() {
+                                ui.add_space((sh - 134.0).max(8.0));
+                                if let Some(cid) = w.channel_id.clone() {
+                                    ui.horizontal(|ui| {
+                                        draw_avatar(
+                                            ui,
+                                            w.channel_avatar_url.as_deref(),
+                                            &w.channel,
+                                            32.0,
+                                        );
+                                        ui.add_space(6.0);
+                                        let ch_btn = ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&w.channel)
+                                                    .font(theme::semibold(13.5))
+                                                    .color(theme::TEXT),
+                                            )
+                                            .truncate()
+                                            .sense(Sense::click()),
+                                        );
+                                        if ch_btn.hovered() {
+                                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                        }
+                                        if ch_btn.clicked() {
+                                            self.open_channel(cid.clone(), w.channel.clone());
+                                        }
+                                    });
+                                    ui.add_space(6.0);
+                                    super::cards::draw_subscribe_bell_button(
+                                        ui,
+                                        cid,
+                                        w.is_subscribed,
+                                        &w.notifications,
+                                        &self.backend.tx,
+                                    );
+                                    ui.add_space(8.0);
+                                }
+                                let title_display = clamp_two_lines(
+                                    ui,
+                                    &w.title,
+                                    theme::semibold(14.5),
+                                    info_w,
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(title_display)
+                                            .font(theme::semibold(14.5))
+                                            .color(theme::TEXT),
+                                    )
+                                    .wrap(),
+                                )
+                                .on_hover_text(&w.title);
+                            }
+                        },
+                    );
+                    ui.add_space(16.0);
+                }
+
+                let player_rect_before = ui.cursor();
                 self.draw_video_surface(ui, ctx, Vec2::new(sw, sh), false);
-                ui.add_space(14.0);
-                ui.vertical(|ui| {
-                    ui.add_space((sh * 0.25).max(20.0));
-                    if self.shorts_idx > 0
-                        && icon_circle_button(ui, icon::CHEVRON_UP, 18.0, "Previous Short")
-                    {
+                let scroll_rect = Rect::from_min_size(player_rect_before.min, Vec2::new(sw, sh));
+                if ui.rect_contains_pointer(scroll_rect) {
+                    let wy = ctx.input(|i| i.smooth_scroll_delta.y);
+                    if wy > 28.0 {
                         step_delta = -1;
-                    }
-                    ui.add_space(8.0);
-                    let can_next = (!self.shorts_queue.is_empty()
-                        && self.shorts_idx + 1 < self.shorts_queue.len())
-                        || self
-                            .watch
-                            .as_ref()
-                            .is_some_and(|w| !w.related.is_empty());
-                    if can_next && icon_circle_button(ui, icon::CHEVRON_DOWN, 18.0, "Next Short") {
+                    } else if wy < -28.0 {
                         step_delta = 1;
                     }
+                }
+
+                ui.add_space(12.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(rail_w, sh),
+                    Layout::top_down(Align::Center),
+                    |ui| {
+                        if let Some(w) = self.watch.clone() {
+                            let rail_total_h = 5.0 * 62.0 + 4.0 * 8.0 + 6.0;
+                            ui.add_space((sh - rail_total_h).max(4.0));
+
+                            let like_lbl = if w.likes_text.is_empty() {
+                                "Like"
+                            } else {
+                                w.likes_text.as_str()
+                            };
+                            let liked = w.is_liked;
+                            if shorts_rail_button(
+                                ui,
+                                like_lbl,
+                                if liked { "Unlike" } else { "Like" },
+                                liked,
+                                |painter, c, col| {
+                                    theme::draw_thumbs_up(painter, c, 18.0, col, liked);
+                                },
+                            ) {
+                                let _ = self.backend.tx.send(Request::SetLike {
+                                    video_id: w.id.clone(),
+                                    like: !liked,
+                                });
+                            }
+                            ui.add_space(8.0);
+
+                            let dislike_lbl = w
+                                .dislikes_text
+                                .as_deref()
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or("Dislike");
+                            if shorts_rail_button(
+                                ui,
+                                dislike_lbl,
+                                if w.is_disliked { "Remove dislike" } else { "Dislike" },
+                                w.is_disliked,
+                                |painter, c, col| {
+                                    theme::draw_icon_centered(
+                                        painter,
+                                        c,
+                                        icon::THUMBS_DOWN,
+                                        18.0,
+                                        col,
+                                    );
+                                },
+                            ) {
+                                let _ = self.backend.tx.send(Request::SetDislike {
+                                    video_id: w.id.clone(),
+                                    dislike: !w.is_disliked,
+                                });
+                            }
+                            ui.add_space(8.0);
+
+                            let c_label = if self.comments.is_empty() {
+                                "Comments".to_owned()
+                            } else {
+                                self.comments.len().to_string()
+                            };
+                            if shorts_rail_button(
+                                ui,
+                                &c_label,
+                                "Comments & Replies",
+                                self.shorts_comments_open,
+                                |painter, c, col| {
+                                    theme::draw_comment_icon(painter, c, 18.0, col);
+                                },
+                            ) {
+                                self.shorts_comments_open = !self.shorts_comments_open;
+                                if self.shorts_comments_open
+                                    && self.comments.is_empty()
+                                    && !self.comments_loading
+                                {
+                                    if let Some(tok) = w.comments_token.clone() {
+                                        self.comments_loading = true;
+                                        let _ = self.backend.tx.send(Request::LoadComments {
+                                            video_id: w.id.clone(),
+                                            continuation: tok,
+                                            append: false,
+                                        });
+                                    }
+                                }
+                            }
+                            ui.add_space(8.0);
+
+                            if shorts_rail_button(
+                                ui,
+                                "Share",
+                                "Copy Short URL",
+                                false,
+                                |painter, c, col| {
+                                    theme::draw_share_icon(painter, c, 18.0, col);
+                                },
+                            ) {
+                                ctx.copy_text(format!("https://www.youtube.com/shorts/{}", w.id));
+                                self.toast("Copied Shorts URL");
+                            }
+                            ui.add_space(8.0);
+
+                            if shorts_rail_button(
+                                ui,
+                                "Save",
+                                "Download MP4",
+                                false,
+                                |painter, c, col| {
+                                    theme::draw_icon_centered(
+                                        painter,
+                                        c,
+                                        icon::DOWNLOAD,
+                                        18.0,
+                                        col,
+                                    );
+                                },
+                            ) {
+                                self.start_download(w.id.clone(), w.title.clone(), false);
+                            }
+                        }
+                    },
+                );
+
+                if self.shorts_comments_open {
                     if let Some(w) = self.watch.clone() {
-                        ui.add_space(16.0);
-                        if icon_circle_button(
-                            ui,
-                            icon::HEART,
-                            18.0,
-                            if w.is_liked { "Unlike" } else { "Like" },
-                        ) {
-                            let _ = self.backend.tx.send(Request::SetLike {
-                                video_id: w.id.clone(),
-                                like: !w.is_liked,
+                        ui.add_space(14.0);
+                        Frame::new()
+                            .fill(theme::SURFACE)
+                            .stroke(Stroke::new(1.0, theme::BORDER))
+                            .corner_radius(12)
+                            .inner_margin(Margin::same(12))
+                            .show(ui, |ui| {
+                                ui.set_width((drawer_w - 24.0).max(120.0));
+                                ui.set_height((sh - 24.0).max(180.0));
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("Comments")
+                                            .font(theme::semibold(15.0))
+                                            .color(theme::TEXT),
+                                    );
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if icon_circle_button(ui, icon::X, 15.0, "Close comments") {
+                                            self.shorts_comments_open = false;
+                                        }
+                                    });
+                                });
+                                ui.add_space(6.0);
+                                ScrollArea::vertical()
+                                    .id_salt("shorts_comments_drawer")
+                                    .show(ui, |ui| {
+                                        self.draw_comments(ui, &w);
+                                    });
                             });
-                        }
-                        if icon_circle_button(ui, icon::THUMBS_DOWN, 18.0, "Dislike") {
-                            let _ = self.backend.tx.send(Request::SetDislike {
-                                video_id: w.id.clone(),
-                                dislike: !w.is_disliked,
-                            });
-                        }
-                        if icon_circle_button(ui, icon::DOWNLOAD, 18.0, "Download MP4") {
-                            self.start_download(w.id.clone(), w.title.clone(), false);
-                        }
-                        if icon_circle_button(ui, icon::COPY, 17.0, "Copy Short URL") {
-                            ctx.copy_text(format!("https://www.youtube.com/shorts/{}", w.id));
-                            self.toast("Copied Shorts URL");
-                        }
                     }
-                });
+                }
+
+                ui.add_space(14.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(nav_w, sh),
+                    Layout::top_down(Align::Center),
+                    |ui| {
+                        let can_prev = self.shorts_idx > 0;
+                        let can_next = (!self.shorts_queue.is_empty()
+                            && self.shorts_idx + 1 < self.shorts_queue.len())
+                            || self
+                                .watch
+                                .as_ref()
+                                .is_some_and(|w| !w.related.is_empty());
+                        let btn_group_h = if can_prev && can_next { 100.0 } else { 44.0 };
+                        ui.add_space(((sh - btn_group_h) * 0.5).max(8.0));
+                        if can_prev
+                            && shorts_nav_circle(ui, icon::CHEVRON_UP, "Previous Short (Up)")
+                        {
+                            step_delta = -1;
+                        }
+                        if can_prev && can_next {
+                            ui.add_space(12.0);
+                        }
+                        if can_next
+                            && shorts_nav_circle(ui, icon::CHEVRON_DOWN, "Next Short (Down)")
+                        {
+                            step_delta = 1;
+                        }
+                    },
+                );
             });
+
+            if !has_wide_info {
+                if let Some(w) = self.watch.clone() {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(side_pad);
+                        if let Some(cid) = w.channel_id.clone() {
+                            draw_avatar(ui, w.channel_avatar_url.as_deref(), &w.channel, 28.0);
+                            ui.add_space(4.0);
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(&w.channel)
+                                            .font(theme::semibold(13.0))
+                                            .color(theme::TEXT),
+                                    )
+                                    .fill(Color32::TRANSPARENT),
+                                )
+                                .clicked()
+                            {
+                                self.open_channel(cid.clone(), w.channel.clone());
+                            }
+                            super::cards::draw_subscribe_bell_button(
+                                ui,
+                                cid,
+                                w.is_subscribed,
+                                &w.notifications,
+                                &self.backend.tx,
+                            );
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(side_pad);
+                        ui.set_max_width((sw + rail_w + 16.0).max(240.0));
+                        ui.label(
+                            RichText::new(clamp_two_lines(
+                                ui,
+                                &w.title,
+                                theme::semibold(13.5),
+                                sw + rail_w,
+                            ))
+                            .font(theme::semibold(13.5))
+                            .color(theme::TEXT),
+                        );
+                    });
+                }
+            }
         });
 
-        if step_delta < 0 && self.shorts_idx > 0 {
-            let next_i = self.shorts_idx - 1;
-            if let Some(item) = self.shorts_queue.get(next_i).cloned() {
-                self.shorts_idx = next_i;
-                let list = self.shorts_queue.clone();
-                self.open_short(item, list);
-            }
-        } else if step_delta > 0 {
-            if !self.shorts_queue.is_empty() && self.shorts_idx + 1 < self.shorts_queue.len() {
-                let next_i = self.shorts_idx + 1;
-                if let Some(item) = self.shorts_queue.get(next_i).cloned() {
-                    self.shorts_idx = next_i;
-                    let list = self.shorts_queue.clone();
-                    self.open_short(item, list);
-                }
-            } else if let Some(next) = self.watch.as_ref().and_then(|w| w.related.first()).cloned()
-            {
-                self.open_short(next, Vec::new());
-            }
+        if step_delta != 0 {
+            self.step_short(step_delta);
         }
     }
 
@@ -696,8 +973,12 @@ impl YtApp {
         cui.add_space(4.0);
         let row_w = cui.available_width();
         let (row_rect, _) = cui.allocate_exact_size(Vec2::new(row_w, 38.0), Sense::hover());
-        let right_w = 240.0_f32.min(row_w * 0.45);
-        let left_w = (row_w - right_w - 6.0).max(160.0);
+        let right_w = if self.shorts_mode && !self.fullscreen {
+            82.0_f32.min(row_w * 0.35)
+        } else {
+            240.0_f32.min(row_w * 0.45)
+        };
+        let left_w = (row_w - right_w - 6.0).max(80.0);
 
         let left_rect = Rect::from_min_max(row_rect.min, pos2(row_rect.left() + left_w, row_rect.max.y));
         let right_rect =
@@ -736,38 +1017,40 @@ impl YtApp {
                 }
             }
 
-            let next_item = self
-                .queue
-                .first()
-                .cloned()
-                .or_else(|| self.watch.as_ref().and_then(|w| w.related.first().cloned()));
-            if let Some(next_vid) = next_item {
-                let (nrect, nresp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
-                let nhov = ui
-                    .ctx()
-                    .animate_bool_with_time(nresp.id, nresp.hovered(), 0.12);
-                if nhov > 0.01 {
-                    ui.painter().circle_filled(
-                        nrect.center(),
-                        16.0,
-                        Color32::from_white_alpha((28.0 * nhov * alpha) as u8),
-                    );
-                }
-                if nresp.hovered() {
-                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                }
-                theme::draw_next_icon(ui.painter(), nrect.center(), 17.0, white);
-                if nresp
-                    .on_hover_text(format!("Next: {}", next_vid.title))
-                    .clicked()
-                {
-                    any_interacted = true;
-                    if !self.queue.is_empty() {
-                        let v = self.queue.remove(0);
-                        self.persist_queue();
-                        self.open_video(v);
-                    } else {
-                        self.open_video(next_vid);
+            if !self.shorts_mode {
+                let next_item = self
+                    .queue
+                    .first()
+                    .cloned()
+                    .or_else(|| self.watch.as_ref().and_then(|w| w.related.first().cloned()));
+                if let Some(next_vid) = next_item {
+                    let (nrect, nresp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
+                    let nhov = ui
+                        .ctx()
+                        .animate_bool_with_time(nresp.id, nresp.hovered(), 0.12);
+                    if nhov > 0.01 {
+                        ui.painter().circle_filled(
+                            nrect.center(),
+                            16.0,
+                            Color32::from_white_alpha((28.0 * nhov * alpha) as u8),
+                        );
+                    }
+                    if nresp.hovered() {
+                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    }
+                    theme::draw_next_icon(ui.painter(), nrect.center(), 17.0, white);
+                    if nresp
+                        .on_hover_text(format!("Next: {}", next_vid.title))
+                        .clicked()
+                    {
+                        any_interacted = true;
+                        if !self.queue.is_empty() {
+                            let v = self.queue.remove(0);
+                            self.persist_queue();
+                            self.open_video(v);
+                        } else {
+                            self.open_video(next_vid);
+                        }
                     }
                 }
             }
@@ -959,8 +1242,8 @@ impl YtApp {
                 self.toggle_fullscreen(ctx);
             }
 
-            // Theater mode (hidden in fullscreen)
-            if !self.fullscreen {
+            // Theater mode (hidden in fullscreen and Shorts mode)
+            if !self.fullscreen && !self.shorts_mode {
                 let (th_rect, th_resp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
                 paint_hover_circle(ui, th_rect, &th_resp, alpha);
                 theme::draw_theater_icon(
@@ -1024,11 +1307,12 @@ impl YtApp {
                 };
             }
 
-            // Captions (CC) button
-            let has_cc = self
-                .watch
-                .as_ref()
-                .is_some_and(|w| !w.captions.is_empty());
+            // Captions (CC) button (hidden in compact Shorts bar unless active)
+            let has_cc = !self.shorts_mode
+                && self
+                    .watch
+                    .as_ref()
+                    .is_some_and(|w| !w.captions.is_empty());
             if has_cc {
                 let (cc_rect, cc_resp) = ui.allocate_exact_size(Vec2::splat(34.0), Sense::click());
                 paint_hover_circle(ui, cc_rect, &cc_resp, alpha);
@@ -1066,54 +1350,56 @@ impl YtApp {
                 }
             }
 
-            // YouTube-style Autoplay pill switch
-            let (ap_rect, ap_resp) =
-                ui.allocate_exact_size(Vec2::new(34.0, 24.0), Sense::click());
-            let ap_t = ui.ctx().animate_bool_with_time(
-                egui::Id::unique("player_autoplay_switch"),
-                self.autoplay_next,
-                0.15,
-            );
-            if ap_resp.hovered() {
-                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-            }
-            let pill = Rect::from_center_size(ap_rect.center(), vec2(26.0, 12.0));
-            ui.painter().rect_filled(
-                pill,
-                6.0,
-                Color32::from_white_alpha(((60.0 + 70.0 * ap_t) * alpha).round() as u8),
-            );
-            let knob_x = pill.left() + 6.0 + 14.0 * ap_t;
-            let knob_c = pos2(knob_x, pill.center().y);
-            ui.painter().circle_filled(knob_c, 7.0, white);
-            let glyph_col = Color32::from_black_alpha((220.0 * alpha).round() as u8);
-            if self.autoplay_next {
-                let tri = vec![
-                    pos2(knob_c.x - 2.0, knob_c.y - 3.0),
-                    pos2(knob_c.x + 3.0, knob_c.y),
-                    pos2(knob_c.x - 2.0, knob_c.y + 3.0),
-                ];
-                ui.painter()
-                    .add(egui::Shape::convex_polygon(tri, glyph_col, Stroke::NONE));
-            } else {
-                for dx in [-1.8f32, 1.2] {
-                    ui.painter().rect_filled(
-                        Rect::from_min_size(pos2(knob_c.x + dx, knob_c.y - 2.8), vec2(1.4, 5.6)),
-                        0.4,
-                        glyph_col,
-                    );
+            if !self.shorts_mode {
+                // YouTube-style Autoplay pill switch
+                let (ap_rect, ap_resp) =
+                    ui.allocate_exact_size(Vec2::new(34.0, 24.0), Sense::click());
+                let ap_t = ui.ctx().animate_bool_with_time(
+                    egui::Id::unique("player_autoplay_switch"),
+                    self.autoplay_next,
+                    0.15,
+                );
+                if ap_resp.hovered() {
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                 }
-            }
-            if ap_resp
-                .on_hover_text(if self.autoplay_next {
-                    "Autoplay is on"
+                let pill = Rect::from_center_size(ap_rect.center(), vec2(26.0, 12.0));
+                ui.painter().rect_filled(
+                    pill,
+                    6.0,
+                    Color32::from_white_alpha(((60.0 + 70.0 * ap_t) * alpha).round() as u8),
+                );
+                let knob_x = pill.left() + 6.0 + 14.0 * ap_t;
+                let knob_c = pos2(knob_x, pill.center().y);
+                ui.painter().circle_filled(knob_c, 7.0, white);
+                let glyph_col = Color32::from_black_alpha((220.0 * alpha).round() as u8);
+                if self.autoplay_next {
+                    let tri = vec![
+                        pos2(knob_c.x - 2.0, knob_c.y - 3.0),
+                        pos2(knob_c.x + 3.0, knob_c.y),
+                        pos2(knob_c.x - 2.0, knob_c.y + 3.0),
+                    ];
+                    ui.painter()
+                        .add(egui::Shape::convex_polygon(tri, glyph_col, Stroke::NONE));
                 } else {
-                    "Autoplay is off"
-                })
-                .clicked()
-            {
-                any_interacted = true;
-                self.autoplay_next = !self.autoplay_next;
+                    for dx in [-1.8f32, 1.2] {
+                        ui.painter().rect_filled(
+                            Rect::from_min_size(pos2(knob_c.x + dx, knob_c.y - 2.8), vec2(1.4, 5.6)),
+                            0.4,
+                            glyph_col,
+                        );
+                    }
+                }
+                if ap_resp
+                    .on_hover_text(if self.autoplay_next {
+                        "Autoplay is on"
+                    } else {
+                        "Autoplay is off"
+                    })
+                    .clicked()
+                {
+                    any_interacted = true;
+                    self.autoplay_next = !self.autoplay_next;
+                }
             }
         }
 
@@ -1761,6 +2047,10 @@ impl YtApp {
 
         // Comments section
         ui.add_space(14.0);
+        self.draw_comments(ui, &w);
+    }
+
+    fn draw_comments(&mut self, ui: &mut egui::Ui, w: &crate::model::WatchData) {
         let mut load_sort: Option<(usize, String)> = None;
         let mut expand_replies: Option<(String, String)> = None;
         ui.horizontal(|ui| {
@@ -1876,11 +2166,64 @@ impl YtApp {
                 );
             }
         } else {
-            let mut open_reply_for: Option<(String, String)> = None;
+            let mut open_reply_for: Option<(String, String, Option<String>)> = None;
             let mut submit_reply: Option<(String, String, String, Option<String>)> = None;
             let mut cancel_reply = false;
             let mut toggle_like_comment: Option<(String, String, bool)> = None;
             let active_reply_id = self.comment_reply_target_id.clone();
+
+            let draw_reply_box = |ui: &mut egui::Ui,
+                                  draft: &mut String,
+                                  target_author: &str,
+                                  parent_cid: &str,
+                                  rp: String,
+                                  replies_tok: Option<String>,
+                                  submit_reply: &mut Option<(String, String, String, Option<String>)>,
+                                  cancel_reply: &mut bool| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let rw = (ui.available_width() - 140.0).max(130.0);
+                    let te = ui.add_sized(
+                        Vec2::new(rw, 28.0),
+                        egui::TextEdit::singleline(draft)
+                            .hint_text(format!("Replying to {target_author}...")),
+                    );
+                    let send_clicked = ui
+                        .add_sized(
+                            Vec2::new(60.0, 28.0),
+                            egui::Button::new(
+                                RichText::new("Reply")
+                                    .font(theme::semibold(12.0))
+                                    .color(Color32::from_rgb(15, 15, 15)),
+                            )
+                            .fill(theme::YT_BLUE)
+                            .corner_radius(14),
+                        )
+                        .clicked()
+                        || (te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                    if send_clicked {
+                        let rtxt = draft.trim().to_owned();
+                        if !rtxt.is_empty() {
+                            *submit_reply = Some((parent_cid.to_owned(), rtxt, rp, replies_tok));
+                        }
+                    }
+                    if ui
+                        .add_sized(
+                            Vec2::new(60.0, 28.0),
+                            egui::Button::new(
+                                RichText::new("Cancel")
+                                    .font(theme::medium(12.0))
+                                    .color(theme::TEXT_DIM),
+                            )
+                            .fill(theme::CHIP)
+                            .corner_radius(14),
+                        )
+                        .clicked()
+                    {
+                        *cancel_reply = true;
+                    }
+                });
+            };
 
             for c in &self.comments {
                 ui.horizontal_top(|ui| {
@@ -1985,64 +2328,22 @@ impl YtApp {
                                     )
                                     .clicked()
                                 {
-                                    open_reply_for = Some((c.id.clone(), c.author.clone()));
+                                    open_reply_for = Some((c.id.clone(), c.author.clone(), None));
                                 }
                             }
                         });
                         if active_reply_id.as_deref() == Some(c.id.as_str()) {
                             if let Some(rp) = c.reply_params.clone() {
-                                ui.add_space(4.0);
-                                ui.horizontal(|ui| {
-                                    let rw = (ui.available_width() - 140.0).max(130.0);
-                                    let te = ui.add_sized(
-                                        Vec2::new(rw, 28.0),
-                                        egui::TextEdit::singleline(&mut self.comment_reply_draft)
-                                            .hint_text(format!(
-                                                "Replying to {}...",
-                                                self.comment_reply_target_author
-                                            )),
-                                    );
-                                    let send_clicked = ui
-                                        .add_sized(
-                                            Vec2::new(60.0, 28.0),
-                                            egui::Button::new(
-                                                RichText::new("Reply")
-                                                    .font(theme::semibold(12.0))
-                                                    .color(Color32::from_rgb(15, 15, 15)),
-                                            )
-                                            .fill(theme::YT_BLUE)
-                                            .corner_radius(14),
-                                        )
-                                        .clicked()
-                                        || (te.lost_focus()
-                                            && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                                    if send_clicked {
-                                        let rtxt = self.comment_reply_draft.trim().to_owned();
-                                        if !rtxt.is_empty() {
-                                            submit_reply = Some((
-                                                c.id.clone(),
-                                                rtxt,
-                                                rp,
-                                                c.replies_token.clone(),
-                                            ));
-                                        }
-                                    }
-                                    if ui
-                                        .add_sized(
-                                            Vec2::new(60.0, 28.0),
-                                            egui::Button::new(
-                                                RichText::new("Cancel")
-                                                    .font(theme::medium(12.0))
-                                                    .color(theme::TEXT_DIM),
-                                            )
-                                            .fill(theme::CHIP)
-                                            .corner_radius(14),
-                                        )
-                                        .clicked()
-                                    {
-                                        cancel_reply = true;
-                                    }
-                                });
+                                draw_reply_box(
+                                    ui,
+                                    &mut self.comment_reply_draft,
+                                    &self.comment_reply_target_author,
+                                    &c.id,
+                                    rp,
+                                    c.replies_token.clone(),
+                                    &mut submit_reply,
+                                    &mut cancel_reply,
+                                );
                             }
                         }
                         if !c.replies.is_empty() {
@@ -2131,7 +2432,48 @@ impl YtApp {
                                                 );
                                                 hresp.on_hover_text("Hearted by creator");
                                             }
+                                            let r_params = r
+                                                .reply_params
+                                                .as_ref()
+                                                .or(c.reply_params.as_ref());
+                                            if self.signed_in && r_params.is_some() {
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new("Reply")
+                                                                .font(theme::semibold(11.0))
+                                                                .color(theme::TEXT_DIM),
+                                                        )
+                                                        .fill(Color32::TRANSPARENT),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    open_reply_for = Some((
+                                                        r.id.clone(),
+                                                        r.author.clone(),
+                                                        Some(format!("@{} ", r.author)),
+                                                    ));
+                                                }
+                                            }
                                         });
+                                        if active_reply_id.as_deref() == Some(r.id.as_str()) {
+                                            if let Some(rp) = r
+                                                .reply_params
+                                                .clone()
+                                                .or_else(|| c.reply_params.clone())
+                                            {
+                                                draw_reply_box(
+                                                    ui,
+                                                    &mut self.comment_reply_draft,
+                                                    &self.comment_reply_target_author,
+                                                    &c.id,
+                                                    rp,
+                                                    c.replies_token.clone(),
+                                                    &mut submit_reply,
+                                                    &mut cancel_reply,
+                                                );
+                                            }
+                                        }
                                     });
                                 });
                                 ui.add_space(4.0);
@@ -2183,10 +2525,10 @@ impl YtApp {
                     liked: next_liked,
                 });
             }
-            if let Some((cid, author)) = open_reply_for {
+            if let Some((cid, author, prefill)) = open_reply_for {
                 self.comment_reply_target_id = Some(cid);
                 self.comment_reply_target_author = author;
-                self.comment_reply_draft.clear();
+                self.comment_reply_draft = prefill.unwrap_or_default();
             } else if cancel_reply {
                 self.comment_reply_target_id = None;
                 self.comment_reply_target_author.clear();
@@ -3993,4 +4335,51 @@ fn draw_live_chat_message_runs(ui: &mut egui::Ui, m: &crate::model::LiveChatMess
             }
         }
     });
+}
+
+fn shorts_rail_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    tooltip: &str,
+    active: bool,
+    paint_icon: impl FnOnce(&egui::Painter, egui::Pos2, Color32),
+) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(60.0, 62.0), Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    let circle_center = pos2(rect.center().x, rect.top() + 21.0);
+    let fill = if active {
+        theme::YT_BLUE.gamma_multiply(0.24)
+    } else if resp.hovered() {
+        theme::CHIP_HOVER
+    } else {
+        theme::CHIP
+    };
+    ui.painter().circle_filled(circle_center, 21.0, fill);
+    let col = if active { theme::YT_BLUE } else { theme::TEXT };
+    paint_icon(ui.painter(), circle_center, col);
+    ui.painter().text(
+        pos2(rect.center().x, rect.top() + 52.0),
+        Align2::CENTER_CENTER,
+        label,
+        theme::medium(11.0),
+        if active { theme::YT_BLUE } else { theme::TEXT_DIM },
+    );
+    resp.on_hover_text(tooltip).clicked()
+}
+
+fn shorts_nav_circle(ui: &mut egui::Ui, ico: char, tooltip: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    let fill = if resp.hovered() {
+        theme::CHIP_HOVER
+    } else {
+        theme::CHIP
+    };
+    ui.painter().circle_filled(rect.center(), 22.0, fill);
+    theme::draw_icon_centered(ui.painter(), rect.center(), ico, 19.0, theme::TEXT);
+    resp.on_hover_text(tooltip).clicked()
 }

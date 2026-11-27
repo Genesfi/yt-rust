@@ -414,10 +414,8 @@ impl YtApp {
                                 if self.notifications_open {
                                     let stale = self
                                         .notifications_loaded_at
-                                        .is_none_or(|t| t.elapsed() > Duration::from_secs(60));
-                                    if (self.notifications.is_empty() || stale)
-                                        && !self.notifications_loading
-                                    {
+                                        .is_none_or(|t| t.elapsed() > Duration::from_secs(5));
+                                    if !self.notifications_loading && (self.notifications.is_empty() || stale) {
                                         self.notifications_loading = true;
                                         let _ = self.backend.tx.send(Request::LoadNotifications);
                                     } else if self.unread_notifications > 0 {
@@ -509,7 +507,7 @@ impl YtApp {
         just_toggled: bool,
     ) {
         let screen = ctx.content_rect();
-        let popup_w = 390.0_f32.min((screen.width() - 24.0).max(260.0));
+        let popup_w = 420.0_f32.min((screen.width() - 24.0).max(280.0));
         let anchor = pos2(
             (bell_rect.right()).clamp(screen.left() + popup_w + 12.0, screen.right() - 12.0),
             bell_rect.bottom() + 8.0,
@@ -543,6 +541,10 @@ impl YtApp {
                                     .font(theme::semibold(15.0))
                                     .color(theme::TEXT),
                             );
+                            if self.notifications_loading && !self.notifications.is_empty() {
+                                ui.add_space(6.0);
+                                ui.add(egui::Spinner::new().size(13.0));
+                            }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 ui.add_space(10.0);
                                 if icon_circle_button(ui, icon::X, 14.0, "Close") {
@@ -553,7 +555,7 @@ impl YtApp {
                                         !self.notifications_loading,
                                         egui::Button::new(
                                             RichText::new(if self.notifications_loading {
-                                                "Loading..."
+                                                "Syncing..."
                                             } else {
                                                 "Refresh"
                                             })
@@ -611,92 +613,129 @@ impl YtApp {
                             });
                             ui.add_space(28.0);
                         } else {
-                            let max_h = (screen.height() - 120.0).clamp(220.0, 460.0);
+                            let max_h = (screen.height() - 120.0).clamp(240.0, 520.0);
                             egui::ScrollArea::vertical()
                                 .id_salt("notifications_menu_scroll")
                                 .max_height(max_h)
                                 .auto_shrink([false, true])
                                 .show(ui, |ui| {
+                                    let mut last_section: Option<&str> = None;
                                     for (idx, item) in self.notifications.iter().enumerate() {
-                                        let row_w = popup_w - 8.0;
-                                        let (row_rect, row_resp) = ui.allocate_exact_size(
-                                            Vec2::new(row_w, 66.0),
-                                            Sense::click(),
-                                        );
-                                        if row_resp.hovered() {
-                                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                            ui.painter().rect_filled(
-                                                row_rect,
-                                                8.0,
-                                                theme::CHIP,
-                                            );
-                                        }
-                                        let mut r_ui = ui.new_child(
-                                            egui::UiBuilder::new()
-                                                .max_rect(row_rect.shrink2(Vec2::new(10.0, 8.0))),
-                                        );
-                                        r_ui.horizontal(|ui| {
-                                            let dot_x = ui.cursor().left() + 4.0;
-                                            let dot_y = row_rect.center().y;
-                                            if !item.read {
-                                                ui.painter().circle_filled(
-                                                    pos2(dot_x, dot_y),
-                                                    3.0,
-                                                    theme::YT_BLUE,
-                                                );
-                                            }
-                                            ui.add_space(10.0);
-                                            draw_avatar(
-                                                ui,
-                                                item.channel_avatar_url.as_deref(),
-                                                "N",
-                                                36.0,
-                                            );
-                                            ui.add_space(6.0);
-                                            let thumb_reserve =
-                                                if item.video_thumbnail_url.is_some() {
-                                                    86.0
-                                                } else {
-                                                    4.0
-                                                };
-                                            let text_w =
-                                                (ui.available_width() - thumb_reserve).max(110.0);
-                                            ui.vertical(|ui| {
-                                                ui.set_width(text_w);
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        RichText::new(&item.message)
-                                                            .font(theme::regular(13.0))
-                                                            .color(theme::TEXT),
-                                                    )
-                                                    .wrap(),
-                                                );
-                                                if !item.sent_time_text.is_empty() {
+                                        if let Some(sec) = item.section.as_deref() {
+                                            if last_section != Some(sec) {
+                                                if last_section.is_some() {
+                                                    ui.add_space(4.0);
+                                                    let y = ui.cursor().top();
+                                                    ui.painter().line_segment(
+                                                        [
+                                                            pos2(ui.min_rect().left() + 8.0, y),
+                                                            pos2(ui.min_rect().left() + popup_w - 8.0, y),
+                                                        ],
+                                                        Stroke::new(1.0, theme::BORDER),
+                                                    );
+                                                    ui.add_space(6.0);
+                                                }
+                                                ui.horizontal(|ui| {
+                                                    ui.add_space(16.0);
                                                     ui.label(
-                                                        RichText::new(&item.sent_time_text)
-                                                            .font(theme::regular(11.5))
+                                                        RichText::new(sec)
+                                                            .font(theme::semibold(12.5))
                                                             .color(theme::TEXT_DIM),
                                                     );
-                                                }
-                                            });
-                                            if let Some(thumb) =
-                                                item.video_thumbnail_url.as_deref()
-                                            {
-                                                ui.with_layout(
-                                                    Layout::right_to_left(Align::Center),
-                                                    |ui| {
-                                                        draw_thumbnail(
-                                                            ui,
-                                                            thumb,
-                                                            "",
-                                                            Vec2::new(76.0, 44.0),
-                                                            6.0,
-                                                            None,
-                                                        );
-                                                    },
-                                                );
+                                                });
+                                                ui.add_space(2.0);
+                                                last_section = Some(sec);
                                             }
-                                        });
+                                        }
+
+                                        let row_id = ui.make_persistent_id(("notif_row", idx));
+                                        let hovered_prev = ui
+                                            .ctx()
+                                            .read_response(row_id)
+                                            .is_some_and(|r| r.hovered());
+                                        let row_fill = if hovered_prev {
+                                            theme::CHIP
+                                        } else {
+                                            Color32::TRANSPARENT
+                                        };
+
+                                        let frame_resp = Frame::new()
+                                            .fill(row_fill)
+                                            .corner_radius(8)
+                                            .inner_margin(Margin::symmetric(10, 8))
+                                            .outer_margin(Margin::symmetric(4, 1))
+                                            .show(ui, |ui| {
+                                                ui.set_width((popup_w - 28.0).max(200.0));
+                                                ui.horizontal_top(|ui| {
+                                                    let dot_x = ui.cursor().left() + 3.0;
+                                                    let dot_y = ui.cursor().top() + 18.0;
+                                                    if !item.read {
+                                                        ui.painter().circle_filled(
+                                                            pos2(dot_x, dot_y),
+                                                            3.0,
+                                                            theme::YT_BLUE,
+                                                        );
+                                                    }
+                                                    ui.add_space(9.0);
+                                                    draw_avatar(
+                                                        ui,
+                                                        item.channel_avatar_url.as_deref(),
+                                                        "N",
+                                                        36.0,
+                                                    );
+                                                    ui.add_space(8.0);
+                                                    let thumb_reserve =
+                                                        if item.video_thumbnail_url.is_some() {
+                                                            86.0
+                                                        } else {
+                                                            4.0
+                                                        };
+                                                    let text_w =
+                                                        (ui.available_width() - thumb_reserve)
+                                                            .max(120.0);
+                                                    ui.vertical(|ui| {
+                                                        ui.set_width(text_w);
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                RichText::new(&item.message)
+                                                                    .font(theme::regular(13.0))
+                                                                    .color(theme::TEXT),
+                                                            )
+                                                            .wrap(),
+                                                        );
+                                                        if !item.sent_time_text.is_empty() {
+                                                            ui.add_space(3.0);
+                                                            ui.label(
+                                                                RichText::new(&item.sent_time_text)
+                                                                    .font(theme::regular(11.5))
+                                                                    .color(theme::TEXT_DIM),
+                                                            );
+                                                        }
+                                                    });
+                                                    if let Some(thumb) =
+                                                        item.video_thumbnail_url.as_deref()
+                                                    {
+                                                        ui.with_layout(
+                                                            Layout::right_to_left(Align::TOP),
+                                                            |ui| {
+                                                                draw_thumbnail(
+                                                                    ui,
+                                                                    thumb,
+                                                                    "",
+                                                                    Vec2::new(78.0, 44.0),
+                                                                    6.0,
+                                                                    None,
+                                                                );
+                                                            },
+                                                        );
+                                                    }
+                                                });
+                                            });
+                                        let row_resp =
+                                            ui.interact(frame_resp.response.rect, row_id, Sense::click());
+                                        if row_resp.hovered() {
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                        }
                                         if row_resp.clicked() {
                                             clicked_idx = Some(idx);
                                             if let Some(vid) = &item.video_id {

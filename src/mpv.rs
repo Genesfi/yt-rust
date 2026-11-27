@@ -542,6 +542,10 @@ impl MpvPlayer {
         );
     }
 
+    pub fn set_loop_file(&self, looped: bool) {
+        self.set_property_str("loop-file", if looped { "inf" } else { "no" });
+    }
+
     pub fn set_hwdec(&self, mode: crate::model::HwdecMode) {
         self.set_property_str("hwdec", mode.mpv_value());
     }

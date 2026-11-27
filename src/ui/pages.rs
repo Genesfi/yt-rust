@@ -340,7 +340,7 @@ impl YtApp {
             "Recommended & Trending"
         };
         let ctx = ui.ctx().clone();
-        if let Some(act) = draw_video_grid(ui, title, &items, loading, cont.is_some()) {
+        if let Some(act) = super::cards::draw_home_mixed_grid(ui, title, &items, loading, cont.is_some()) {
             self.handle_grid_action(&ctx, act, |app| {
                 app.home_loading = true;
                 let _ = app.backend.tx.send(Request::LoadHome {
@@ -349,6 +349,75 @@ impl YtApp {
                     append: true,
                 });
             });
+        }
+    }
+
+    pub(super) fn draw_shorts_page(&mut self, ui: &mut egui::Ui) {
+        if self.shorts_loading && self.shorts_items.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new("Opening Shorts Reel...")
+                            .font(theme::medium(14.0))
+                            .color(theme::TEXT_DIM),
+                    );
+                });
+            });
+            return;
+        }
+        ui.horizontal(|ui| {
+            let (irec, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
+            theme::draw_shorts_icon(ui.painter(), irec.center(), 18.0, theme::YT_RED);
+            ui.add_space(4.0);
+            ui.label(RichText::new("Shorts").font(theme::bold(20.0)));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        !self.shorts_loading,
+                        egui::Button::new(
+                            RichText::new(if self.shorts_loading {
+                                "Refreshing..."
+                            } else {
+                                "Refresh"
+                            })
+                            .font(theme::medium(12.5))
+                            .color(theme::TEXT),
+                        )
+                        .fill(theme::CHIP)
+                        .corner_radius(16),
+                    )
+                    .clicked()
+                {
+                    self.shorts_loading = true;
+                    let _ = self.backend.tx.send(Request::LoadShorts);
+                }
+                if let Some(first) = self.shorts_items.first().cloned() {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(format!("{}  Play Shorts", icon::PLAY))
+                                    .font(theme::semibold(12.5))
+                                    .color(Color32::from_rgb(15, 15, 15)),
+                            )
+                            .fill(Color32::from_rgb(241, 241, 241))
+                            .corner_radius(16),
+                        )
+                        .clicked()
+                    {
+                        let list = self.shorts_items.clone();
+                        self.open_short(first, list);
+                    }
+                }
+            });
+        });
+        ui.add_space(10.0);
+        let items = self.shorts_items.clone();
+        let loading = self.shorts_loading;
+        let ctx = ui.ctx().clone();
+        if let Some(act) = super::cards::draw_shorts_portrait_grid(ui, "", &items, loading) {
+            self.handle_grid_action(&ctx, act, |_| {});
         }
     }
 

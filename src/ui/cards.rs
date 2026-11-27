@@ -344,6 +344,90 @@ pub(super) fn draw_video_grid_with_flags(
     show_remove_history: bool,
     show_remove_playlist: bool,
 ) -> Option<GridAction> {
+    draw_feed_grid_inner(
+        ui,
+        heading,
+        items,
+        loading,
+        has_more,
+        show_remove_history,
+        show_remove_playlist,
+        false,
+    )
+}
+
+/// Renders a mixed feed (like Home) that separates `Short` entries into a dedicated
+/// horizontal portrait Shorts shelf after the first row of regular 16:9 videos.
+pub(super) fn draw_home_mixed_grid(
+    ui: &mut egui::Ui,
+    heading: &str,
+    items: &[VideoItem],
+    loading: bool,
+    has_more: bool,
+) -> Option<GridAction> {
+    draw_feed_grid_inner(ui, heading, items, loading, has_more, false, false, true)
+}
+
+pub(super) fn draw_shorts_portrait_grid(
+    ui: &mut egui::Ui,
+    heading: &str,
+    items: &[VideoItem],
+    loading: bool,
+) -> Option<GridAction> {
+    let mut action = None;
+    if !heading.is_empty() || loading {
+        ui.horizontal(|ui| {
+            if !heading.is_empty() {
+                ui.label(RichText::new(heading).font(theme::bold(20.0)));
+            }
+            if loading {
+                ui.add_space(8.0);
+                ui.spinner();
+            }
+        });
+        ui.add_space(10.0);
+    }
+    if items.is_empty() && !loading {
+        ui.label(
+            RichText::new("No Shorts found.")
+                .font(theme::regular(14.0))
+                .color(theme::TEXT_DIM),
+        );
+        return None;
+    }
+    ScrollArea::vertical()
+        .id_salt(("shorts_grid", heading))
+        .show(ui, |ui| {
+            let avail = (ui.available_width() - 8.0).max(200.0);
+            let cols = ((avail / 188.0).floor() as usize).clamp(2, 7);
+            let spacing = 14.0;
+            let card_w = ((avail - spacing * (cols as f32 - 1.0)) / cols as f32).clamp(150.0, 210.0);
+            let thumb_h = (card_w * 16.0 / 9.0).round();
+            for row in items.chunks(cols) {
+                ui.horizontal_top(|ui| {
+                    for (idx, item) in row.iter().enumerate() {
+                        draw_short_portrait_card(ui, item, card_w, thumb_h, &mut action);
+                        if idx + 1 < row.len() {
+                            ui.add_space(spacing);
+                        }
+                    }
+                });
+                ui.add_space(16.0);
+            }
+        });
+    action
+}
+
+fn draw_feed_grid_inner(
+    ui: &mut egui::Ui,
+    heading: &str,
+    items: &[VideoItem],
+    loading: bool,
+    has_more: bool,
+    show_remove_history: bool,
+    show_remove_playlist: bool,
+    split_shorts_shelf: bool,
+) -> Option<GridAction> {
     let mut action = None;
     if !heading.is_empty() || loading {
         ui.horizontal(|ui| {
@@ -374,214 +458,48 @@ pub(super) fn draw_video_grid_with_flags(
         let card_w = ((avail - spacing * (cols as f32 - 1.0)) / cols as f32).max(180.0);
         let thumb_h = card_w * 9.0 / 16.0;
 
-        for row in items.chunks(cols) {
-            ui.horizontal_top(|ui| {
-                for (col_idx, item) in row.iter().enumerate() {
-                    let card_h = thumb_h + 92.0;
-                    let (card_rect, card_resp) =
-                        ui.allocate_exact_size(Vec2::new(card_w, card_h), Sense::click());
-                    let hovered = card_resp.hovered() || ui.rect_contains_pointer(card_rect);
-                    let hover_t = ui.ctx().animate_bool_with_time(
-                        egui::Id::unique(("card_hover", &item.id)),
-                        hovered,
-                        0.15,
-                    );
-                    if hovered {
-                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                    }
-                    if hover_t > 0.01 {
-                        // Smooth YouTube-style ambient card glow
-                        ui.painter().rect_filled(
-                            card_rect.expand(6.0),
-                            14.0,
-                            Color32::from_rgba_unmultiplied(40, 32, 29, (215.0 * hover_t) as u8),
-                        );
-                    }
+        let (regulars, shorts): (Vec<&VideoItem>, Vec<&VideoItem>) = if split_shorts_shelf {
+            items.iter().partition(|it| !it.is_short())
+        } else {
+            (items.iter().collect(), Vec::new())
+        };
 
-                    let mut card_ui = ui.new_child(egui::UiBuilder::new().max_rect(card_rect));
-                    let cclip = card_ui.clip_rect().intersect(card_rect);
-                    card_ui.set_clip_rect(cclip);
-                    let mut child_clicked_override = false;
-                    card_ui.vertical(|ui| {
-                        draw_thumbnail_with_hover(
-                            ui,
-                            &item.thumbnail_url,
-                            &item.duration_text,
-                            Vec2::new(card_w, thumb_h),
-                            12.0,
-                            item.watched_percent,
-                            hover_t,
-                        );
-                        ui.add_space(10.0);
-                        ui.horizontal_top(|ui| {
-                            let avatar_r = ui
-                                .horizontal(|ui| {
-                                    draw_avatar(
-                                        ui,
-                                        item.channel_avatar_url.as_deref(),
-                                        &item.channel,
-                                        34.0,
-                                    );
-                                })
-                                .response;
-                            if item.channel_id.is_some()
-                                && avatar_r.interact(Sense::click()).clicked()
-                            {
-                                if let Some(cid) = item.channel_id.clone() {
-                                    action = Some(GridAction::OpenChannel {
-                                        channel_id: cid,
-                                        name: item.channel.clone(),
-                                    });
-                                    child_clicked_override = true;
-                                }
-                            }
-                            ui.add_space(8.0);
-                            ui.vertical(|ui| {
-                                ui.set_max_width((card_w - 72.0).max(90.0));
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&item.title)
-                                            .font(theme::semibold(13.8))
-                                            .color(theme::TEXT),
-                                    )
-                                    .wrap(),
-                                );
-                                ui.add_space(2.0);
-                                let ch_lbl = ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&item.channel)
-                                            .font(theme::regular(12.2))
-                                            .color(theme::TEXT_DIM),
-                                    )
-                                    .truncate()
-                                    .sense(Sense::click()),
-                                );
-                                if ch_lbl.hovered() && item.channel_id.is_some() {
-                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                                }
-                                if ch_lbl.clicked() {
-                                    if let Some(cid) = item.channel_id.clone() {
-                                        action = Some(GridAction::OpenChannel {
-                                            channel_id: cid,
-                                            name: item.channel.clone(),
-                                        });
-                                        child_clicked_override = true;
-                                    }
-                                }
-                                let meta = join_meta(&item.views_text, &item.published_text);
-                                if !meta.is_empty() {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(meta)
-                                                .font(theme::regular(12.0))
-                                                .color(theme::TEXT_DIM),
-                                        )
-                                        .truncate(),
-                                    );
-                                }
-                            });
+        let split_at = if !shorts.is_empty() {
+            cols.min(regulars.len())
+        } else {
+            regulars.len()
+        };
 
-                            ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-                                let menu_id = ui.scope_id().with(&item.id);
-                                ui.push_id(menu_id, |ui| {
-                                    let (mrect, mresp) = ui.allocate_exact_size(
-                                        Vec2::splat(28.0),
-                                        Sense::click(),
-                                    );
-                                    let mhov = ui.ctx().animate_bool_with_time(
-                                        mresp.id,
-                                        mresp.hovered(),
-                                        0.12,
-                                    );
-                                    if mresp.hovered() {
-                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                                    }
-                                    if mhov > 0.01 {
-                                        ui.painter().circle_filled(
-                                            mrect.center(),
-                                            14.0,
-                                            Color32::from_white_alpha((24.0 * mhov) as u8),
-                                        );
-                                    }
-                                    let icon_col = theme::lerp_color(
-                                        theme::TEXT_FAINT,
-                                        Color32::WHITE,
-                                        hover_t.max(mhov).clamp(0.0, 1.0),
-                                    );
-                                    theme::draw_icon_centered(
-                                        ui.painter(),
-                                        mrect.center(),
-                                        icon::ELLIPSIS_VERTICAL,
-                                        15.0,
-                                        icon_col,
-                                    );
-                                    egui::Popup::menu(&mresp).show(|ui| {
-                                        draw_video_context_menu(ui, item, &mut action, false);
-                                        if show_remove_history
-                                            && ui
-                                                .button(format!(
-                                                    "{}  Remove from history",
-                                                    icon::TRASH_2
-                                                ))
-                                                .clicked()
-                                        {
-                                            action = Some(GridAction::RemoveFromHistory(item.clone()));
-                                            ui.close();
-                                        }
-                                        if show_remove_playlist
-                                            && ui
-                                                .button(format!(
-                                                    "{}  Remove from playlist",
-                                                    icon::TRASH_2
-                                                ))
-                                                .clicked()
-                                        {
-                                            action = Some(GridAction::RemoveFromPlaylist(item.clone()));
-                                            ui.close();
-                                        }
-                                    });
-                                    if mresp.hovered() || mresp.clicked() {
-                                        child_clicked_override = true;
-                                    }
-                                });
-                            });
-                        });
-                    });
+        for row in regulars[..split_at].chunks(cols) {
+            draw_video_card_row(
+                ui,
+                row,
+                card_w,
+                thumb_h,
+                spacing,
+                show_remove_history,
+                show_remove_playlist,
+                &mut action,
+            );
+            ui.add_space(18.0);
+        }
 
-                    card_resp.context_menu(|ui| {
-                        draw_video_context_menu(ui, item, &mut action, false);
-                        if show_remove_history
-                            && ui
-                                .button(format!("{}  Remove from history", icon::TRASH_2))
-                                .clicked()
-                        {
-                            action = Some(GridAction::RemoveFromHistory(item.clone()));
-                            ui.close();
-                        }
-                        if show_remove_playlist
-                            && ui
-                                .button(format!("{}  Remove from playlist", icon::TRASH_2))
-                                .clicked()
-                        {
-                            action = Some(GridAction::RemoveFromPlaylist(item.clone()));
-                            ui.close();
-                        }
-                    });
+        if !shorts.is_empty() {
+            draw_shorts_shelf(ui, heading, &shorts, &mut action);
+            ui.add_space(20.0);
+        }
 
-                    let card_hover_resp = if item.title.chars().count() > 46 {
-                        card_resp.on_hover_text(&item.title)
-                    } else {
-                        card_resp
-                    };
-
-                    if card_hover_resp.clicked() && !child_clicked_override && action.is_none() {
-                        action = Some(GridAction::Open(item.clone()));
-                    }
-                    if col_idx + 1 < row.len() {
-                        ui.add_space(spacing);
-                    }
-                }
-            });
+        for row in regulars[split_at..].chunks(cols) {
+            draw_video_card_row(
+                ui,
+                row,
+                card_w,
+                thumb_h,
+                spacing,
+                show_remove_history,
+                show_remove_playlist,
+                &mut action,
+            );
             ui.add_space(18.0);
         }
 
@@ -609,6 +527,413 @@ pub(super) fn draw_video_grid_with_flags(
     }
 
     action
+}
+
+fn draw_shorts_shelf(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    shorts: &[&VideoItem],
+    action: &mut Option<GridAction>,
+) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let (irec, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
+        theme::draw_shorts_icon(ui.painter(), irec.center(), 18.0, theme::YT_RED);
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Shorts")
+                .font(theme::bold(19.0))
+                .color(theme::TEXT),
+        );
+        if let Some(first) = shorts.first() {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(format!("{}  Play Shorts", icon::PLAY))
+                                .font(theme::medium(12.5))
+                                .color(theme::TEXT),
+                        )
+                        .fill(theme::CHIP)
+                        .corner_radius(16),
+                    )
+                    .clicked()
+                {
+                    *action = Some(GridAction::Open((*first).clone()));
+                }
+            });
+        }
+    });
+    ui.add_space(10.0);
+
+    let card_w = 172.0;
+    let thumb_h = 304.0;
+    ScrollArea::horizontal()
+        .id_salt(("home_shorts_shelf", id_salt))
+        .show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                for (idx, item) in shorts.iter().enumerate() {
+                    draw_short_portrait_card(ui, item, card_w, thumb_h, action);
+                    if idx + 1 < shorts.len() {
+                        ui.add_space(12.0);
+                    }
+                }
+            });
+        });
+}
+
+fn draw_short_portrait_card(
+    ui: &mut egui::Ui,
+    item: &VideoItem,
+    card_w: f32,
+    thumb_h: f32,
+    action: &mut Option<GridAction>,
+) {
+    let card_h = thumb_h + 70.0;
+    let (card_rect, card_resp) =
+        ui.allocate_exact_size(Vec2::new(card_w, card_h), Sense::click());
+    let hovered = card_resp.hovered() || ui.rect_contains_pointer(card_rect);
+    let hover_t = ui.ctx().animate_bool_with_time(
+        egui::Id::unique(("short_card_hover", &item.id)),
+        hovered,
+        0.15,
+    );
+    if hovered {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    if hover_t > 0.01 {
+        ui.painter().rect_filled(
+            card_rect.expand(4.0),
+            14.0,
+            Color32::from_rgba_unmultiplied(40, 32, 29, (205.0 * hover_t) as u8),
+        );
+    }
+
+    let mut card_ui = ui.new_child(egui::UiBuilder::new().max_rect(card_rect));
+    let cclip = card_ui.clip_rect().intersect(card_rect);
+    card_ui.set_clip_rect(cclip);
+    let mut child_clicked_override = false;
+    card_ui.vertical(|ui| {
+        let (thumb_rect, _) =
+            ui.allocate_exact_size(Vec2::new(card_w, thumb_h), Sense::hover());
+        ui.painter().rect_filled(thumb_rect, 12.0, Color32::BLACK);
+        theme::paint_image_cover_rounded(ui, &item.thumbnail_url, thumb_rect, 12);
+        if hover_t > 0.02 {
+            ui.painter().circle_filled(
+                thumb_rect.center(),
+                20.0,
+                Color32::from_black_alpha((150.0 * hover_t) as u8),
+            );
+            theme::draw_icon_centered(
+                ui.painter(),
+                thumb_rect.center(),
+                icon::PLAY,
+                16.0,
+                Color32::from_white_alpha((235.0 * hover_t) as u8),
+            );
+        }
+
+        ui.add_space(8.0);
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_max_width((card_w - 30.0).max(90.0));
+                ui.set_max_height(56.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&item.title)
+                            .font(theme::semibold(13.2))
+                            .color(theme::TEXT),
+                    )
+                    .wrap(),
+                );
+                let sub = if !item.views_text.is_empty() {
+                    item.views_text.clone()
+                } else {
+                    item.channel.clone()
+                };
+                if !sub.is_empty() {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(sub)
+                                .font(theme::regular(11.8))
+                                .color(theme::TEXT_DIM),
+                        )
+                        .truncate(),
+                    );
+                }
+            });
+            ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                let menu_id = ui.scope_id().with(("short_menu", &item.id));
+                ui.push_id(menu_id, |ui| {
+                    let (mrect, mresp) =
+                        ui.allocate_exact_size(Vec2::splat(26.0), Sense::click());
+                    let mhov =
+                        ui.ctx()
+                            .animate_bool_with_time(mresp.id, mresp.hovered(), 0.12);
+                    if mresp.hovered() {
+                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    }
+                    if mhov > 0.01 {
+                        ui.painter().circle_filled(
+                            mrect.center(),
+                            13.0,
+                            Color32::from_white_alpha((24.0 * mhov) as u8),
+                        );
+                    }
+                    let icon_col = theme::lerp_color(
+                        theme::TEXT_FAINT,
+                        Color32::WHITE,
+                        hover_t.max(mhov).clamp(0.0, 1.0),
+                    );
+                    theme::draw_icon_centered(
+                        ui.painter(),
+                        mrect.center(),
+                        icon::ELLIPSIS_VERTICAL,
+                        14.0,
+                        icon_col,
+                    );
+                    egui::Popup::menu(&mresp).show(|ui| {
+                        draw_video_context_menu(ui, item, action, false);
+                    });
+                    if mresp.hovered() || mresp.clicked() {
+                        child_clicked_override = true;
+                    }
+                });
+            });
+        });
+    });
+
+    card_resp.context_menu(|ui| {
+        draw_video_context_menu(ui, item, action, false);
+    });
+    let card_hover_resp = if item.title.chars().count() > 38 {
+        card_resp.on_hover_text(&item.title)
+    } else {
+        card_resp
+    };
+    if card_hover_resp.clicked() && !child_clicked_override && action.is_none() {
+        *action = Some(GridAction::Open(item.clone()));
+    }
+}
+
+fn draw_video_card_row(
+    ui: &mut egui::Ui,
+    row: &[&VideoItem],
+    card_w: f32,
+    thumb_h: f32,
+    spacing: f32,
+    show_remove_history: bool,
+    show_remove_playlist: bool,
+    action: &mut Option<GridAction>,
+) {
+    ui.horizontal_top(|ui| {
+        for (col_idx, item) in row.iter().enumerate() {
+            let item = *item;
+            let card_h = thumb_h + 92.0;
+            let (card_rect, card_resp) =
+                ui.allocate_exact_size(Vec2::new(card_w, card_h), Sense::click());
+            let hovered = card_resp.hovered() || ui.rect_contains_pointer(card_rect);
+            let hover_t = ui.ctx().animate_bool_with_time(
+                egui::Id::unique(("card_hover", &item.id)),
+                hovered,
+                0.15,
+            );
+            if hovered {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            if hover_t > 0.01 {
+                // Smooth YouTube-style ambient card glow
+                ui.painter().rect_filled(
+                    card_rect.expand(6.0),
+                    14.0,
+                    Color32::from_rgba_unmultiplied(40, 32, 29, (215.0 * hover_t) as u8),
+                );
+            }
+
+            let mut card_ui = ui.new_child(egui::UiBuilder::new().max_rect(card_rect));
+            let cclip = card_ui.clip_rect().intersect(card_rect);
+            card_ui.set_clip_rect(cclip);
+            let mut child_clicked_override = false;
+            card_ui.vertical(|ui| {
+                draw_thumbnail_with_hover(
+                    ui,
+                    &item.thumbnail_url,
+                    &item.duration_text,
+                    Vec2::new(card_w, thumb_h),
+                    12.0,
+                    item.watched_percent,
+                    hover_t,
+                );
+                ui.add_space(10.0);
+                ui.horizontal_top(|ui| {
+                    let avatar_r = ui
+                        .horizontal(|ui| {
+                            draw_avatar(
+                                ui,
+                                item.channel_avatar_url.as_deref(),
+                                &item.channel,
+                                34.0,
+                            );
+                        })
+                        .response;
+                    if item.channel_id.is_some()
+                        && avatar_r.interact(Sense::click()).clicked()
+                    {
+                        if let Some(cid) = item.channel_id.clone() {
+                            *action = Some(GridAction::OpenChannel {
+                                channel_id: cid,
+                                name: item.channel.clone(),
+                            });
+                            child_clicked_override = true;
+                        }
+                    }
+                    ui.add_space(8.0);
+                    ui.vertical(|ui| {
+                        ui.set_max_width((card_w - 72.0).max(90.0));
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&item.title)
+                                    .font(theme::semibold(13.8))
+                                    .color(theme::TEXT),
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(2.0);
+                        let ch_lbl = ui.add(
+                            egui::Label::new(
+                                RichText::new(&item.channel)
+                                    .font(theme::regular(12.2))
+                                    .color(theme::TEXT_DIM),
+                            )
+                            .truncate()
+                            .sense(Sense::click()),
+                        );
+                        if ch_lbl.hovered() && item.channel_id.is_some() {
+                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                        }
+                        if ch_lbl.clicked() {
+                            if let Some(cid) = item.channel_id.clone() {
+                                *action = Some(GridAction::OpenChannel {
+                                    channel_id: cid,
+                                    name: item.channel.clone(),
+                                });
+                                child_clicked_override = true;
+                            }
+                        }
+                        let meta = join_meta(&item.views_text, &item.published_text);
+                        if !meta.is_empty() {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(meta)
+                                        .font(theme::regular(12.0))
+                                        .color(theme::TEXT_DIM),
+                                )
+                                .truncate(),
+                            );
+                        }
+                    });
+
+                    ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                        let menu_id = ui.scope_id().with(&item.id);
+                        ui.push_id(menu_id, |ui| {
+                            let (mrect, mresp) = ui.allocate_exact_size(
+                                Vec2::splat(28.0),
+                                Sense::click(),
+                            );
+                            let mhov = ui.ctx().animate_bool_with_time(
+                                mresp.id,
+                                mresp.hovered(),
+                                0.12,
+                            );
+                            if mresp.hovered() {
+                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                            }
+                            if mhov > 0.01 {
+                                ui.painter().circle_filled(
+                                    mrect.center(),
+                                    14.0,
+                                    Color32::from_white_alpha((24.0 * mhov) as u8),
+                                );
+                            }
+                            let icon_col = theme::lerp_color(
+                                theme::TEXT_FAINT,
+                                Color32::WHITE,
+                                hover_t.max(mhov).clamp(0.0, 1.0),
+                            );
+                            theme::draw_icon_centered(
+                                ui.painter(),
+                                mrect.center(),
+                                icon::ELLIPSIS_VERTICAL,
+                                15.0,
+                                icon_col,
+                            );
+                            egui::Popup::menu(&mresp).show(|ui| {
+                                draw_video_context_menu(ui, item, action, false);
+                                if show_remove_history
+                                    && ui
+                                        .button(format!(
+                                            "{}  Remove from history",
+                                            icon::TRASH_2
+                                        ))
+                                        .clicked()
+                                {
+                                    *action = Some(GridAction::RemoveFromHistory(item.clone()));
+                                    ui.close();
+                                }
+                                if show_remove_playlist
+                                    && ui
+                                        .button(format!(
+                                            "{}  Remove from playlist",
+                                            icon::TRASH_2
+                                        ))
+                                        .clicked()
+                                {
+                                    *action = Some(GridAction::RemoveFromPlaylist(item.clone()));
+                                    ui.close();
+                                }
+                            });
+                            if mresp.hovered() || mresp.clicked() {
+                                child_clicked_override = true;
+                            }
+                        });
+                    });
+                });
+            });
+
+            card_resp.context_menu(|ui| {
+                draw_video_context_menu(ui, item, action, false);
+                if show_remove_history
+                    && ui
+                        .button(format!("{}  Remove from history", icon::TRASH_2))
+                        .clicked()
+                {
+                    *action = Some(GridAction::RemoveFromHistory(item.clone()));
+                    ui.close();
+                }
+                if show_remove_playlist
+                    && ui
+                        .button(format!("{}  Remove from playlist", icon::TRASH_2))
+                        .clicked()
+                {
+                    *action = Some(GridAction::RemoveFromPlaylist(item.clone()));
+                    ui.close();
+                }
+            });
+
+            let card_hover_resp = if item.title.chars().count() > 46 {
+                card_resp.on_hover_text(&item.title)
+            } else {
+                card_resp
+            };
+
+            if card_hover_resp.clicked() && !child_clicked_override && action.is_none() {
+                *action = Some(GridAction::Open(item.clone()));
+            }
+            if col_idx + 1 < row.len() {
+                ui.add_space(spacing);
+            }
+        }
+    });
 }
 
 pub(super) fn draw_video_context_menu(

@@ -1570,50 +1570,11 @@ fn collect_videos_with_channel_items(
                             out.push(item);
                         }
                     }
-                } else if let Some(sl) = map.get("shortsLockupViewModel") {
-                    let vid = sl["onTap"]["innertubeCommand"]["reelWatchEndpoint"]["videoId"]
-                        .as_str()
-                        .or_else(|| {
-                            sl["entityId"]
-                                .as_str()
-                                .and_then(|s| s.strip_prefix("shorts-shelf-item-"))
-                        });
-                    if let Some(vid) = vid.filter(|s| s.len() == 11) {
-                        if seen.insert(vid.to_owned()) {
-                            let title = sl["overlayMetadata"]["primaryText"]["content"]
-                                .as_str()
-                                .or_else(|| sl["accessibilityText"].as_str())
-                                .unwrap_or("Short")
-                                .to_owned();
-                            let views = sl["overlayMetadata"]["secondaryText"]["content"]
-                                .as_str()
-                                .unwrap_or("")
-                                .to_owned();
-                            let thumb = sl["thumbnail"]["sources"]
-                                .as_array()
-                                .and_then(|a| a.last())
-                                .and_then(|s| s["url"].as_str())
-                                .map(normalize_url)
-                                .unwrap_or_else(|| {
-                                    format!("https://i.ytimg.com/vi/{vid}/mqdefault.jpg")
-                                });
-                            out.push(VideoItem {
-                                id: vid.to_owned(),
-                                title,
-                                channel: channel_name.to_owned(),
-                                channel_id: Some(channel_id.to_owned()),
-                                channel_avatar_url: None,
-                                views_text: views,
-                                published_text: String::new(),
-                                duration_text: "Short".to_owned(),
-                                thumbnail_url: thumb,
-                                is_live: false,
-                                watched_percent: None,
-                                resume_secs: None,
-                                playlist_browse_id: None,
-                                playlist_set_video_id: None,
-                            });
-                        }
+                } else if let Some(item) =
+                    parse_shorts_entry(map, channel_name, Some(channel_id))
+                {
+                    if seen.insert(item.id.clone()) {
+                        out.push(item);
                     }
                 } else if let Some(gp) = map.get("gridPlaylistRenderer") {
                     if let (Some(pid), Some(title)) =
@@ -1813,20 +1774,33 @@ fn parse_comment_entry(
     let surface = vm["commentSurfaceKey"]
         .as_str()
         .and_then(|sk| surface_map.get(sk));
-    let reply_params = surface
-        .and_then(|s| find_nested_str(s, "createReplyParams"))
-        .or_else(|| find_nested_str(payload, "createReplyParams"))
-        .or_else(|| find_nested_str(thread, "createReplyParams"))
+    let tb_surface = vm["toolbarSurfaceKey"]
+        .as_str()
+        .or_else(|| find_nested_str(payload, "toolbarSurfaceKey"))
+        .or_else(|| surface.and_then(|s| find_nested_str(s, "toolbarSurfaceKey")))
+        .and_then(|tk| surface_map.get(tk));
+    let shared_entity = vm["sharedKey"]
+        .as_str()
+        .or_else(|| find_nested_str(payload, "sharedKey"))
+        .and_then(|sk| surface_map.get(sk));
+    let reply_params = [surface, tb_surface, shared_entity, Some(payload), Some(vm), Some(thread)]
+        .into_iter()
+        .flatten()
+        .find_map(|v| find_nested_str(v, "createReplyParams"))
         .map(str::to_owned);
     let is_liked = toolbar["likeState"].as_str() == Some("TOOLBAR_LIKE_STATE_LIKED");
-    let like_action_params = surface
-        .and_then(|s| {
+    let like_action_params = [surface, tb_surface]
+        .into_iter()
+        .flatten()
+        .find_map(|s| {
             find_nested_str(&s["likeCommand"], "action")
                 .or_else(|| find_nested_str(&s["toolbar"]["likeCommand"], "action"))
         })
         .map(str::to_owned);
-    let unlike_action_params = surface
-        .and_then(|s| {
+    let unlike_action_params = [surface, tb_surface]
+        .into_iter()
+        .flatten()
+        .find_map(|s| {
             find_nested_str(&s["unlikeCommand"], "action")
                 .or_else(|| find_nested_str(&s["toolbar"]["unlikeCommand"], "action"))
         })
@@ -1878,14 +1852,21 @@ pub async fn fetch_comments(
     let mut surface_map = std::collections::HashMap::<String, Value>::new();
     if let Some(muts) = v["frameworkUpdates"]["entityBatchUpdate"]["mutations"].as_array() {
         for m in muts {
+            let outer_key = m["entityKey"].as_str();
             if let Some(p) = m["payload"]["commentEntityPayload"].as_object() {
-                if let Some(key) = p.get("key").and_then(|k| k.as_str()) {
+                if let Some(key) = p.get("key").and_then(|k| k.as_str()).or(outer_key) {
                     entity_map.insert(key.to_owned(), Value::Object(p.clone()));
                 }
             }
-            if let Some(p) = m["payload"]["commentSurfaceEntityPayload"].as_object() {
-                if let Some(key) = p.get("key").and_then(|k| k.as_str()) {
-                    surface_map.insert(key.to_owned(), Value::Object(p.clone()));
+            for payload_field in [
+                "commentSurfaceEntityPayload",
+                "engagementToolbarSurfaceEntityPayload",
+                "commentSharedEntityPayload",
+            ] {
+                if let Some(p) = m["payload"][payload_field].as_object() {
+                    if let Some(key) = p.get("key").and_then(|k| k.as_str()).or(outer_key) {
+                        surface_map.insert(key.to_owned(), Value::Object(p.clone()));
+                    }
                 }
             }
         }
@@ -2086,10 +2067,69 @@ pub async fn set_subscribe(
     Ok(())
 }
 
+fn extract_notification_targets(val: &Value) -> (Option<String>, Option<String>) {
+    let mut video_id: Option<String> = None;
+    let mut channel_id: Option<String> = None;
+
+    fn walk_ep(v: &Value, vid: &mut Option<String>, cid: &mut Option<String>) {
+        match v {
+            Value::Object(map) => {
+                if vid.is_none() {
+                    if let Some(id) = map
+                        .get("watchEndpoint")
+                        .or_else(|| map.get("reelWatchEndpoint"))
+                        .or_else(|| map.get("watchPlaylistEndpoint"))
+                        .and_then(|e| e.get("videoId"))
+                        .and_then(|s| s.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        *vid = Some(id.to_owned());
+                    }
+                }
+                if cid.is_none() {
+                    if let Some(id) = map
+                        .get("browseEndpoint")
+                        .and_then(|e| e.get("browseId"))
+                        .and_then(|s| s.as_str())
+                        .filter(|s| s.starts_with("UC"))
+                    {
+                        *cid = Some(id.to_owned());
+                    }
+                }
+                for child in map.values() {
+                    if vid.is_some() && cid.is_some() {
+                        return;
+                    }
+                    walk_ep(child, vid, cid);
+                }
+            }
+            Value::Array(arr) => {
+                for child in arr {
+                    if vid.is_some() && cid.is_some() {
+                        return;
+                    }
+                    walk_ep(child, vid, cid);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    walk_ep(val, &mut video_id, &mut channel_id);
+    if channel_id.is_none() {
+        channel_id = val["browseEndpoint"]["browseId"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+    }
+    (video_id, channel_id)
+}
+
 pub fn parse_notifications_menu(v: &Value) -> (Vec<NotificationMenuItem>, u32, Option<String>) {
     let mut items = Vec::new();
     let mut unseen_hint: Option<u32> = None;
     let mut seen_params: Option<String> = None;
+    let mut seen_keys = HashSet::<String>::new();
 
     fn extract_seen_params(val: &Value, out: &mut Option<String>) {
         if out.is_some() {
@@ -2118,10 +2158,76 @@ pub fn parse_notifications_menu(v: &Value) -> (Vec<NotificationMenuItem>, u32, O
         }
     }
 
+    fn push_notification_renderer(
+        nr: &serde_json::Map<String, Value>,
+        section: Option<&str>,
+        items: &mut Vec<NotificationMenuItem>,
+        seen_keys: &mut HashSet<String>,
+    ) {
+        let message = nr
+            .get("shortMessage")
+            .and_then(text)
+            .or_else(|| {
+                nr.get("accessibility")
+                    .and_then(|a| a.get("accessibilityData"))
+                    .and_then(|a| a.get("label"))
+                    .and_then(|s| s.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        let sent_time_text = nr
+            .get("sentTimeText")
+            .and_then(text)
+            .unwrap_or_default();
+        let channel_avatar_url = nr
+            .get("thumbnail")
+            .and_then(|t| t["thumbnails"].as_array())
+            .and_then(|a| a.last().or_else(|| a.first()))
+            .and_then(|t| t["url"].as_str())
+            .map(normalize_url);
+        let video_thumbnail_url = nr
+            .get("videoThumbnail")
+            .and_then(|t| t["thumbnails"].as_array())
+            .and_then(|a| a.last().or_else(|| a.first()))
+            .and_then(|t| t["url"].as_str())
+            .map(normalize_url);
+        let nav = nr.get("navigationEndpoint").unwrap_or(&Value::Null);
+        let (video_id, channel_id) = extract_notification_targets(nav);
+        let read = nr.get("read").and_then(|b| b.as_bool()).unwrap_or(true);
+        if !message.is_empty() && (video_id.is_some() || channel_id.is_some()) {
+            let dedup_key = nr
+                .get("notificationId")
+                .and_then(|s| s.as_str())
+                .map(|id| format!("id:{id}"))
+                .unwrap_or_else(|| {
+                    format!(
+                        "{}:{}:{}",
+                        video_id.as_deref().unwrap_or(""),
+                        channel_id.as_deref().unwrap_or(""),
+                        message
+                    )
+                });
+            if seen_keys.insert(dedup_key) {
+                items.push(NotificationMenuItem {
+                    message,
+                    sent_time_text,
+                    section: section.map(str::to_owned),
+                    channel_avatar_url,
+                    video_thumbnail_url,
+                    video_id,
+                    channel_id,
+                    read,
+                });
+            }
+        }
+    }
+
     fn walk_notifications(
         val: &Value,
+        current_section: Option<&str>,
         items: &mut Vec<NotificationMenuItem>,
         unseen_hint: &mut Option<u32>,
+        seen_keys: &mut HashSet<String>,
     ) {
         match val {
             Value::Object(map) => {
@@ -2132,62 +2238,45 @@ pub fn parse_notifications_menu(v: &Value) -> (Vec<NotificationMenuItem>, u32, O
                 {
                     *unseen_hint = Some(cnt as u32);
                 }
-                if let Some(nr) = map.get("notificationRenderer").and_then(|x| x.as_object()) {
-                    let message = nr
-                        .get("shortMessage")
+                if let Some(sec) = map
+                    .get("multiPageMenuNotificationSectionRenderer")
+                    .and_then(|x| x.as_object())
+                {
+                    let sec_title = sec
+                        .get("notificationSectionHeaderRenderer")
+                        .and_then(|h| h.get("title").or_else(|| h.get("text")))
                         .and_then(text)
-                        .unwrap_or_default();
-                    let sent_time_text = nr
-                        .get("sentTimeText")
-                        .and_then(text)
-                        .unwrap_or_default();
-                    let channel_avatar_url = nr
-                        .get("thumbnail")
-                        .and_then(|t| t["thumbnails"].as_array())
-                        .and_then(|a| a.first())
-                        .and_then(|t| t["url"].as_str())
-                        .map(normalize_url);
-                    let video_thumbnail_url = nr
-                        .get("videoThumbnail")
-                        .and_then(|t| t["thumbnails"].as_array())
-                        .and_then(|a| a.last().or_else(|| a.first()))
-                        .and_then(|t| t["url"].as_str())
-                        .map(normalize_url);
-                    let nav = nr.get("navigationEndpoint").unwrap_or(&Value::Null);
-                    let video_id = nav["watchEndpoint"]["videoId"]
-                        .as_str()
-                        .map(str::to_owned);
-                    let channel_id = nav["browseEndpoint"]["browseId"]
-                        .as_str()
-                        .map(str::to_owned);
-                    let read = nr.get("read").and_then(|b| b.as_bool()).unwrap_or(true);
-                    if !message.is_empty() && (video_id.is_some() || channel_id.is_some()) {
-                        items.push(NotificationMenuItem {
-                            message,
-                            sent_time_text,
-                            channel_avatar_url,
-                            video_thumbnail_url,
-                            video_id,
-                            channel_id,
-                            read,
-                        });
+                        .or_else(|| sec.get("sectionTitle").and_then(text))
+                        .filter(|s| !s.trim().is_empty());
+                    let next_sec = sec_title.as_deref().or(current_section);
+                    if let Some(arr) = sec.get("items").and_then(|x| x.as_array()) {
+                        for entry in arr {
+                            walk_notifications(entry, next_sec, items, unseen_hint, seen_keys);
+                        }
+                    }
+                    if let Some(cont) = sec.get("continuation") {
+                        walk_notifications(cont, next_sec, items, unseen_hint, seen_keys);
                     }
                     return;
                 }
+                if let Some(nr) = map.get("notificationRenderer").and_then(|x| x.as_object()) {
+                    push_notification_renderer(nr, current_section, items, seen_keys);
+                    return;
+                }
                 for child in map.values() {
-                    walk_notifications(child, items, unseen_hint);
+                    walk_notifications(child, current_section, items, unseen_hint, seen_keys);
                 }
             }
             Value::Array(arr) => {
                 for child in arr {
-                    walk_notifications(child, items, unseen_hint);
+                    walk_notifications(child, current_section, items, unseen_hint, seen_keys);
                 }
             }
             _ => {}
         }
     }
 
-    walk_notifications(v, &mut items, &mut unseen_hint);
+    walk_notifications(v, None, &mut items, &mut unseen_hint, &mut seen_keys);
     extract_seen_params(v, &mut seen_params);
     let unread_fallback = items.iter().filter(|n| !n.read).count() as u32;
     (items, unseen_hint.unwrap_or(unread_fallback), seen_params)
@@ -4162,6 +4251,188 @@ fn collect_chips(v: &Value) -> Vec<FeedChip> {
     out
 }
 
+fn parse_shorts_entry(
+    map: &serde_json::Map<String, Value>,
+    default_channel: &str,
+    default_channel_id: Option<&str>,
+) -> Option<VideoItem> {
+    if let Some(sl) = map.get("shortsLockupViewModel") {
+        let vid = sl["onTap"]["innertubeCommand"]["reelWatchEndpoint"]["videoId"]
+            .as_str()
+            .or_else(|| {
+                sl["entityId"]
+                    .as_str()
+                    .and_then(|s| s.strip_prefix("shorts-shelf-item-"))
+            })?;
+        if vid.len() != 11 {
+            return None;
+        }
+        let title = sl["overlayMetadata"]["primaryText"]["content"]
+            .as_str()
+            .or_else(|| sl["accessibilityText"].as_str())
+            .unwrap_or("Short")
+            .to_owned();
+        let views = sl["overlayMetadata"]["secondaryText"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
+        let thumb = sl["thumbnail"]["sources"]
+            .as_array()
+            .and_then(|a| a.last())
+            .and_then(|s| s["url"].as_str())
+            .map(normalize_url)
+            .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{vid}/mqdefault.jpg"));
+        return Some(VideoItem {
+            id: vid.to_owned(),
+            title,
+            channel: default_channel.to_owned(),
+            channel_id: default_channel_id.map(str::to_owned),
+            channel_avatar_url: None,
+            views_text: views,
+            published_text: String::new(),
+            duration_text: "Short".to_owned(),
+            thumbnail_url: thumb,
+            is_live: false,
+            watched_percent: None,
+            resume_secs: None,
+            playlist_browse_id: None,
+            playlist_set_video_id: None,
+        });
+    }
+    if let Some(ri) = map.get("reelItemRenderer") {
+        let vid = ri["videoId"]
+            .as_str()
+            .or_else(|| ri["navigationEndpoint"]["reelWatchEndpoint"]["videoId"].as_str())?;
+        if vid.len() != 11 {
+            return None;
+        }
+        let title = text(&ri["headline"])
+            .or_else(|| {
+                ri["accessibility"]["accessibilityData"]["label"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "Short".to_owned());
+        let views = text(&ri["viewCountText"]).unwrap_or_default();
+        let thumb = pick_thumb(&ri["thumbnail"]["thumbnails"], vid);
+        return Some(VideoItem {
+            id: vid.to_owned(),
+            title,
+            channel: default_channel.to_owned(),
+            channel_id: default_channel_id.map(str::to_owned),
+            channel_avatar_url: None,
+            views_text: views,
+            published_text: String::new(),
+            duration_text: "Short".to_owned(),
+            thumbnail_url: thumb,
+            is_live: false,
+            watched_percent: None,
+            resume_secs: None,
+            playlist_browse_id: None,
+            playlist_set_video_id: None,
+        });
+    }
+    None
+}
+
+pub async fn shorts_feed(
+    http: &reqwest::Client,
+    cfg: &WebConfig,
+    session: Option<&Session>,
+) -> anyhow::Result<Vec<VideoItem>> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    // 1. Grab Shorts shelves from authenticated Home feed first when signed in
+    if session.is_some() {
+        if let Ok(home) = home_feed(http, None, None, cfg, session).await {
+            for it in home.items {
+                if it.duration_text == "Short" && seen.insert(it.id.clone()) {
+                    out.push(it);
+                }
+            }
+        }
+    }
+    // 2. Supplement via Shorts search / #shorts query so dedicated Shorts tab is always populated
+    if out.len() < 16 {
+        if let Ok(sp) = search(http, "#shorts", None, cfg, session).await {
+            for mut it in sp.items {
+                if seen.insert(it.id.clone()) {
+                    if it.duration_text.is_empty() {
+                        it.duration_text = "Short".to_owned();
+                    }
+                    if it.duration_text == "Short" || it.title.to_ascii_lowercase().contains("#short")
+                    {
+                        it.duration_text = "Short".to_owned();
+                        out.push(it);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(first_id) = out.first().map(|s| s.id.clone()) {
+        if let Ok(seq) = fetch_shorts_sequence(http, &first_id, cfg, session).await {
+            for it in seq {
+                if seen.insert(it.id.clone()) {
+                    out.push(it);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub async fn fetch_shorts_sequence(
+    http: &reqwest::Client,
+    seed_video_id: &str,
+    cfg: &WebConfig,
+    session: Option<&Session>,
+) -> anyhow::Result<Vec<VideoItem>> {
+    let v = post_web(
+        http,
+        "reel/reel_watch_sequence",
+        json!({ "seedVideoId": seed_video_id }),
+        cfg,
+        session,
+    )
+    .await?;
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    seen.insert(seed_video_id.to_owned());
+    if let Some(entries) = v["entries"].as_array() {
+        for e in entries {
+            let ep = &e["command"]["reelWatchEndpoint"];
+            let Some(vid) = ep["videoId"].as_str() else {
+                continue;
+            };
+            if vid.len() != 11 || !seen.insert(vid.to_owned()) {
+                continue;
+            }
+            let thumb = pick_thumb(&ep["thumbnail"]["thumbnails"], vid);
+            let title = text(&ep["overlay"]["reelPlayerOverlayRenderer"]["reelPlayerHeaderSupportedRenderers"]["reelPlayerHeaderRenderer"]["reelTitleText"])
+                .unwrap_or_else(|| format!("Short {vid}"));
+            let channel = text(&ep["overlay"]["reelPlayerOverlayRenderer"]["reelPlayerHeaderSupportedRenderers"]["reelPlayerHeaderRenderer"]["channelTitleText"])
+                .unwrap_or_default();
+            out.push(VideoItem {
+                id: vid.to_owned(),
+                title,
+                channel,
+                channel_id: None,
+                channel_avatar_url: None,
+                views_text: String::new(),
+                published_text: String::new(),
+                duration_text: "Short".to_owned(),
+                thumbnail_url: thumb,
+                is_live: false,
+                watched_percent: None,
+                resume_secs: None,
+                playlist_browse_id: None,
+                playlist_set_video_id: None,
+            });
+        }
+    }
+    Ok(out)
+}
+
 fn collect_videos(v: &Value, out: &mut Vec<VideoItem>, seen: &mut HashSet<String>) {
     match v {
         Value::Object(map) => {
@@ -4182,6 +4453,10 @@ fn collect_videos(v: &Value, out: &mut Vec<VideoItem>, seen: &mut HashSet<String
                     if seen.insert(item.id.clone()) {
                         out.push(item);
                     }
+                }
+            } else if let Some(item) = parse_shorts_entry(map, "", None) {
+                if seen.insert(item.id.clone()) {
+                    out.push(item);
                 }
             }
             for val in map.values() {
@@ -4965,6 +5240,9 @@ mod tests {
                             "multiPageMenuRenderer": {
                                 "sections": [{
                                     "multiPageMenuNotificationSectionRenderer": {
+                                        "notificationSectionHeaderRenderer": {
+                                            "title": { "simpleText": "Important" }
+                                        },
                                         "items": [{
                                             "notificationRenderer": {
                                                 "notificationId": "N1",
@@ -4978,6 +5256,15 @@ mod tests {
                                                     "serializedInteractionsRequest": "SEEN_TOK"
                                                 }
                                             }
+                                        },
+                                        {
+                                            "notificationRenderer": {
+                                                "notificationId": "N2",
+                                                "shortMessage": { "simpleText": "Creator uploaded Short: Quick Tip" },
+                                                "sentTimeText": { "simpleText": "10 minutes ago" },
+                                                "read": false,
+                                                "navigationEndpoint": { "reelWatchEndpoint": { "videoId": "shrt999" } }
+                                            }
                                         }]
                                     }
                                 }]
@@ -4990,9 +5277,11 @@ mod tests {
         let (items, unseen, seen_tok) = parse_notifications_menu(&menu);
         assert_eq!(unseen, 3);
         assert_eq!(seen_tok.as_deref(), Some("SEEN_TOK"));
-        assert_eq!(items.len(), 1);
+        assert_eq!(items.len(), 2);
         assert_eq!(items[0].video_id.as_deref(), Some("abc123"));
+        assert_eq!(items[0].section.as_deref(), Some("Important"));
         assert!(!items[0].read);
+        assert_eq!(items[1].video_id.as_deref(), Some("shrt999"));
         assert_eq!(
             items[0].channel_avatar_url.as_deref(),
             Some("https://yt3.ggpht.com/av.jpg")
@@ -5079,5 +5368,82 @@ mod tests {
         assert_eq!(chips[1].title, "Gaming");
         assert_eq!(chips[1].continuation.as_deref(), Some("CONT_GAMING"));
         assert_eq!(chips[2].params.as_deref(), Some("PAR_POD"));
+    }
+
+    #[test]
+    fn parses_engagement_toolbar_reply_params_and_shorts_items() {
+        let mut entity_map = std::collections::HashMap::new();
+        entity_map.insert(
+            "K2".to_owned(),
+            json!({
+                "properties": { "commentId": "C2", "publishedTime": "2h ago", "content": { "content": "Nice vid!" } },
+                "author": { "displayName": "Bob" },
+                "toolbar": { "likeCountNotliked": "5", "likeState": "TOOLBAR_LIKE_STATE_INDIFFERENT" }
+            }),
+        );
+        let mut surface_map = std::collections::HashMap::new();
+        surface_map.insert(
+            "TB2".to_owned(),
+            json!({
+                "replyCommand": {
+                    "innertubeCommand": {
+                        "createCommentReplyDialogEndpoint": {
+                            "dialog": {
+                                "commentReplyDialogRenderer": {
+                                    "replyButton": {
+                                        "buttonRenderer": {
+                                            "serviceEndpoint": {
+                                                "createCommentReplyEndpoint": {
+                                                    "createReplyParams": "REP_TOK_2"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }),
+        );
+        let entry = json!({
+            "commentThreadRenderer": {
+                "commentViewModel": {
+                    "commentViewModel": {
+                        "commentKey": "K2",
+                        "toolbarSurfaceKey": "TB2"
+                    }
+                }
+            }
+        });
+        let item = parse_comment_entry(&entry, &entity_map, &surface_map).unwrap();
+        assert_eq!(item.reply_params.as_deref(), Some("REP_TOK_2"));
+
+        let shelf = json!({
+            "items": [
+                {
+                    "shortsLockupViewModel": {
+                        "entityId": "shorts-shelf-item-abc12345678",
+                        "overlayMetadata": {
+                            "primaryText": { "content": "Quick Tip" },
+                            "secondaryText": { "content": "12K views" }
+                        }
+                    }
+                },
+                {
+                    "reelItemRenderer": {
+                        "videoId": "def12345678",
+                        "headline": { "simpleText": "Funny Clip" },
+                        "viewCountText": { "simpleText": "9K views" }
+                    }
+                }
+            ]
+        });
+        let mut videos = Vec::new();
+        let mut seen = HashSet::new();
+        collect_videos(&shelf, &mut videos, &mut seen);
+        assert_eq!(videos.len(), 2);
+        assert_eq!((videos[0].id.as_str(), videos[0].duration_text.as_str()), ("abc12345678", "Short"));
+        assert_eq!((videos[1].id.as_str(), videos[1].duration_text.as_str()), ("def12345678", "Short"));
     }
 }

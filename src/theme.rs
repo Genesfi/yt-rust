@@ -61,14 +61,26 @@ pub fn draw_icon_centered(
 /// Paints a network image without egui's oversized default spinner, showing a subtle
 /// YouTube-style skeleton shimmer while pending.
 pub fn paint_image_rounded(ui: &egui::Ui, url: &str, rect: egui::Rect, radius: u8) {
-    let img = egui::Image::new(url)
+    paint_image_with_fit(ui, url, rect, radius, false);
+}
+
+/// Center-crops (`cover` fit) and paints a rounded network image so portrait cards
+/// fill cleanly even when YouTube supplies 4:3 or 16:9 side-barred thumbnails.
+pub fn paint_image_cover_rounded(ui: &egui::Ui, url: &str, rect: egui::Rect, radius: u8) {
+    paint_image_with_fit(ui, url, rect, radius, true);
+}
+
+fn paint_image_with_fit(ui: &egui::Ui, url: &str, rect: egui::Rect, radius: u8, cover: bool) {
+    let probe = egui::Image::new(url)
         .show_loading_spinner(false)
         .corner_radius(CornerRadius::same(radius))
         .fit_to_exact_size(rect.size());
-    let ready = img
-        .load_for_size(ui.ctx(), rect.size())
-        .is_ok_and(|p| matches!(p, egui::load::TexturePoll::Ready { .. }));
-    if !ready {
+    let poll = probe.load_for_size(ui.ctx(), rect.size());
+    let tex_size = match &poll {
+        Ok(egui::load::TexturePoll::Ready { texture }) => Some(texture.size),
+        _ => None,
+    };
+    if tex_size.is_none() {
         let t = ui.input(|i| i.time) as f32;
         let pulse = 0.5 + 0.5 * (t * 3.2).sin();
         let shade = (32.0 + 11.0 * pulse).round() as u8;
@@ -79,6 +91,28 @@ pub fn paint_image_rounded(ui: &egui::Ui, url: &str, rect: egui::Rect, radius: u
         );
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(50));
+    }
+    let mut img = probe;
+    if cover {
+        if let Some(ts) = tex_size.filter(|s| s.x > 1.0 && s.y > 1.0) {
+            let src_aspect = ts.x / ts.y;
+            let dst_aspect = (rect.width() / rect.height().max(1.0)).max(0.05);
+            if src_aspect > dst_aspect * 1.02 {
+                let u_span = (dst_aspect / src_aspect).clamp(0.08, 1.0);
+                let u0 = (1.0 - u_span) * 0.5;
+                img = img.uv(egui::Rect::from_min_max(
+                    egui::pos2(u0, 0.0),
+                    egui::pos2(u0 + u_span, 1.0),
+                ));
+            } else if src_aspect < dst_aspect * 0.98 {
+                let v_span = (src_aspect / dst_aspect).clamp(0.08, 1.0);
+                let v0 = (1.0 - v_span) * 0.5;
+                img = img.uv(egui::Rect::from_min_max(
+                    egui::pos2(0.0, v0),
+                    egui::pos2(1.0, v0 + v_span),
+                ));
+            }
+        }
     }
     img.paint_at(ui, rect);
 }
@@ -319,6 +353,35 @@ pub fn draw_share_icon(painter: &egui::Painter, c: egui::Pos2, s: f32, color: Co
     painter.add(egui::Shape::convex_polygon(head, color, Stroke::NONE));
 }
 
+/// Crisp YouTube-style comment speech bubble centered at `c`.
+pub fn draw_comment_icon(painter: &egui::Painter, c: egui::Pos2, s: f32, color: Color32) {
+    let stroke = Stroke::new((s * 0.11).max(1.4), color);
+    let bubble = vec![
+        egui::pos2(c.x - s * 0.40, c.y - s * 0.34),
+        egui::pos2(c.x + s * 0.40, c.y - s * 0.34),
+        egui::pos2(c.x + s * 0.40, c.y + s * 0.18),
+        egui::pos2(c.x - s * 0.08, c.y + s * 0.18),
+        egui::pos2(c.x - s * 0.36, c.y + s * 0.40),
+        egui::pos2(c.x - s * 0.30, c.y + s * 0.18),
+        egui::pos2(c.x - s * 0.40, c.y + s * 0.18),
+    ];
+    painter.add(egui::Shape::closed_line(bubble, stroke));
+    painter.line_segment(
+        [
+            egui::pos2(c.x - s * 0.22, c.y - s * 0.14),
+            egui::pos2(c.x + s * 0.22, c.y - s * 0.14),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(c.x - s * 0.22, c.y + s * 0.01),
+            egui::pos2(c.x + s * 0.10, c.y + s * 0.01),
+        ],
+        stroke,
+    );
+}
+
 /// YouTube-style Next track (`|>|`) icon centered at `c`.
 pub fn draw_next_icon(painter: &egui::Painter, c: egui::Pos2, s: f32, color: Color32) {
     let tri = vec![
@@ -459,6 +522,23 @@ pub fn draw_fullscreen_icon(
             painter.line_segment([corner, egui::pos2(corner.x, corner.y - sy * arm)], stroke);
         }
     }
+}
+
+/// Crisp YouTube Shorts badge outline + inner play glyph centered at `c`.
+pub fn draw_shorts_icon(painter: &egui::Painter, c: egui::Pos2, s: f32, color: Color32) {
+    let r = egui::Rect::from_center_size(c, egui::vec2(s * 0.66, s * 0.88));
+    painter.rect_stroke(
+        r,
+        s * 0.16,
+        Stroke::new((s * 0.10).max(1.4), color),
+        egui::StrokeKind::Middle,
+    );
+    let tri = vec![
+        egui::pos2(c.x - s * 0.10, c.y - s * 0.16),
+        egui::pos2(c.x + s * 0.16, c.y),
+        egui::pos2(c.x - s * 0.10, c.y + s * 0.16),
+    ];
+    painter.add(egui::Shape::convex_polygon(tri, color, Stroke::NONE));
 }
 
 /// Generate a crisp 64x64 YouTube-rs RGBA icon for the window titlebar & Windows taskbar.

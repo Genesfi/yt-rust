@@ -37,6 +37,13 @@ pub struct VideoItem {
     pub playlist_set_video_id: Option<String>,
 }
 
+impl VideoItem {
+    /// Returns true if this item represents a vertical YouTube Short.
+    pub fn is_short(&self) -> bool {
+        self.duration_text.eq_ignore_ascii_case("Short")
+    }
+}
+
 /// Notification preference level for a subscribed channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum NotificationLevel {
@@ -86,6 +93,7 @@ impl ChannelNotificationParams {
 pub struct NotificationMenuItem {
     pub message: String,
     pub sent_time_text: String,
+    pub section: Option<String>,
     pub channel_avatar_url: Option<String>,
     pub video_thumbnail_url: Option<String>,
     pub video_id: Option<String>,
