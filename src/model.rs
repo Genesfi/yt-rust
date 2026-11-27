@@ -105,6 +105,7 @@ pub struct NotificationMenuItem {
     pub video_id: Option<String>,
     pub channel_id: Option<String>,
     pub read: bool,
+    pub is_live: bool,
 }
 
 /// Channel header info & available tabs returned on `Page::Channel`.

@@ -319,12 +319,26 @@ async fn probe_stream_ok(http: &reqwest::Client, url: &str, ua: Option<&str>) ->
     match http
         .get(&probe_url)
         .header("User-Agent", ua)
-        .timeout(Duration::from_secs(6))
+        .timeout(Duration::from_secs(4))
         .send()
         .await
     {
         Ok(resp) => resp.status().is_success(),
         Err(_) => true,
+    }
+}
+
+async fn probe_streams_ok(http: &reqwest::Client, streams: &YtdlpStreams) -> bool {
+    let ua = streams.user_agent.as_deref();
+    match streams.audio_url.as_deref() {
+        Some(a_url) => {
+            let (v_ok, a_ok) = tokio::join!(
+                probe_stream_ok(http, &streams.video_url, ua),
+                probe_stream_ok(http, a_url, ua),
+            );
+            v_ok && a_ok
+        }
+        None => probe_stream_ok(http, &streams.video_url, ua).await,
     }
 }
 
@@ -350,8 +364,8 @@ pub fn needs_potoken_retry(err: &str) -> bool {
 }
 
 /// Fallback stream resolution using yt-dlp when InnerTube direct URLs fail.
-/// Tries without account cookies first so normal public playback avoids sending cookies,
-/// and retries with `--cookies` only when YouTube requires authentication/age verification.
+/// When `prefer_cookies` is true (e.g. InnerTube already returned LOGIN_REQUIRED or PO tokens were
+/// minted), passes session cookies immediately to avoid wasting ~10s on an anonymous bot-checked attempt.
 pub async fn resolve_video(
     http: &reqwest::Client,
     data_dir: &Path,
@@ -359,32 +373,60 @@ pub async fn resolve_video(
     video_id: &str,
     max_height: u32,
     po_token: Option<&crate::potoken::PoTokens>,
+    visitor_data: Option<&str>,
+    prefer_cookies: bool,
 ) -> anyhow::Result<YtdlpStreams> {
-    let (bin_res, runtime) = tokio::join!(
-        ensure_ytdlp(http, data_dir),
-        resolve_js_runtime(http, data_dir),
-    );
-    let bin = bin_res?;
+    static CACHED_TOOLS: std::sync::Mutex<Option<(PathBuf, Option<String>)>> =
+        std::sync::Mutex::new(None);
+    let cached = {
+        let g = CACHED_TOOLS.lock().unwrap();
+        g.as_ref().filter(|(b, _)| b.is_file()).cloned()
+    };
+    let (bin, runtime) = match cached {
+        Some(pair) => pair,
+        None => {
+            let (bin_res, runtime) = tokio::join!(
+                ensure_ytdlp(http, data_dir),
+                resolve_js_runtime(http, data_dir),
+            );
+            let bin = bin_res?;
+            *CACHED_TOOLS.lock().unwrap() = Some((bin.clone(), runtime.clone()));
+            (bin, runtime)
+        }
+    };
     let cookie_owned = cookie.filter(|c| !c.trim().is_empty()).map(str::to_owned);
     let pot_owned = po_token.cloned();
+    let vd_owned = visitor_data
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_owned);
 
-    let mut used_cookie = false;
+    // Anonymous WebView PO tokens are bound to visitor_data; passing session cookies alongside
+    // an anonymous web.gvs token triggers YouTube 403s, so keep PO-token attempts cookieless first.
+    let use_cookie_first = prefer_cookies && cookie_owned.is_some();
+    let mut used_cookie = use_cookie_first;
     let first_res = {
         let bin = bin.clone();
         let rt = runtime.clone();
         let dir = data_dir.to_owned();
         let vid = video_id.to_owned();
+        let c_first = if use_cookie_first {
+            cookie_owned.clone()
+        } else {
+            None
+        };
         let pot = pot_owned.clone();
+        let vd = vd_owned.clone();
         tokio::task::spawn_blocking(move || {
             run_ytdlp(
                 &bin,
                 rt.as_deref(),
                 &dir,
-                None,
+                c_first.as_deref(),
                 &vid,
                 max_height,
                 false,
                 pot.as_ref(),
+                vd.as_deref(),
             )
         })
         .await?
@@ -394,7 +436,7 @@ pub async fn resolve_video(
         Ok(s) => s,
         Err(first_err) => {
             let msg = format!("{first_err:#}");
-            if is_auth_required_error(&msg) {
+            if !use_cookie_first && is_auth_required_error(&msg) {
                 if let Some(ref c) = cookie_owned {
                     used_cookie = true;
                     let bin = bin.clone();
@@ -403,6 +445,7 @@ pub async fn resolve_video(
                     let vid = video_id.to_owned();
                     let c = c.clone();
                     let pot = pot_owned.clone();
+                    let vd = vd_owned.clone();
                     tokio::task::spawn_blocking(move || {
                         run_ytdlp(
                             &bin,
@@ -413,6 +456,7 @@ pub async fn resolve_video(
                             max_height,
                             false,
                             pot.as_ref(),
+                            vd.as_deref(),
                         )
                     })
                     .await??
@@ -425,16 +469,19 @@ pub async fn resolve_video(
         }
     };
 
-    // YouTube c=WEB URLs resolved with cookies can return HTTP 403 on GVS without a browser PO-token.
-    // Probe the first 1 KB; if 403, re-resolve using web_safari/tv/android_vr HLS/non-PO-token clients.
-    if !probe_stream_ok(http, &streams.video_url, streams.user_agent.as_deref()).await {
+    if !probe_streams_ok(http, &streams).await {
         log::warn!(
-            "yt-dlp primary stream for {video_id} returned 403 on preflight; falling back to web_safari/tv clients"
+            "yt-dlp primary stream for {video_id} failed preflight (HTTP 403); falling back to web_safari/tv clients"
         );
         let data_dir_retry = data_dir.to_owned();
-        let cookie_retry = if used_cookie { cookie_owned } else { None };
+        let cookie_retry = if used_cookie {
+            cookie_owned
+        } else {
+            cookie_owned.filter(|_| !streams.video_url.contains("c=WEB"))
+        };
         let vid_retry = video_id.to_owned();
         let pot_retry = pot_owned.clone();
+        let vd_retry = vd_owned.clone();
         if let Ok(Ok(alt)) = tokio::task::spawn_blocking(move || {
             run_ytdlp(
                 &bin,
@@ -445,6 +492,7 @@ pub async fn resolve_video(
                 max_height,
                 true,
                 pot_retry.as_ref(),
+                vd_retry.as_deref(),
             )
         })
         .await
@@ -465,13 +513,16 @@ fn apply_js_runtime(cmd: &mut Command, runtime: Option<&str>) {
 fn invoke_ytdlp_json(
     bin: &Path,
     runtime: Option<&str>,
+    cache_dir: &Path,
     jar_path: Option<&Path>,
     video_id: &str,
     selector: &str,
     extra_args: &[&str],
 ) -> anyhow::Result<std::process::Output> {
+    let _ = std::fs::create_dir_all(cache_dir);
     let mut cmd = Command::new(bin);
-    cmd.args(["--no-warnings", "--no-playlist", "--no-cache-dir"]);
+    cmd.args(["--no-warnings", "--no-playlist", "--cache-dir"]);
+    cmd.arg(cache_dir);
     apply_js_runtime(&mut cmd, runtime);
     cmd.args(extra_args);
     cmd.args(["-f", selector, "-j"]);
@@ -489,6 +540,7 @@ fn invoke_ytdlp_json(
     Ok(cmd.output()?)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_ytdlp(
     bin: &Path,
     runtime: Option<&str>,
@@ -498,60 +550,75 @@ fn run_ytdlp(
     max_height: u32,
     prefer_alt_clients: bool,
     po_token: Option<&crate::potoken::PoTokens>,
+    visitor_data: Option<&str>,
 ) -> anyhow::Result<YtdlpStreams> {
     let _jar = cookie
         .map(|c| TempCookieJar::create(data_dir, c))
         .transpose()?;
     let jar_path = _jar.as_ref().map(|j| j.path.as_path());
+    let cache_dir = data_dir.join("ytdlp-cache");
     let selector = format!(
         "bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best"
     );
     let hls_sel = format!(
-        "bestvideo[height<={max_height}][protocol^=m3u8]+bestaudio/best[height<={max_height}][protocol^=m3u8]/bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best"
+        "bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/bestvideo[height<={max_height}][protocol^=m3u8]+bestaudio/best[height<={max_height}][protocol^=m3u8]/best"
     );
-    let pot_arg = po_token.map(|pot| {
-        format!(
-            "youtube:player_client=web,web_safari,tv;po_token=web.player+{},web.gvs+{}",
+    let pot_arg = (cookie.is_none()).then_some(po_token).flatten().map(|pot| {
+        let mut s = String::from("youtube:player_client=web");
+        if let Some(vd) = visitor_data.filter(|v| !v.is_empty()) {
+            s.push_str(";visitor_data=");
+            s.push_str(vd);
+        }
+        s.push_str(&format!(
+            ";po_token=web.player+{},web.gvs+{}",
             pot.player, pot.stream
-        )
+        ));
+        s
     });
     let mut out = if prefer_alt_clients {
-        let arg = pot_arg
-            .as_deref()
-            .unwrap_or("youtube:player_client=web_safari,tv,android_vr");
         invoke_ytdlp_json(
             bin,
             runtime,
+            &cache_dir,
             jar_path,
             video_id,
             &hls_sel,
-            &["--extractor-args", arg],
+            &["--extractor-args", "youtube:player_client=web_safari,tv,android_vr"],
         )?
     } else if let Some(ref arg) = pot_arg {
         invoke_ytdlp_json(
             bin,
             runtime,
+            &cache_dir,
             jar_path,
             video_id,
             &selector,
             &["--extractor-args", arg],
         )?
+    } else if cookie.is_some() {
+        invoke_ytdlp_json(
+            bin,
+            runtime,
+            &cache_dir,
+            jar_path,
+            video_id,
+            &hls_sel,
+            &["--extractor-args", "youtube:player_client=web_safari,tv"],
+        )?
     } else {
-        invoke_ytdlp_json(bin, runtime, jar_path, video_id, &selector, &[])?
+        invoke_ytdlp_json(bin, runtime, &cache_dir, jar_path, video_id, &selector, &[])?
     };
     if !out.status.success() && !prefer_alt_clients {
         let err = String::from_utf8_lossy(&out.stderr);
         if err.contains("Requested format is not available") {
-            let arg = pot_arg
-                .as_deref()
-                .unwrap_or("youtube:player_client=web_safari,tv,android_vr");
             out = invoke_ytdlp_json(
                 bin,
                 runtime,
+                &cache_dir,
                 jar_path,
                 video_id,
                 &hls_sel,
-                &["--extractor-args", arg],
+                &["--extractor-args", "youtube:player_client=web_safari,tv,android_vr"],
             )?;
         }
     }

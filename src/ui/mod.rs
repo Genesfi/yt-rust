@@ -52,6 +52,22 @@ pub(super) enum RightTab {
     LiveChat,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum NotifFilter {
+    #[default]
+    All,
+    Live,
+    Videos,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum HistoryFilter {
+    #[default]
+    All,
+    Videos,
+    Shorts,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum SubsFilter {
     All,
@@ -161,6 +177,7 @@ pub(super) struct PlayerSlot {
     pub muted: bool,
     pub speed: f64,
     pub selected_format_idx: Option<usize>,
+    pub shorts_upgrade_target: Option<(String, usize)>,
     pub selected_audio_idx: usize,
     pub selected_caption_idx: Option<usize>,
     pub used_ytdlp: bool,
@@ -214,6 +231,7 @@ impl PlayerSlot {
             muted: false,
             speed,
             selected_format_idx: None,
+            shorts_upgrade_target: None,
             selected_audio_idx: 0,
             selected_caption_idx: None,
             used_ytdlp: false,
@@ -270,6 +288,7 @@ impl PlayerSlot {
         self.sponsor_segments.clear();
         self.last_skipped_end = -1.0;
         self.seeking_pos = None;
+        self.shorts_upgrade_target = None;
         self.selected_audio_idx = 0;
         self.selected_caption_idx = None;
         self.player_menu = PlayerMenu::None;
@@ -431,6 +450,7 @@ pub struct YtApp {
     pub(super) watch_loading: bool,
     pub(super) watch: Option<WatchData>,
     pub(super) selected_format_idx: Option<usize>,
+    pub(super) shorts_upgrade_target: Option<(String, usize)>,
     pub(super) selected_audio_idx: usize,
     pub(super) selected_caption_idx: Option<usize>,
     pub(super) used_ytdlp: bool,
@@ -521,6 +541,8 @@ pub struct YtApp {
     pub(super) settings_tab: SettingsTab,
     pub(super) settings_query: String,
     pub(super) settings_search_in_group: bool,
+    pub(super) notif_filter: NotifFilter,
+    pub(super) history_filter: HistoryFilter,
     pub(super) sub_font_size: u32,
     pub(super) sub_bg_opacity: f32,
     pub(super) shortcuts: ShortcutConfig,
@@ -849,6 +871,7 @@ impl YtApp {
             watch_loading: false,
             watch: None,
             selected_format_idx: None,
+            shorts_upgrade_target: None,
             selected_audio_idx: 0,
             selected_caption_idx: None,
             used_ytdlp: false,
@@ -938,6 +961,8 @@ impl YtApp {
             settings_tab: SettingsTab::Account,
             settings_query: String::new(),
             settings_search_in_group: false,
+            notif_filter: NotifFilter::All,
+            history_filter: HistoryFilter::All,
             sub_font_size,
             sub_bg_opacity,
             shortcuts,
@@ -1368,6 +1393,10 @@ impl YtApp {
         std::mem::swap(&mut self.muted, &mut slot.muted);
         std::mem::swap(&mut self.speed, &mut slot.speed);
         std::mem::swap(&mut self.selected_format_idx, &mut slot.selected_format_idx);
+        std::mem::swap(
+            &mut self.shorts_upgrade_target,
+            &mut slot.shorts_upgrade_target,
+        );
         std::mem::swap(&mut self.selected_audio_idx, &mut slot.selected_audio_idx);
         std::mem::swap(
             &mut self.selected_caption_idx,
@@ -1613,6 +1642,30 @@ impl YtApp {
         }
     }
 
+    fn shorts_quality(&self) -> PreferredQuality {
+        match self.preferred_quality {
+            PreferredQuality::Best4K | PreferredQuality::P1440 | PreferredQuality::P1080 => {
+                PreferredQuality::P720
+            }
+            q => q,
+        }
+    }
+
+    fn trigger_shorts_prefetch(&self) {
+        if self.page != Page::Shorts || self.shorts_grid_view || self.shorts_queue.is_empty() {
+            return;
+        }
+        let quality = self.shorts_quality();
+        for offset in 1..=2 {
+            if let Some(next_item) = self.shorts_queue.get(self.shorts_idx + offset) {
+                let _ = self.backend.tx.send(Request::PrefetchShort {
+                    video_id: next_item.id.clone(),
+                    quality,
+                });
+            }
+        }
+    }
+
     pub(super) fn open_short(&mut self, item: VideoItem, list: Vec<VideoItem>) {
         if self.page != Page::Shorts {
             self.prev_page = self.page;
@@ -1646,7 +1699,7 @@ impl YtApp {
         self.shorts_slot.pending_resume = None;
         let _ = self.backend.tx.send(Request::Watch {
             video_id: item.id,
-            quality: self.preferred_quality,
+            quality: self.shorts_quality(),
             sync_history: self.sync_history,
         });
         if need_seq {
@@ -1750,10 +1803,37 @@ impl YtApp {
         }
         self.ingest_and_request_avatars(&mut data.related);
         self.watch_loading = false;
-        self.selected_format_idx = selected_format_idx;
         self.selected_audio_idx = 0;
         self.selected_caption_idx = None;
         self.used_ytdlp = used_ytdlp;
+        self.shorts_upgrade_target = None;
+
+        let is_hls_master = data.hls_url.as_deref() == Some(selected_video_url.as_str());
+        let mut initial_video_url = selected_video_url;
+        let mut initial_audio_url = selected_audio_url;
+        let mut initial_format_idx = selected_format_idx;
+        if is_shorts && !is_hls_master && !data.is_live {
+            if let Some(hd_idx) = selected_format_idx {
+                let hd_h = data.video_formats.get(hd_idx).map_or(0, |f| f.height);
+                if hd_h > 480 {
+                    if let Some(fast_idx) = pick_fast_short_format(&data.video_formats) {
+                        if fast_idx != hd_idx {
+                            let fast_fmt = &data.video_formats[fast_idx];
+                            initial_video_url =
+                                self.backend.proxy_url(&fast_fmt.url, fast_fmt.content_length);
+                            initial_audio_url = if fast_fmt.has_audio {
+                                None
+                            } else {
+                                self.selected_audio_stream(&data)
+                            };
+                            initial_format_idx = Some(fast_idx);
+                            self.shorts_upgrade_target = Some((data.id.clone(), hd_idx));
+                        }
+                    }
+                }
+            }
+        }
+        self.selected_format_idx = initial_format_idx;
 
         let start_at = if data.is_live || is_shorts {
             None
@@ -1793,16 +1873,16 @@ impl YtApp {
             res
         };
 
-        let is_hls_master = data.hls_url.as_deref() == Some(selected_video_url.as_str());
         self.playing_hls_master = is_hls_master;
         let target_fmt = if is_hls_master {
-            selected_format_idx.and_then(|i| data.video_formats.get(i))
+            initial_format_idx.and_then(|i| data.video_formats.get(i))
         } else {
             None
         };
         self.pending_hls_target_height = target_fmt.map(|f| f.height);
         let suppress_resume_toast = self.start_paused;
         if let Some(mpv) = &self.mpv {
+            mpv.set_cache_pause_wait(if is_shorts { 0.3 } else { 1.5 });
             mpv.set_hls_bitrate(target_fmt.map(|f| f.bitrate));
             let mpv_start = if data.is_live {
                 None
@@ -1810,8 +1890,8 @@ impl YtApp {
                 Some(start_at.unwrap_or(0.0))
             };
             mpv.load_stream(
-                &selected_video_url,
-                selected_audio_url.as_deref(),
+                &initial_video_url,
+                initial_audio_url.as_deref(),
                 mpv_start,
             );
             mpv.set_speed(self.speed);
@@ -1821,7 +1901,7 @@ impl YtApp {
             }
             self.start_paused = false;
         }
-        self.active_stream_urls = (selected_video_url, selected_audio_url);
+        self.active_stream_urls = (initial_video_url, initial_audio_url);
         self.watch_started_at = Some(Instant::now());
         if !suppress_resume_toast {
             if let Some(s) = start_at {
@@ -1880,6 +1960,9 @@ impl YtApp {
             }
         }
         self.watch = Some(*data);
+        if is_shorts {
+            self.trigger_shorts_prefetch();
+        }
     }
 
     pub(super) fn open_local_file(&mut self, path: &std::path::Path) {
@@ -1907,6 +1990,7 @@ impl YtApp {
         self.sponsor_segments.clear();
         self.last_skipped_end = -1.0;
         self.seeking_pos = None;
+        self.shorts_upgrade_target = None;
         self.selected_format_idx = None;
         self.selected_audio_idx = 0;
         self.selected_caption_idx = None;
@@ -1995,6 +2079,7 @@ impl YtApp {
         self.sponsor_segments.clear();
         self.last_skipped_end = -1.0;
         self.seeking_pos = None;
+        self.shorts_upgrade_target = None;
         self.selected_audio_idx = 0;
         self.selected_caption_idx = None;
         self.player_menu = PlayerMenu::None;
@@ -2087,6 +2172,11 @@ impl YtApp {
     }
 
     pub(super) fn switch_quality(&mut self, idx: usize) {
+        self.shorts_upgrade_target = None;
+        self.switch_quality_inner(idx, true);
+    }
+
+    fn switch_quality_inner(&mut self, idx: usize, notify_toast: bool) {
         let Some(w) = &self.watch else { return };
         let Some(fmt) = w.video_formats.get(idx) else { return };
         let label = fmt.label();
@@ -2111,7 +2201,9 @@ impl YtApp {
                     mpv.set_vid(Some(tr.id));
                     self.pending_hls_target_height = None;
                     self.selected_format_idx = Some(idx);
-                    self.toast(format!("Quality: {label}"));
+                    if notify_toast {
+                        self.toast(format!("Quality: {label}"));
+                    }
                     return;
                 }
                 if let Some(hls) = w.hls_url.as_deref() {
@@ -2120,7 +2212,9 @@ impl YtApp {
                     mpv.load_stream(hls, None, (!w.is_live).then_some(pos));
                     self.pending_hls_target_height = Some(target_h);
                     self.selected_format_idx = Some(idx);
-                    self.toast(format!("Quality: {label}"));
+                    if notify_toast {
+                        self.toast(format!("Quality: {label}"));
+                    }
                     return;
                 }
             }
@@ -2145,7 +2239,9 @@ impl YtApp {
         self.pending_hls_target_height = None;
         self.active_stream_urls = (video_url, audio);
         self.selected_format_idx = Some(idx);
-        self.toast(format!("Quality: {label}"));
+        if notify_toast {
+            self.toast(format!("Quality: {label}"));
+        }
     }
 
     pub(super) fn switch_quality_auto(&mut self) {
@@ -2780,6 +2876,7 @@ impl YtApp {
                                     self.shorts_queue.push(it);
                                 }
                             }
+                            self.trigger_shorts_prefetch();
                         }
                     }
                 }
@@ -2794,6 +2891,7 @@ impl YtApp {
                                 self.shorts_queue.push(it);
                             }
                         }
+                        self.trigger_shorts_prefetch();
                     }
                 }
                 Response::ChannelLoaded {
@@ -3429,16 +3527,23 @@ impl YtApp {
                     width,
                     height,
                     rgba,
+                    tiled_width,
+                    tiled_height,
+                    tiled_rgba,
                 } => {
                     if self.ambient_requested_key.as_deref() == Some(key.as_str()) {
-                        let img = egui::ColorImage::from_rgba_unmultiplied(
+                        let soft_img = egui::ColorImage::from_rgba_unmultiplied(
                             [width as usize, height as usize],
                             &rgba,
                         );
                         let soft = ctx.load_texture(
                             format!("ambient-soft-{key}"),
-                            img.clone(),
+                            soft_img,
                             egui::TextureOptions::LINEAR,
+                        );
+                        let tiled_img = egui::ColorImage::from_rgba_unmultiplied(
+                            [tiled_width as usize, tiled_height as usize],
+                            &tiled_rgba,
                         );
                         let tiled_opts = egui::TextureOptions {
                             magnification: egui::TextureFilter::Linear,
@@ -3448,7 +3553,7 @@ impl YtApp {
                         };
                         let tiled = ctx.load_texture(
                             format!("ambient-tiled-{key}"),
-                            img,
+                            tiled_img,
                             tiled_opts,
                         );
                         if let Some((_, old)) = self.ambient_tex_soft.take() {
@@ -4042,6 +4147,18 @@ impl YtApp {
                 }
             }
         }
+        if let Some((ref target_vid, hd_idx)) = self.shorts_upgrade_target {
+            if self.watch.as_ref().is_some_and(|w| w.id == *target_vid)
+                && self.playback.time_pos >= 1.2
+                && !self.playback.paused
+                && !self.playback.buffering
+                && self.playback.cache_duration >= 1.2
+            {
+                self.shorts_upgrade_target = None;
+                self.switch_quality_inner(hd_idx, false);
+                return;
+            }
+        }
         let is_live = self.watch.as_ref().is_some_and(|w| w.is_live);
         let is_remote_watch = self
             .watch
@@ -4066,7 +4183,7 @@ impl YtApp {
             && self.playback.video_h == 0
             && self
                 .watch_started_at
-                .is_some_and(|t| t.elapsed() >= Duration::from_secs(2));
+                .is_some_and(|t| t.elapsed() >= Duration::from_secs(6));
         let mid_eof_drop = !is_live
             && self.playback.eof
             && !was_eof
@@ -4437,19 +4554,18 @@ impl YtApp {
                 }
                 AmbientMode::TiledBlur => {
                     if let Some((_, tex)) = &self.ambient_tex_tiled {
-                        let tile_px = 220.0_f32;
+                        let tile_px = 560.0_f32;
+                        let u_span = (screen.width() / tile_px).max(1.0);
+                        let v_span = (screen.height() / tile_px).max(1.0);
                         let tiled_uv = egui::Rect::from_min_max(
                             egui::pos2(0.0, 0.0),
-                            egui::pos2(
-                                (screen.width() / tile_px).max(1.0),
-                                (screen.height() / tile_px).max(1.0),
-                            ),
+                            egui::pos2(u_span, v_span),
                         );
                         painter.image(
                             tex.id(),
                             screen,
                             tiled_uv,
-                            Color32::WHITE.gamma_multiply(strength * 0.85 * fade),
+                            Color32::WHITE.gamma_multiply(strength * 0.92 * fade),
                         );
                     }
                 }
@@ -4724,13 +4840,13 @@ impl eframe::App for YtApp {
                             let items = self.remote_history.clone();
                             let loading = self.remote_history_loading;
                             let cont = self.remote_history_continuation.clone();
-                            if let Some(act) = cards::draw_video_grid_opts(
+                            if let Some(act) = cards::draw_history_feed(
                                 ui,
                                 "Watch History (Synced with YouTube)",
                                 &items,
+                                &mut self.history_filter,
                                 loading,
                                 cont.is_some(),
-                                true,
                             ) {
                                 self.handle_grid_action(&ctx, act, |app| {
                                     app.remote_history_loading = true;
@@ -4741,13 +4857,13 @@ impl eframe::App for YtApp {
                             }
                         } else {
                             let items = self.history.clone();
-                            if let Some(act) = cards::draw_video_grid_opts(
+                            if let Some(act) = cards::draw_history_feed(
                                 ui,
                                 "Watch History (Local)",
                                 &items,
+                                &mut self.history_filter,
                                 false,
                                 false,
-                                true,
                             ) {
                                 self.handle_grid_action(&ctx, act, |_| {});
                             }
@@ -4946,9 +5062,27 @@ pub(super) fn parse_sleep_timer_input(raw: &str) -> Option<Duration> {
     (secs >= 10).then(|| Duration::from_secs(secs.min(24 * 3600)))
 }
 
+fn pick_fast_short_format(formats: &[crate::model::VideoFormat]) -> Option<usize> {
+    formats
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.height > 0 && f.height <= 480 && !f.url.is_empty())
+        .max_by_key(|(_, f)| {
+            (
+                f.height >= 360,
+                f.has_audio,
+                f.mime.contains("avc1"),
+                f.height,
+                std::cmp::Reverse(f.bitrate),
+            )
+        })
+        .map(|(i, _)| i)
+}
+
 #[cfg(test)]
 mod ui_tests {
-    use super::{parse_sleep_timer_input, shuffle_vec};
+    use super::{parse_sleep_timer_input, pick_fast_short_format, shuffle_vec};
+    use crate::model::VideoFormat;
     use std::time::Duration;
 
     #[test]
@@ -4970,5 +5104,29 @@ mod ui_tests {
         assert_eq!(parse_sleep_timer_input("45 menit"), Some(Duration::from_secs(2700)));
         assert_eq!(parse_sleep_timer_input("0"), None);
         assert_eq!(parse_sleep_timer_input("abc"), None);
+    }
+
+    #[test]
+    fn picks_fast_low_format_for_cold_shorts() {
+        let fmt = |height: u32, mime: &str, has_audio: bool, bitrate: u64| VideoFormat {
+            itag: 0,
+            url: "https://example.com/v".into(),
+            mime: mime.into(),
+            width: height,
+            height,
+            fps: 30,
+            bitrate,
+            content_length: 0,
+            has_audio,
+        };
+        let formats = [
+            fmt(720, "video/mp4; codecs=\"avc1\"", false, 1_500_000),
+            fmt(480, "video/mp4; codecs=\"avc1\"", false, 700_000),
+            fmt(360, "video/mp4; codecs=\"avc1\"", true, 450_000),
+        ];
+        // Prefers the 360p muxed stream for instant single-connection startup.
+        assert_eq!(pick_fast_short_format(&formats), Some(2));
+        // Without a muxed stream, falls back to 480p H.264.
+        assert_eq!(pick_fast_short_format(&formats[..2]), Some(1));
     }
 }

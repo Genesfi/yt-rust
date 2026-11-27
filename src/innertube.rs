@@ -14,7 +14,7 @@ use crate::model::{
 const ORIGIN: &str = "https://www.youtube.com";
 pub const WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 const FALLBACK_WEB_VERSION: &str = "2.20261001.00.00";
-const VISIONOS_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+pub const VISIONOS_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
 const CONSENT_COOKIE: &str = "SOCS=CAISAiAD";
 
 #[derive(Clone, Debug)]
@@ -2344,6 +2344,7 @@ pub fn parse_notifications_menu(v: &Value) -> (Vec<NotificationMenuItem>, u32, O
                     .map(|s| !s.contains("UNREAD"))
             })
             .unwrap_or(true);
+        let is_live = infer_notification_is_live(&message, &sent_time_text, nr.get("videoThumbnail"));
         if !message.is_empty() {
             let dedup_key = nr
                 .get("notificationId")
@@ -2367,6 +2368,7 @@ pub fn parse_notifications_menu(v: &Value) -> (Vec<NotificationMenuItem>, u32, O
                     video_id,
                     channel_id,
                     read,
+                    is_live,
                 });
             }
         }
@@ -2443,6 +2445,7 @@ pub fn parse_notifications_menu(v: &Value) -> (Vec<NotificationMenuItem>, u32, O
                     message
                 )
             });
+        let is_live = infer_notification_is_live(&message, &sent_time_text, vm.get("videoThumbnail"));
         if seen_keys.insert(dedup_key) {
             items.push(NotificationMenuItem {
                 message,
@@ -2453,8 +2456,32 @@ pub fn parse_notifications_menu(v: &Value) -> (Vec<NotificationMenuItem>, u32, O
                 video_id,
                 channel_id,
                 read,
+                is_live,
             });
         }
+    }
+
+    fn infer_notification_is_live(msg: &str, time_txt: &str, thumb: Option<&Value>) -> bool {
+        let m = msg.to_ascii_lowercase();
+        let t = time_txt.to_ascii_lowercase();
+        if m.contains(" is live")
+            || m.contains("live now")
+            || m.contains("sedang live")
+            || m.contains("started a live stream")
+            || m.contains("🔴")
+            || t.contains("live now")
+            || t.contains("watching")
+            || t.contains("menonton")
+        {
+            return true;
+        }
+        if let Some(th) = thumb {
+            let s = th.to_string().to_ascii_lowercase();
+            if s.contains("\"live\"") || s.contains("\"badge_style_live\"") {
+                return true;
+            }
+        }
+        false
     }
 
     fn walk_notifications(
@@ -2933,6 +2960,7 @@ pub fn build_subscription_notifications(
             video_id: Some(it.id.clone()),
             channel_id: it.channel_id.clone(),
             read,
+            is_live: it.is_live,
         });
     }
     (out, unseen)
@@ -3520,15 +3548,18 @@ pub async fn fetch_account_info(
     Some((name, avatar))
 }
 
-pub async fn fetch_next_watch_fallback(
+pub async fn fetch_next_json(
     http: &reqwest::Client,
     video_id: &str,
     cfg: &WebConfig,
     session: Option<&Session>,
-) -> Option<WatchData> {
-    let next = post_web(http, "next", json!({ "videoId": video_id }), cfg, session)
+) -> Option<Value> {
+    post_web(http, "next", json!({ "videoId": video_id }), cfg, session)
         .await
-        .ok()?;
+        .ok()
+}
+
+pub fn watch_data_from_next(video_id: &str, next: &Value) -> Option<WatchData> {
     let contents = next["contents"]["twoColumnWatchNextResults"]["results"]["results"]["contents"]
         .as_array()?;
     let title = contents
@@ -3621,7 +3652,47 @@ pub async fn watch(
 
     let player = player_res?;
     let next = next_res.ok();
+    Ok(build_watch_data(video_id, player, next))
+}
 
+#[allow(clippy::too_many_arguments)]
+pub async fn watch_web_solved(
+    http: &reqwest::Client,
+    video_id: &str,
+    cfg: &WebConfig,
+    session: Option<&Session>,
+    jsc: &crate::jsc::Solver,
+    visitor_data: &str,
+    po_tokens: Option<&crate::potoken::PoTokens>,
+    next: Option<Value>,
+    use_cookies: bool,
+) -> anyhow::Result<WatchData> {
+    let js_player = jsc.player(http).await?;
+    let mut player = player_web_with_pot(
+        http,
+        video_id,
+        cfg,
+        session.filter(|_| use_cookies),
+        visitor_data,
+        js_player.sts,
+        po_tokens.map(|p| p.player.as_str()),
+    )
+    .await?;
+    jsc.solve_streaming_data(
+        &js_player,
+        &mut player["streamingData"],
+        po_tokens.map(|p| p.stream.as_str()),
+    )
+    .await?;
+    let data = build_watch_data(video_id, player, next);
+    anyhow::ensure!(
+        !data.video_formats.is_empty() || data.hls_url.is_some(),
+        "WEB player returned no playable video formats"
+    );
+    Ok(data)
+}
+
+fn build_watch_data(video_id: &str, player: Value, next: Option<Value>) -> WatchData {
     let vd = &player["videoDetails"];
     let title = vd["title"]
         .as_str()
@@ -3771,7 +3842,7 @@ pub async fn watch(
         .or_else(|| as_secs_f64(&player["playerConfig"]["playbackStartConfig"]["startSeconds"]))
         .filter(|&s| s > 2.0);
 
-    Ok(WatchData {
+    WatchData {
         id: video_id.to_owned(),
         title,
         channel,
@@ -3802,7 +3873,7 @@ pub async fn watch(
         is_live,
         is_members_only,
         resume_secs,
-    })
+    }
 }
 
 pub async fn fetch_hls_variants(
@@ -4227,55 +4298,35 @@ async fn fetch_player(
     http: &reqwest::Client,
     video_id: &str,
     cfg: &WebConfig,
-    session: Option<&Session>,
+    _session: Option<&Session>,
 ) -> anyhow::Result<Value> {
     let visitor_data = cfg.visitor_data.as_deref();
     let mut last_err: Option<anyhow::Error> = None;
     let mut playable_fallback: Option<Value> = None;
     let mut non_playable: Option<Value> = None;
-    let mut tried_auth = false;
 
-    match player_visionos(http, video_id, visitor_data).await {
-        Ok(v) if is_preferred_player_response(&v) => return Ok(v),
-        Ok(v) if has_playable_url(&v) => playable_fallback = Some(v),
-        Ok(v) => non_playable = Some(v),
-        Err(e) => {
-            if is_login_or_age_error(&e) {
-                if let Some(sess) = session {
-                    tried_auth = true;
-                    if let Some(v) = try_authenticated_players(http, video_id, cfg, sess).await {
-                        return Ok(v);
-                    }
+    // Run both fast direct clients concurrently (~0.3s total instead of sequential timeouts).
+    let (vis_res, avr_res) = tokio::join!(
+        player_visionos(http, video_id, visitor_data),
+        player_android_vr(http, video_id, visitor_data),
+    );
+
+    for res in [vis_res, avr_res] {
+        match res {
+            Ok(v) if is_preferred_player_response(&v) => return Ok(v),
+            Ok(v) if has_playable_url(&v) => {
+                if playable_fallback.is_none() {
+                    playable_fallback = Some(v);
                 }
             }
-            last_err = Some(e);
-        }
-    }
-
-    match player_android_vr(http, video_id, visitor_data).await {
-        Ok(vr) if is_preferred_player_response(&vr) => return Ok(vr),
-        Ok(vr) if has_playable_url(&vr) => {
-            if playable_fallback.is_none() {
-                playable_fallback = Some(vr);
+            Ok(v) => {
+                if non_playable.is_none() {
+                    non_playable = Some(v);
+                }
             }
-        }
-        Ok(vr) => {
-            if non_playable.is_none() {
-                non_playable = Some(vr);
-            }
-        }
-        Err(e) => {
-            if last_err.is_none() {
-                last_err = Some(e);
-            }
-        }
-    }
-
-    if !tried_auth {
-        if let Some(sess) = session {
-            if let Some(v) = try_authenticated_players(http, video_id, cfg, sess).await {
-                if is_preferred_player_response(&v) || playable_fallback.is_none() {
-                    return Ok(v);
+            Err(e) => {
+                if last_err.is_none() || is_login_or_age_error(&e) {
+                    last_err = Some(e);
                 }
             }
         }
@@ -4287,102 +4338,63 @@ async fn fetch_player(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("All InnerTube player clients failed")))
 }
 
-async fn try_authenticated_players(
+async fn player_web_with_pot(
     http: &reqwest::Client,
     video_id: &str,
     cfg: &WebConfig,
-    session: &Session,
-) -> Option<Value> {
-    if let Ok(v) = player_tv(http, video_id, cfg.visitor_data.as_deref(), session).await {
-        if has_playable_url(&v) {
-            return Some(v);
-        }
-    }
-    if let Ok(v) = player_web_signed_in(http, video_id, cfg, session).await {
-        if has_playable_url(&v) {
-            return Some(v);
-        }
-    }
-    None
-}
-
-async fn player_tv(
-    http: &reqwest::Client,
-    video_id: &str,
-    visitor_data: Option<&str>,
-    session: &Session,
+    session: Option<&Session>,
+    visitor_data: &str,
+    sts: u32,
+    po_player: Option<&str>,
 ) -> anyhow::Result<Value> {
-    const TV_VERSION: &str = "7.20250923.13.00";
-    const TV_UA: &str = "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version";
-    let mut client = json!({
-        "clientName": "TVHTML5",
-        "clientVersion": TV_VERSION,
-        "userAgent": TV_UA,
-        "hl": "en",
-        "gl": "US",
-    });
-    if let Some(vd) = visitor_data.filter(|v| !v.is_empty()) {
-        client["visitorData"] = json!(vd);
-    }
-    let body = json!({
-        "context": { "client": client },
-        "videoId": video_id,
-        "contentCheckOk": true,
-        "racyCheckOk": true,
-    });
-    let mut req = http
-        .post("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
-        .header("User-Agent", TV_UA)
-        .header("X-YouTube-Client-Name", "7")
-        .header("X-YouTube-Client-Version", TV_VERSION)
-        .header("Origin", ORIGIN)
-        .header("Referer", format!("{ORIGIN}/tv"))
-        .timeout(Duration::from_secs(10))
-        .json(&body);
-    if let Some(vd) = visitor_data.filter(|v| !v.is_empty()) {
-        req = req.header("X-Goog-Visitor-Id", vd);
-    }
-    req = session.sign(req, ORIGIN);
-    let resp: Value = req.send().await?.error_for_status()?.json().await?;
-    check_playability(&resp)?;
-    Ok(resp)
-}
-
-async fn player_web_signed_in(
-    http: &reqwest::Client,
-    video_id: &str,
-    cfg: &WebConfig,
-    session: &Session,
-) -> anyhow::Result<Value> {
+    let gl = if cfg.gl.is_empty() { "US" } else { cfg.gl.as_str() };
     let mut client = json!({
         "clientName": "WEB",
         "clientVersion": cfg.client_version,
+        "platform": "DESKTOP",
         "userAgent": WEB_UA,
         "hl": "en",
-        "gl": "US",
+        "gl": gl,
+        "mainAppWebInfo": {
+            "graftUrl": format!("/watch?v={video_id}"),
+        },
     });
-    if let Some(vd) = cfg.visitor_data.as_deref().filter(|v| !v.is_empty()) {
-        client["visitorData"] = json!(vd);
+    if !visitor_data.is_empty() {
+        client["visitorData"] = json!(visitor_data);
     }
-    let body = json!({
+    let mut body = json!({
         "context": { "client": client },
         "videoId": video_id,
+        "playbackContext": {
+            "contentPlaybackContext": {
+                "html5Preference": "HTML5_PREF_WANTS",
+                "signatureTimestamp": sts,
+            }
+        },
         "contentCheckOk": true,
         "racyCheckOk": true,
     });
+    if let Some(pot) = po_player.filter(|p| !p.is_empty()) {
+        body["serviceIntegrityDimensions"] = json!({ "poToken": pot });
+    }
     let mut req = http
         .post("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
         .header("User-Agent", WEB_UA)
         .header("X-YouTube-Client-Name", "1")
         .header("X-YouTube-Client-Version", &cfg.client_version)
         .header("Origin", ORIGIN)
+        .header("X-Origin", ORIGIN)
         .header("Referer", format!("{ORIGIN}/watch?v={video_id}"))
         .timeout(Duration::from_secs(10))
         .json(&body);
-    if let Some(vd) = cfg.visitor_data.as_deref().filter(|v| !v.is_empty()) {
-        req = req.header("X-Goog-Visitor-Id", vd);
+    if !visitor_data.is_empty() {
+        req = req.header("X-Goog-Visitor-Id", visitor_data);
     }
-    req = session.sign(req, ORIGIN);
+    if let Some(s) = session {
+        req = s.sign(req, ORIGIN);
+    } else {
+        req = req.header("Cookie", CONSENT_COOKIE);
+    }
     let resp: Value = req.send().await?.error_for_status()?.json().await?;
     check_playability(&resp)?;
     Ok(resp)

@@ -4,6 +4,7 @@ mod auth;
 mod backend;
 mod images;
 mod innertube;
+mod jsc;
 mod login;
 mod model;
 mod mpv;

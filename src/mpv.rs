@@ -550,6 +550,10 @@ impl MpvPlayer {
         self.set_property_str("hwdec", mode.mpv_value());
     }
 
+    pub fn set_cache_pause_wait(&self, secs: f64) {
+        self.set_property_str("cache-pause-wait", &format!("{secs:.2}"));
+    }
+
     pub fn poll_state(&self) -> PlaybackState {
         // Drain libmpv's event queue so internal buffers never stall
         unsafe {

@@ -7,10 +7,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
-const FIRST_BLOCK: u64 = 256 * 1024;
-const BLOCK_SIZE: u64 = 1024 * 1024;
+const FIRST_BLOCK: u64 = 64 * 1024;
+const BLOCK_SIZE: u64 = 512 * 1024;
 const WORKERS: usize = 4;
-const PREFETCH_AHEAD: usize = 14;
+const PREFETCH_AHEAD: usize = 16;
 const KEEP_BEHIND: usize = 2;
 const VISIONOS_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
 const WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
@@ -36,6 +36,7 @@ struct StreamSession {
     blocks: Mutex<HashMap<usize, Vec<u8>>>,
     in_flight: Mutex<HashMap<usize, bool>>,
     want_block: AtomicUsize,
+    head_limit: AtomicUsize,
     active_readers: AtomicUsize,
     cancelled: AtomicBool,
     failed: AtomicBool,
@@ -44,7 +45,7 @@ struct StreamSession {
 }
 
 impl StreamSession {
-    fn new(url: String, user_agent: String, size: u64) -> Self {
+    fn new(url: String, user_agent: String, size: u64, head_limit: usize) -> Self {
         let num_blocks = block_count(size);
         Self {
             url,
@@ -54,6 +55,7 @@ impl StreamSession {
             blocks: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
             want_block: AtomicUsize::new(0),
+            head_limit: AtomicUsize::new(head_limit),
             active_readers: AtomicUsize::new(0),
             cancelled: AtomicBool::new(false),
             failed: AtomicBool::new(false),
@@ -72,7 +74,8 @@ impl StreamSession {
             return None;
         }
         let want = self.want_block.load(Ordering::Acquire).min(self.num_blocks.saturating_sub(1));
-        let end = (want + PREFETCH_AHEAD).min(self.num_blocks);
+        let cap = self.head_limit.load(Ordering::Acquire);
+        let end = (want + PREFETCH_AHEAD).min(cap).min(self.num_blocks);
 
         let blocks = self.blocks.lock().unwrap();
         let mut flight = self.in_flight.lock().unwrap();
@@ -175,6 +178,22 @@ impl StreamProxy {
     }
 
     pub fn register_with_ua(&self, url: &str, size: u64, user_agent: &str) -> String {
+        self.register_inner(url, size, user_agent, usize::MAX)
+    }
+
+    /// Registers a stream for background head-only prefetch (first 2 blocks = ~576 KB)
+    /// until a player actually opens the local proxy URL.
+    pub fn register_prefetch_with_ua(&self, url: &str, size: u64, user_agent: &str) -> String {
+        self.register_inner(url, size, user_agent, 2)
+    }
+
+    fn register_inner(
+        &self,
+        url: &str,
+        size: u64,
+        user_agent: &str,
+        head_limit: usize,
+    ) -> String {
         if size == 0 || url.contains(".m3u8") || url.contains("/manifest/hls") || url.contains("range=") {
             return url.to_owned();
         }
@@ -183,13 +202,13 @@ impl StreamProxy {
         } else {
             user_agent.to_owned()
         };
-        let session = Arc::new(StreamSession::new(url.to_owned(), ua, size));
+        let session = Arc::new(StreamSession::new(url.to_owned(), ua, size, head_limit));
         let id = {
             let mut st = self.state.lock().unwrap();
             let id = st.next_id;
             st.next_id += 1;
-            // Keep only the 4 most recent streams (e.g. current video+audio + brief overlap)
-            if st.sessions.len() >= 4 {
+            // Retain active watch + active short + prefetched upcoming shorts
+            if st.sessions.len() >= 10 {
                 if let Some(&oldest) = st.sessions.keys().min() {
                     if let Some(old) = st.sessions.remove(&oldest) {
                         old.cancel();
@@ -200,7 +219,8 @@ impl StreamProxy {
             id
         };
 
-        for _ in 0..WORKERS {
+        let workers = if head_limit <= 2 { 2 } else { WORKERS };
+        for _ in 0..workers {
             let http = self.http.clone();
             let sess = session.clone();
             self.handle.spawn(async move {
@@ -242,6 +262,16 @@ impl StreamProxy {
             .sessions
             .get(&id)
             .is_some_and(|s| s.failed.load(Ordering::Acquire))
+    }
+
+    pub fn session_user_agent(&self, url: &str) -> Option<String> {
+        let id = self.session_id_from_url(url)?;
+        self.state
+            .lock()
+            .unwrap()
+            .sessions
+            .get(&id)
+            .map(|s| s.user_agent.clone())
     }
 }
 
@@ -410,6 +440,9 @@ async fn handle_conn(
         return Ok(());
     }
 
+    if sess.head_limit.swap(usize::MAX, Ordering::AcqRel) != usize::MAX {
+        sess.notify.notify_waiters();
+    }
     let mut headers_sent = false;
     let mut pos = start;
     while pos <= end {

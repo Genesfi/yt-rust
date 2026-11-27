@@ -10,7 +10,7 @@ use crate::innertube;
 use crate::theme::{self, icon};
 
 use super::cards::{draw_avatar, draw_thumbnail, icon_circle_button};
-use super::{Page, YtApp};
+use super::{NotifFilter, Page, YtApp};
 
 impl YtApp {
     pub(super) fn draw_top_bar(&mut self, ui: &mut egui::Ui) {
@@ -544,43 +544,46 @@ impl YtApp {
                     .inner_margin(Margin::symmetric(0, 10))
                     .show(ui, |ui| {
                         ui.set_width(popup_w);
-                        ui.horizontal(|ui| {
-                            ui.add_space(16.0);
-                            ui.label(
-                                RichText::new("Notifications")
-                                    .font(theme::semibold(15.0))
-                                    .color(theme::TEXT),
-                            );
-                            if self.notifications_loading && !self.notifications.is_empty() {
-                                ui.add_space(6.0);
-                                ui.add(egui::Spinner::new().size(13.0));
+                        let (hdr_rect, _) =
+                            ui.allocate_exact_size(Vec2::new(popup_w, 32.0), Sense::hover());
+                        let mut hdr_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(hdr_rect.shrink2(Vec2::new(14.0, 0.0)))
+                                .layout(Layout::left_to_right(Align::Center)),
+                        );
+                        hdr_ui.label(
+                            RichText::new("Notifications")
+                                .font(theme::semibold(15.0))
+                                .color(theme::TEXT),
+                        );
+                        if self.notifications_loading && !self.notifications.is_empty() {
+                            hdr_ui.add_space(6.0);
+                            hdr_ui.add(egui::Spinner::new().size(13.0));
+                        }
+                        hdr_ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if icon_circle_button(ui, icon::X, 14.0, "Close") {
+                                self.notifications_open = false;
                             }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.add_space(10.0);
-                                if icon_circle_button(ui, icon::X, 14.0, "Close") {
-                                    self.notifications_open = false;
-                                }
-                                if ui
-                                    .add_enabled(
-                                        !self.notifications_loading,
-                                        egui::Button::new(
-                                            RichText::new(if self.notifications_loading {
-                                                "Syncing..."
-                                            } else {
-                                                "Refresh"
-                                            })
-                                            .font(theme::medium(12.0))
-                                            .color(theme::YT_BLUE),
-                                        )
-                                        .fill(Color32::TRANSPARENT)
-                                        .corner_radius(14),
+                            if ui
+                                .add_enabled(
+                                    !self.notifications_loading,
+                                    egui::Button::new(
+                                        RichText::new(if self.notifications_loading {
+                                            "Syncing..."
+                                        } else {
+                                            "Refresh"
+                                        })
+                                        .font(theme::medium(12.0))
+                                        .color(theme::YT_BLUE),
                                     )
-                                    .clicked()
-                                {
-                                    self.notifications_loading = true;
-                                    let _ = self.backend.tx.send(Request::LoadNotifications);
-                                }
-                            });
+                                    .fill(Color32::TRANSPARENT)
+                                    .corner_radius(14),
+                                )
+                                .clicked()
+                            {
+                                self.notifications_loading = true;
+                                let _ = self.backend.tx.send(Request::LoadNotifications);
+                            }
                         });
                         ui.add_space(6.0);
                         ui.painter().line_segment(
@@ -590,7 +593,61 @@ impl YtApp {
                             ],
                             Stroke::new(1.0, theme::BORDER),
                         );
-                        ui.add_space(4.0);
+                        ui.add_space(6.0);
+
+                        if !self.notifications.is_empty() {
+                            let n_all = self.notifications.len();
+                            let n_live = self.notifications.iter().filter(|n| n.is_live).count();
+                            let n_vid = n_all.saturating_sub(n_live);
+                            ui.horizontal(|ui| {
+                                ui.add_space(14.0);
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                for (opt, lbl) in [
+                                    (NotifFilter::All, format!("All ({n_all})")),
+                                    (NotifFilter::Live, format!("Live ({n_live})")),
+                                    (NotifFilter::Videos, format!("Videos ({n_vid})")),
+                                ] {
+                                    let active = self.notif_filter == opt;
+                                    let fill = if active {
+                                        Color32::from_rgb(241, 241, 241)
+                                    } else {
+                                        theme::CHIP
+                                    };
+                                    let text_col = if active {
+                                        Color32::from_rgb(15, 15, 15)
+                                    } else {
+                                        theme::TEXT
+                                    };
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new(lbl)
+                                                    .font(theme::medium(12.0))
+                                                    .color(text_col),
+                                            )
+                                            .fill(fill)
+                                            .corner_radius(14)
+                                            .min_size(Vec2::new(48.0, 24.0)),
+                                        )
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .clicked()
+                                    {
+                                        self.notif_filter = opt;
+                                    }
+                                }
+                            });
+                            ui.add_space(6.0);
+                        }
+
+                        let filtered_count = self
+                            .notifications
+                            .iter()
+                            .filter(|n| match self.notif_filter {
+                                NotifFilter::All => true,
+                                NotifFilter::Live => n.is_live,
+                                NotifFilter::Videos => !n.is_live,
+                            })
+                            .count();
 
                         if self.notifications_loading && self.notifications.is_empty() {
                             ui.add_space(28.0);
@@ -622,6 +679,20 @@ impl YtApp {
                                 );
                             });
                             ui.add_space(28.0);
+                        } else if filtered_count == 0 {
+                            ui.add_space(24.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    RichText::new(match self.notif_filter {
+                                        NotifFilter::Live => "No live streams right now.",
+                                        NotifFilter::Videos => "No regular video notifications.",
+                                        NotifFilter::All => "No notifications.",
+                                    })
+                                    .font(theme::regular(13.0))
+                                    .color(theme::TEXT_DIM),
+                                );
+                            });
+                            ui.add_space(24.0);
                         } else {
                             let max_h = (screen.height() - 120.0).clamp(240.0, 520.0);
                             egui::ScrollArea::vertical()
@@ -631,6 +702,14 @@ impl YtApp {
                                 .show(ui, |ui| {
                                     let mut last_section: Option<&str> = None;
                                     for (idx, item) in self.notifications.iter().enumerate() {
+                                        let matches = match self.notif_filter {
+                                            NotifFilter::All => true,
+                                            NotifFilter::Live => item.is_live,
+                                            NotifFilter::Videos => !item.is_live,
+                                        };
+                                        if !matches {
+                                            continue;
+                                        }
                                         if let Some(sec) = item.section.as_deref() {
                                             if last_section != Some(sec) {
                                                 if last_section.is_some() {

@@ -81,6 +81,10 @@ pub enum Request {
         quality: PreferredQuality,
         sync_history: bool,
     },
+    PrefetchShort {
+        video_id: String,
+        quality: PreferredQuality,
+    },
     RecoverStream {
         video_id: String,
         quality: PreferredQuality,
@@ -397,6 +401,9 @@ pub enum Response {
         width: u32,
         height: u32,
         rgba: Vec<u8>,
+        tiled_width: u32,
+        tiled_height: u32,
+        tiled_rgba: Vec<u8>,
     },
     Error(String),
 }
@@ -566,7 +573,13 @@ impl Backend {
 
     pub fn proxy_url(&self, raw_url: &str, content_length: u64) -> String {
         match &self.proxy {
-            Some(p) => p.register(raw_url, content_length),
+            Some(p) => {
+                if raw_url.contains("c=WEB") || raw_url.contains("c=TVHTML5") {
+                    p.register_with_ua(raw_url, content_length, innertube::WEB_UA)
+                } else {
+                    p.register(raw_url, content_length)
+                }
+            }
             None => raw_url.to_owned(),
         }
     }
@@ -701,7 +714,25 @@ impl Backend {
 
                     let shared_session = Arc::new(Mutex::new(session));
                     let potoken = Arc::new(PoTokenClient::new(&dir_clone));
+                    let jsc = Arc::new(crate::jsc::Solver::new(&dir_clone));
                     let po_token_mode = Arc::new(AtomicU8::new(PoTokenMode::Auto.as_u8()));
+                    let short_cache: Arc<
+                        tokio::sync::Mutex<
+                            HashMap<String, (Response, PreferredQuality, std::time::Instant)>,
+                        >,
+                    > = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                    let short_inflight: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> =
+                        Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+                    let short_notify = Arc::new(tokio::sync::Notify::new());
+                    {
+                        let jsc_warm = jsc.clone();
+                        let http_warm = http.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = jsc_warm.warm(&http_warm).await {
+                                log::debug!("jsc warm-up skipped: {e:#}");
+                            }
+                        });
+                    }
                     {
                         let rot_http = http.clone();
                         let rot_sess = shared_session.clone();
@@ -721,7 +752,11 @@ impl Backend {
                         let data_dir = dir_clone.clone();
                         let thumb_cache = thumb_cache.clone();
                         let potoken = potoken.clone();
+                        let jsc = jsc.clone();
                         let po_token_mode = po_token_mode.clone();
+                        let short_cache = short_cache.clone();
+                        let short_inflight = short_inflight.clone();
+                        let short_notify = short_notify.clone();
 
                         match req {
                             Request::LoadHome {
@@ -2083,21 +2118,66 @@ impl Backend {
                                     });
 
                                     let po_cli = potoken.clone();
+                                    let jsc_cli = jsc.clone();
                                     let po_mode =
                                         PoTokenMode::from_u8(po_token_mode.load(Ordering::Relaxed));
-                                    match resolve_watch(
-                                        &http,
-                                        &data_dir,
-                                        &video_id,
-                                        quality,
-                                        &cfg_clone,
-                                        sess_clone.as_ref(),
-                                        proxy_clone.as_ref(),
-                                        &po_cli,
-                                        po_mode,
-                                    )
-                                    .await
+                                    let take_cached_short = |cache: &mut HashMap<String, (Response, PreferredQuality, std::time::Instant)>| {
+                                        match cache.remove(&video_id) {
+                                            Some((resp, cq, at))
+                                                if cq == quality
+                                                    && at.elapsed()
+                                                        < std::time::Duration::from_secs(5 * 60) =>
+                                            {
+                                                Some(resp)
+                                            }
+                                            _ => None,
+                                        }
+                                    };
+                                    let mut cached_short = {
+                                        let mut cache = short_cache.lock().await;
+                                        take_cached_short(&mut cache)
+                                    };
+                                    if cached_short.is_none()
+                                        && short_inflight.lock().await.contains(&video_id)
                                     {
+                                        let deadline = tokio::time::Instant::now()
+                                            + std::time::Duration::from_secs(12);
+                                        loop {
+                                            let notified = short_notify.notified();
+                                            tokio::pin!(notified);
+                                            if !short_inflight.lock().await.contains(&video_id) {
+                                                break;
+                                            }
+                                            if tokio::time::timeout_at(deadline, notified)
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        let mut cache = short_cache.lock().await;
+                                        cached_short = take_cached_short(&mut cache);
+                                    }
+                                    let res = match cached_short {
+                                        Some(resp) => Ok(resp),
+                                        None => {
+                                            resolve_watch(
+                                                &http,
+                                                &data_dir,
+                                                &video_id,
+                                                quality,
+                                                &cfg_clone,
+                                                sess_clone.as_ref(),
+                                                proxy_clone.as_ref(),
+                                                &po_cli,
+                                                &jsc_cli,
+                                                po_mode,
+                                                false,
+                                            )
+                                            .await
+                                        }
+                                    };
+                                    match res {
                                         Ok(res) => {
                                             let _ = resp_tx.send(res);
                                             wake();
@@ -2127,6 +2207,66 @@ impl Backend {
                                     }
                                 });
                             }
+                            Request::PrefetchShort { video_id, quality } => {
+                                let cfg_clone = cfg.clone();
+                                let sess_clone = session.clone();
+                                let proxy_clone = proxy.clone();
+                                tokio::spawn(async move {
+                                    {
+                                        let cache = short_cache.lock().await;
+                                        if let Some((_, cq, at)) = cache.get(&video_id) {
+                                            if *cq == quality
+                                                && at.elapsed()
+                                                    < std::time::Duration::from_secs(5 * 60)
+                                            {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    {
+                                        let mut inf = short_inflight.lock().await;
+                                        if !inf.insert(video_id.clone()) {
+                                            return;
+                                        }
+                                    }
+                                    let po_cli = potoken.clone();
+                                    let jsc_cli = jsc.clone();
+                                    let po_mode =
+                                        PoTokenMode::from_u8(po_token_mode.load(Ordering::Relaxed));
+                                    if let Ok(resp) = resolve_watch(
+                                        &http,
+                                        &data_dir,
+                                        &video_id,
+                                        quality,
+                                        &cfg_clone,
+                                        sess_clone.as_ref(),
+                                        proxy_clone.as_ref(),
+                                        &po_cli,
+                                        &jsc_cli,
+                                        po_mode,
+                                        true,
+                                    )
+                                    .await
+                                    {
+                                        let mut cache = short_cache.lock().await;
+                                        if cache.len() >= 5 {
+                                            if let Some(oldest_k) = cache
+                                                .iter()
+                                                .min_by_key(|(_, (_, _, at))| *at)
+                                                .map(|(k, _)| k.clone())
+                                            {
+                                                cache.remove(&oldest_k);
+                                            }
+                                        }
+                                        cache.insert(
+                                            video_id.clone(),
+                                            (resp, quality, std::time::Instant::now()),
+                                        );
+                                    }
+                                    short_inflight.lock().await.remove(&video_id);
+                                    short_notify.notify_waiters();
+                                });
+                            }
                             Request::RecoverStream {
                                 video_id,
                                 quality,
@@ -2147,6 +2287,7 @@ impl Backend {
                                         None => quality,
                                     };
                                     let po_cli = potoken.clone();
+                                    let jsc_cli = jsc.clone();
                                     let po_mode =
                                         PoTokenMode::from_u8(po_token_mode.load(Ordering::Relaxed));
                                     match resolve_watch(
@@ -2158,7 +2299,9 @@ impl Backend {
                                         sess_clone.as_ref(),
                                         proxy_clone.as_ref(),
                                         &po_cli,
+                                        &jsc_cli,
                                         po_mode,
+                                        false,
                                     )
                                     .await
                                     {
@@ -2182,13 +2325,21 @@ impl Backend {
                                                     pick_format_index(&data.video_formats, h)
                                                 {
                                                     let fmt = &data.video_formats[idx];
+                                                    let ua = if used_ytdlp {
+                                                        proxy_clone
+                                                            .as_ref()
+                                                            .and_then(|p| p.session_user_agent(&selected_video_url))
+                                                    } else {
+                                                        None
+                                                    };
                                                     let wrap = |url: &str, len: u64| -> String {
                                                         let is_hls = url.contains(".m3u8")
                                                             || url.contains("/manifest/hls");
                                                         match proxy_clone.as_ref() {
-                                                            Some(p) if !is_hls => {
-                                                                p.register(url, len)
-                                                            }
+                                                            Some(p) if !is_hls => match ua.as_deref() {
+                                                                Some(u) => p.register_with_ua(url, len, u),
+                                                                None => p.register(url, len),
+                                                            },
                                                             _ => url.to_owned(),
                                                         }
                                                     };
@@ -2414,12 +2565,17 @@ impl Backend {
                                     .await
                                     .ok()
                                     .flatten();
-                                    if let Some((width, height, rgba)) = ok {
+                                    if let Some(((width, height, rgba), (tiled_width, tiled_height, tiled_rgba))) =
+                                        ok
+                                    {
                                         let _ = resp_tx.send(Response::AmbientArtReady {
                                             key,
                                             width,
                                             height,
                                             rgba,
+                                            tiled_width,
+                                            tiled_height,
+                                            tiled_rgba,
                                         });
                                         wake();
                                     }
@@ -2575,12 +2731,19 @@ fn apply_ytdlp_streams(
     yt: ytdlp::YtdlpStreams,
     quality: PreferredQuality,
     proxy: Option<&StreamProxy>,
+    prefetch: bool,
 ) -> (String, Option<String>, Option<usize>) {
     let ua = yt.user_agent.as_deref().unwrap_or("");
     let wrap_yt = |url: &str, len: u64| -> String {
         let is_hls = url.contains(".m3u8") || url.contains("/manifest/hls");
         match proxy {
-            Some(p) if !is_hls => p.register_with_ua(url, len, ua),
+            Some(p) if !is_hls => {
+                if prefetch {
+                    p.register_prefetch_with_ua(url, len, ua)
+                } else {
+                    p.register_with_ua(url, len, ua)
+                }
+            }
             _ => url.to_owned(),
         }
     };
@@ -2639,20 +2802,46 @@ fn apply_ytdlp_streams(
     (v_url, a_url, fmt_idx)
 }
 
+async fn anon_visitor_data(
+    http: &reqwest::Client,
+    cfg: &WebConfig,
+    session: Option<&Session>,
+) -> String {
+    if session.is_none() {
+        if let Some(v) = cfg.visitor_data.as_deref().filter(|s| !s.is_empty()) {
+            return v.to_owned();
+        }
+    }
+    static CACHED: tokio::sync::Mutex<Option<(String, std::time::Instant)>> =
+        tokio::sync::Mutex::const_new(None);
+    {
+        let g = CACHED.lock().await;
+        if let Some((v, at)) = g.as_ref() {
+            if at.elapsed() < std::time::Duration::from_secs(30 * 60) && !v.is_empty() {
+                return v.clone();
+            }
+        }
+    }
+    let vd = innertube::fetch_web_config(http, None)
+        .await
+        .visitor_data
+        .filter(|s| !s.is_empty())
+        .or_else(|| cfg.visitor_data.clone())
+        .unwrap_or_default();
+    if !vd.is_empty() {
+        *CACHED.lock().await = Some((vd.clone(), std::time::Instant::now()));
+    }
+    vd
+}
+
 async fn mint_po_tokens_if_needed(
     http: &reqwest::Client,
     cfg: &WebConfig,
     session: Option<&Session>,
     potoken: &PoTokenClient,
     video_id: &str,
-) -> Option<crate::potoken::PoTokens> {
-    let vd = match cfg.visitor_data.as_deref().filter(|s| !s.is_empty()) {
-        Some(v) => v.to_owned(),
-        None => innertube::fetch_web_config(http, session)
-            .await
-            .visitor_data
-            .unwrap_or_default(),
-    };
+) -> Option<(String, crate::potoken::PoTokens)> {
+    let vd = anon_visitor_data(http, cfg, session).await;
     if vd.is_empty() {
         log::warn!("potoken: visitor_data unavailable, skipping mint");
         return None;
@@ -2660,7 +2849,7 @@ async fn mint_po_tokens_if_needed(
     match potoken.mint(&vd, video_id).await {
         Ok(toks) => {
             log::info!("potoken: minted BotGuard PO tokens for {video_id}");
-            Some(toks)
+            Some((vd, toks))
         }
         Err(e) => {
             log::warn!("potoken: mint failed for {video_id}: {e:#}");
@@ -2680,14 +2869,19 @@ async fn resolve_ytdlp_with_potoken(
     potoken: &PoTokenClient,
     po_mode: PoTokenMode,
     blocked_hint: bool,
+    prefer_cookies_for_auth: bool,
 ) -> anyhow::Result<ytdlp::YtdlpStreams> {
     let cookie = session.map(|s| s.cookie.as_str());
-    let eager_pot = match po_mode {
-        PoTokenMode::On => mint_po_tokens_if_needed(http, cfg, session, potoken, video_id).await,
-        PoTokenMode::Auto if blocked_hint => {
-            mint_po_tokens_if_needed(http, cfg, session, potoken, video_id).await
+    let eager_pot = if prefer_cookies_for_auth {
+        None
+    } else {
+        match po_mode {
+            PoTokenMode::On => mint_po_tokens_if_needed(http, cfg, session, potoken, video_id).await,
+            PoTokenMode::Auto if blocked_hint => {
+                mint_po_tokens_if_needed(http, cfg, session, potoken, video_id).await
+            }
+            _ => None,
         }
-        _ => None,
     };
 
     let res = ytdlp::resolve_video(
@@ -2696,7 +2890,9 @@ async fn resolve_ytdlp_with_potoken(
         cookie,
         video_id,
         max_height,
-        eager_pot.as_ref(),
+        eager_pot.as_ref().map(|(_, t)| t),
+        eager_pot.as_ref().map(|(vd, _)| vd.as_str()),
+        prefer_cookies_for_auth,
     )
     .await;
 
@@ -2708,7 +2904,7 @@ async fn resolve_ytdlp_with_potoken(
                 && eager_pot.is_none()
                 && ytdlp::needs_potoken_retry(&msg)
             {
-                if let Some(pot) =
+                if let Some((vd, pot)) =
                     mint_po_tokens_if_needed(http, cfg, session, potoken, video_id).await
                 {
                     return ytdlp::resolve_video(
@@ -2718,6 +2914,8 @@ async fn resolve_ytdlp_with_potoken(
                         video_id,
                         max_height,
                         Some(&pot),
+                        Some(&vd),
+                        false,
                     )
                     .await;
                 }
@@ -2725,6 +2923,238 @@ async fn resolve_ytdlp_with_potoken(
             Err(err)
         }
     }
+}
+
+async fn probe_url_ok(http: &reqwest::Client, url: &str, ua: &str) -> bool {
+    if url.contains(".m3u8") || url.contains("/manifest/hls") {
+        return true;
+    }
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let probe_url = if url.contains("range=") {
+        url.to_owned()
+    } else {
+        format!("{url}{sep}range=0-1023")
+    };
+    match http
+        .get(&probe_url)
+        .header("User-Agent", ua)
+        .timeout(std::time::Duration::from_secs(4))
+        .send()
+        .await
+    {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => true,
+    }
+}
+
+fn select_and_wrap_watch(
+    data: &WatchData,
+    quality: PreferredQuality,
+    proxy: Option<&StreamProxy>,
+    ua: Option<&str>,
+    prefetch: bool,
+) -> Option<(String, Option<String>, Option<usize>, String, Option<String>)> {
+    let wrap = |url: &str, len: u64| -> String {
+        let is_hls = url.contains(".m3u8") || url.contains("/manifest/hls");
+        match proxy {
+            Some(p) if !is_hls => match (prefetch, ua) {
+                (true, Some(u)) => p.register_prefetch_with_ua(url, len, u),
+                (true, None) => p.register_prefetch_with_ua(url, len, crate::innertube::VISIONOS_UA),
+                (false, Some(u)) => p.register_with_ua(url, len, u),
+                (false, None) => p.register(url, len),
+            },
+            _ => url.to_owned(),
+        }
+    };
+    if data.is_live {
+        if let Some(hls) = data.hls_url.clone() {
+            let hint_idx = if quality != PreferredQuality::Best4K {
+                pick_format_index(&data.video_formats, quality.max_height())
+            } else {
+                None
+            };
+            return Some((hls.clone(), None, hint_idx, hls, None));
+        }
+    }
+    if let Some(idx) = pick_format_index(&data.video_formats, quality.max_height()) {
+        let fmt = &data.video_formats[idx];
+        let raw_v = fmt.url.clone();
+        let raw_a = if fmt.has_audio {
+            None
+        } else {
+            data.audio_url.clone()
+        };
+        let v_url = wrap(&raw_v, fmt.content_length);
+        let a_url = raw_a
+            .as_deref()
+            .map(|u| wrap(u, data.audio_content_length));
+        return Some((v_url, a_url, Some(idx), raw_v, raw_a));
+    }
+    if let Some(hls) = data.hls_url.clone() {
+        return Some((hls.clone(), None, None, hls, None));
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_web_native(
+    http: &reqwest::Client,
+    video_id: &str,
+    quality: PreferredQuality,
+    cfg: &WebConfig,
+    session: Option<&Session>,
+    proxy: Option<&StreamProxy>,
+    potoken: &PoTokenClient,
+    jsc: &crate::jsc::Solver,
+    po_mode: PoTokenMode,
+    need_pot: bool,
+    strict_auth: bool,
+    prefetch: bool,
+) -> (Option<Response>, Option<serde_json::Value>, Option<(String, crate::potoken::PoTokens)>) {
+    let want_pot = po_mode != PoTokenMode::Off && need_pot;
+    let (next_json, js_res, (mut vd, mut pot)) = tokio::join!(
+        innertube::fetch_next_json(http, video_id, cfg, session),
+        jsc.player(http),
+        async {
+            if want_pot {
+                match mint_po_tokens_if_needed(http, cfg, session, potoken, video_id).await {
+                    Some((v, p)) => (v, Some(p)),
+                    None => (anon_visitor_data(http, cfg, session).await, None),
+                }
+            } else {
+                (anon_visitor_data(http, cfg, session).await, None)
+            }
+        }
+    );
+
+    if let Err(e) = &js_res {
+        log::warn!("jsc solver unavailable ({e:#}); falling back");
+        return (None, next_json, pot.map(|p| (vd, p)));
+    }
+
+    let mut attempt_cookies = if session.is_some() {
+        if pot.is_some() && !strict_auth {
+            // Anonymous PO tokens match unauthenticated WEB requests; avoid a 403 preflight
+            // round-trip with cookies first before falling back cleanly.
+            vec![false, true]
+        } else {
+            vec![true]
+        }
+    } else {
+        vec![false]
+    };
+
+    for use_cookies in attempt_cookies.drain(..) {
+        match innertube::watch_web_solved(
+            http,
+            video_id,
+            cfg,
+            session,
+            jsc,
+            &vd,
+            pot.as_ref(),
+            next_json.clone(),
+            use_cookies,
+        )
+        .await
+        {
+            Ok(mut data) => {
+                populate_hls_variants_if_needed(http, &mut data).await;
+                if let Some((v_url, a_url, idx, raw_v, raw_a)) =
+                    select_and_wrap_watch(&data, quality, proxy, Some(innertube::WEB_UA), prefetch)
+                {
+                    let ok = match raw_a.as_deref() {
+                        Some(a) => {
+                            let (vo, ao) = tokio::join!(
+                                probe_url_ok(http, &raw_v, innertube::WEB_UA),
+                                probe_url_ok(http, a, innertube::WEB_UA),
+                            );
+                            vo && ao
+                        }
+                        None => probe_url_ok(http, &raw_v, innertube::WEB_UA).await,
+                    };
+                    if ok {
+                        return (
+                            Some(Response::WatchReady {
+                                selected_video_url: v_url,
+                                selected_audio_url: a_url,
+                                selected_format_idx: idx,
+                                data: Box::new(data),
+                                used_ytdlp: false,
+                            }),
+                            next_json,
+                            pot.map(|p| (vd, p)),
+                        );
+                    }
+                    log::warn!(
+                        "WEB InnerTube stream for {video_id} (cookies={use_cookies}) failed 403 preflight"
+                    );
+                }
+            }
+            Err(e) => {
+                log::warn!("WEB InnerTube player for {video_id} (cookies={use_cookies}) failed: {e:#}");
+                if pot.is_none() && po_mode == PoTokenMode::Auto {
+                    let msg = format!("{e:#}");
+                    if ytdlp::needs_potoken_retry(&msg) {
+                        if let Some((v, p)) =
+                            mint_po_tokens_if_needed(http, cfg, session, potoken, video_id).await
+                        {
+                            vd = v;
+                            pot = Some(p);
+                            if let Ok(mut data) = innertube::watch_web_solved(
+                                http,
+                                video_id,
+                                cfg,
+                                session,
+                                jsc,
+                                &vd,
+                                pot.as_ref(),
+                                next_json.clone(),
+                                session.is_some() && !strict_auth,
+                            )
+                            .await
+                            {
+                                populate_hls_variants_if_needed(http, &mut data).await;
+                                if let Some((v_url, a_url, idx, raw_v, raw_a)) = select_and_wrap_watch(
+                                    &data,
+                                    quality,
+                                    proxy,
+                                    Some(innertube::WEB_UA),
+                                    prefetch,
+                                ) {
+                                    let ok = match raw_a.as_deref() {
+                                        Some(a) => {
+                                            let (vo, ao) = tokio::join!(
+                                                probe_url_ok(http, &raw_v, innertube::WEB_UA),
+                                                probe_url_ok(http, a, innertube::WEB_UA),
+                                            );
+                                            vo && ao
+                                        }
+                                        None => probe_url_ok(http, &raw_v, innertube::WEB_UA).await,
+                                    };
+                                    if ok {
+                                        return (
+                                            Some(Response::WatchReady {
+                                                selected_video_url: v_url,
+                                                selected_audio_url: a_url,
+                                                selected_format_idx: idx,
+                                                data: Box::new(data),
+                                                used_ytdlp: false,
+                                            }),
+                                            next_json,
+                                            pot.map(|p| (vd, p)),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (None, next_json, pot.map(|p| (vd, p)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2737,177 +3167,160 @@ async fn resolve_watch(
     session: Option<&Session>,
     proxy: Option<&StreamProxy>,
     potoken: &PoTokenClient,
+    jsc: &crate::jsc::Solver,
     po_mode: PoTokenMode,
+    prefetch: bool,
 ) -> anyhow::Result<Response> {
-    let wrap = |url: &str, len: u64| -> String {
-        let is_hls = url.contains(".m3u8") || url.contains("/manifest/hls");
-        match proxy {
-            Some(p) if !is_hls => p.register(url, len),
-            _ => url.to_owned(),
-        }
-    };
-    match innertube::watch(http, video_id, cfg, session).await {
-        Ok(mut data) => {
-            let had_direct_formats = !data.video_formats.is_empty();
-            populate_hls_variants_if_needed(http, &mut data).await;
-            // Livestreams and HLS-only VODs (e.g. post-live broadcasts with noclen=1 adaptive URLs)
-            // play with synced audio via master HLS manifest and native libmpv `vid` track switching.
-            if data.is_live || !had_direct_formats {
-                if let Some(hls) = data.hls_url.clone() {
+    let mut blocked_hint = po_mode == PoTokenMode::On;
+    let mut strict_auth = false;
+
+    if po_mode != PoTokenMode::On {
+        match innertube::watch(http, video_id, cfg, session).await {
+            Ok(mut data) => {
+                let had_direct_formats = !data.video_formats.is_empty();
+                populate_hls_variants_if_needed(http, &mut data).await;
+                if data.is_live || !had_direct_formats {
+                    if let Some(hls) = data.hls_url.clone() {
+                        if po_mode == PoTokenMode::Auto {
+                            potoken.close_if_running();
+                        }
+                        let hint_idx = if quality != PreferredQuality::Best4K {
+                            pick_format_index(&data.video_formats, quality.max_height())
+                        } else {
+                            None
+                        };
+                        return Ok(Response::WatchReady {
+                            selected_video_url: hls,
+                            selected_audio_url: None,
+                            selected_format_idx: hint_idx,
+                            data: Box::new(data),
+                            used_ytdlp: false,
+                        });
+                    }
+                }
+                if let Some((v_url, a_url, idx, _, _)) =
+                    select_and_wrap_watch(&data, quality, proxy, None, prefetch)
+                {
                     if po_mode == PoTokenMode::Auto {
                         potoken.close_if_running();
                     }
-                    let hint_idx = if quality != PreferredQuality::Best4K {
-                        pick_format_index(&data.video_formats, quality.max_height())
-                    } else {
-                        None
-                    };
                     return Ok(Response::WatchReady {
-                        selected_video_url: hls,
-                        selected_audio_url: None,
-                        selected_format_idx: hint_idx,
+                        selected_video_url: v_url,
+                        selected_audio_url: a_url,
+                        selected_format_idx: idx,
                         data: Box::new(data),
                         used_ytdlp: false,
                     });
                 }
             }
-            if let Some(idx) = pick_format_index(&data.video_formats, quality.max_height()) {
-                if po_mode == PoTokenMode::Auto {
-                    potoken.close_if_running();
-                }
-                let fmt = &data.video_formats[idx];
-                let video_url = wrap(&fmt.url, fmt.content_length);
-                let audio = if fmt.has_audio {
-                    None
-                } else {
-                    data.audio_url
-                        .as_deref()
-                        .map(|u| wrap(u, data.audio_content_length))
-                };
-                return Ok(Response::WatchReady {
-                    selected_video_url: video_url,
-                    selected_audio_url: audio,
-                    selected_format_idx: Some(idx),
-                    data: Box::new(data),
-                    used_ytdlp: false,
-                });
+            Err(inner_err) => {
+                let inner_msg = format!("{inner_err:#}");
+                let lc = inner_msg.to_ascii_lowercase();
+                strict_auth = lc.contains("confirm your age")
+                    || lc.contains("age-restricted")
+                    || lc.contains("members-only")
+                    || lc.contains("members on level");
+                blocked_hint = ytdlp::is_auth_required_error(&inner_msg)
+                    || inner_msg.contains("UNPLAYABLE");
+                log::warn!("InnerTube watch failed ({inner_msg}), trying native WEB+jsc");
             }
-            if let Some(hls) = data.hls_url.clone() {
-                if po_mode == PoTokenMode::Auto {
-                    potoken.close_if_running();
-                }
-                return Ok(Response::WatchReady {
-                    selected_video_url: hls,
-                    selected_audio_url: None,
-                    selected_format_idx: None,
-                    data: Box::new(data),
-                    used_ytdlp: false,
-                });
-            }
-            let yt = resolve_ytdlp_with_potoken(
-                http,
-                data_dir,
-                video_id,
-                quality.max_height(),
-                cfg,
-                session,
-                potoken,
-                po_mode,
-                false,
-            )
-            .await?;
-            let (selected_video_url, selected_audio_url, fmt_idx) =
-                apply_ytdlp_streams(&mut data, yt, quality, proxy);
-            Ok(Response::WatchReady {
-                selected_video_url,
-                selected_audio_url,
-                selected_format_idx: fmt_idx,
-                data: Box::new(data),
-                used_ytdlp: true,
-            })
-        }
-        Err(inner_err) => {
-            let inner_msg = format!("{inner_err:#}");
-            let blocked_hint = ytdlp::is_auth_required_error(&inner_msg)
-                || inner_msg.contains("UNPLAYABLE");
-            log::warn!("InnerTube watch failed ({inner_msg}), falling back to yt-dlp");
-            let (yt_res, next_opt) = tokio::join!(
-                resolve_ytdlp_with_potoken(
-                    http,
-                    data_dir,
-                    video_id,
-                    quality.max_height(),
-                    cfg,
-                    session,
-                    potoken,
-                    po_mode,
-                    blocked_hint,
-                ),
-                innertube::fetch_next_watch_fallback(http, video_id, cfg, session),
-            );
-            let yt = yt_res?;
-            let mut data = next_opt.unwrap_or_else(|| WatchData {
-                id: video_id.to_owned(),
-                title: format!("Video {video_id}"),
-                channel: "Unknown".to_owned(),
-                channel_id: None,
-                channel_avatar_url: None,
-                subscribers_text: String::new(),
-                views_text: String::new(),
-                published_text: String::new(),
-                likes_text: String::new(),
-                dislikes_text: None,
-                is_liked: false,
-                is_disliked: false,
-                is_subscribed: false,
-                notifications: ChannelNotificationParams::default(),
-                description: String::new(),
-                duration_secs: 0.0,
-                video_formats: Vec::new(),
-                audio_url: None,
-                audio_content_length: 0,
-                audio_tracks: Vec::new(),
-                hls_url: None,
-                captions: Vec::new(),
-                chapters: Vec::new(),
-                storyboard: None,
-                comments_token: None,
-                live_chat_token: None,
-                related: Vec::new(),
-                is_live: false,
-                is_members_only: false,
-                resume_secs: None,
-            });
-            if let Some(t) = yt.title.as_deref().filter(|s| !s.is_empty()) {
-                if data.title.starts_with("Video ") || data.title.is_empty() {
-                    data.title = t.to_owned();
-                }
-            }
-            if let Some(c) = yt.channel.as_deref().filter(|s| !s.is_empty()) {
-                if data.channel == "Unknown" || data.channel.is_empty() {
-                    data.channel = c.to_owned();
-                }
-            }
-            if data.channel_id.is_none() {
-                data.channel_id = yt.channel_id.clone();
-            }
-            if data.description.is_empty() && !yt.description.is_empty() {
-                data.description = yt.description.clone();
-            }
-            if data.duration_secs <= 0.0 {
-                data.duration_secs = yt.duration_secs;
-            }
-            let (selected_video_url, selected_audio_url, fmt_idx) =
-                apply_ytdlp_streams(&mut data, yt, quality, proxy);
-            Ok(Response::WatchReady {
-                selected_video_url,
-                selected_audio_url,
-                selected_format_idx: fmt_idx,
-                data: Box::new(data),
-                used_ytdlp: true,
-            })
         }
     }
+
+    let (web_res, next_json, _minted_pot) = resolve_web_native(
+        http,
+        video_id,
+        quality,
+        cfg,
+        session,
+        proxy,
+        potoken,
+        jsc,
+        po_mode,
+        blocked_hint || po_mode == PoTokenMode::On,
+        strict_auth,
+        prefetch,
+    )
+    .await;
+    if let Some(resp) = web_res {
+        return Ok(resp);
+    }
+
+    log::warn!("Native WEB+jsc fallback unavailable for {video_id}, falling back to yt-dlp");
+    let yt = resolve_ytdlp_with_potoken(
+        http,
+        data_dir,
+        video_id,
+        quality.max_height(),
+        cfg,
+        session,
+        potoken,
+        po_mode,
+        blocked_hint,
+        strict_auth,
+    )
+    .await?;
+    let next_opt = next_json.and_then(|v| innertube::watch_data_from_next(video_id, &v));
+    let mut data = next_opt.unwrap_or_else(|| WatchData {
+        id: video_id.to_owned(),
+        title: format!("Video {video_id}"),
+        channel: "Unknown".to_owned(),
+        channel_id: None,
+        channel_avatar_url: None,
+        subscribers_text: String::new(),
+        views_text: String::new(),
+        published_text: String::new(),
+        likes_text: String::new(),
+        dislikes_text: None,
+        is_liked: false,
+        is_disliked: false,
+        is_subscribed: false,
+        notifications: ChannelNotificationParams::default(),
+        description: String::new(),
+        duration_secs: 0.0,
+        video_formats: Vec::new(),
+        audio_url: None,
+        audio_content_length: 0,
+        audio_tracks: Vec::new(),
+        hls_url: None,
+        captions: Vec::new(),
+        chapters: Vec::new(),
+        storyboard: None,
+        comments_token: None,
+        live_chat_token: None,
+        related: Vec::new(),
+        is_live: false,
+        is_members_only: false,
+        resume_secs: None,
+    });
+    if let Some(t) = yt.title.as_deref().filter(|s| !s.is_empty()) {
+        if data.title.starts_with("Video ") || data.title.is_empty() {
+            data.title = t.to_owned();
+        }
+    }
+    if let Some(c) = yt.channel.as_deref().filter(|s| !s.is_empty()) {
+        if data.channel == "Unknown" || data.channel.is_empty() {
+            data.channel = c.to_owned();
+        }
+    }
+    if data.channel_id.is_none() {
+        data.channel_id = yt.channel_id.clone();
+    }
+    if data.description.is_empty() && !yt.description.is_empty() {
+        data.description = yt.description.clone();
+    }
+    if data.duration_secs <= 0.0 {
+        data.duration_secs = yt.duration_secs;
+    }
+    let (selected_video_url, selected_audio_url, fmt_idx) =
+        apply_ytdlp_streams(&mut data, yt, quality, proxy, prefetch);
+    Ok(Response::WatchReady {
+        selected_video_url,
+        selected_audio_url,
+        selected_format_idx: fmt_idx,
+        data: Box::new(data),
+        used_ytdlp: true,
+    })
 }
 
 pub fn pick_format_index(formats: &[VideoFormat], max_height: u32) -> Option<usize> {
@@ -2921,7 +3334,7 @@ pub fn pick_format_index(formats: &[VideoFormat], max_height: u32) -> Option<usi
         .or_else(|| Some(formats.len() - 1))
 }
 
-fn blur_ambient_art(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+fn blur_ambient_art(bytes: &[u8]) -> Option<((u32, u32, Vec<u8>), (u32, u32, Vec<u8>))> {
     const N: u32 = 64;
     let img = image::load_from_memory(bytes).ok()?.to_rgb8();
     let small = image::imageops::resize(&img, N, N, image::imageops::FilterType::Triangle);
@@ -2972,47 +3385,78 @@ fn blur_ambient_art(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
         })
         .collect();
 
-    let n = N as usize;
-    let box_pass = |src: &[[f32; 3]], horizontal: bool| -> Vec<[f32; 3]> {
-        let r = 5isize;
+    let box_pass = |src: &[[f32; 3]], side: usize, r: isize, wrap: bool, horizontal: bool| -> Vec<[f32; 3]> {
         let d = (2 * r + 1) as f32;
         let mut out = vec![[0.0f32; 3]; src.len()];
-        for y in 0..n {
-            for x in 0..n {
+        for y in 0..side {
+            for x in 0..side {
                 let mut acc = [0.0f32; 3];
                 for o in -r..=r {
                     let (sx, sy) = if horizontal {
-                        ((x as isize + o).clamp(0, n as isize - 1) as usize, y)
+                        let nx = if wrap {
+                            (x as isize + o).rem_euclid(side as isize) as usize
+                        } else {
+                            (x as isize + o).clamp(0, side as isize - 1) as usize
+                        };
+                        (nx, y)
                     } else {
-                        (x, (y as isize + o).clamp(0, n as isize - 1) as usize)
+                        let ny = if wrap {
+                            (y as isize + o).rem_euclid(side as isize) as usize
+                        } else {
+                            (y as isize + o).clamp(0, side as isize - 1) as usize
+                        };
+                        (x, ny)
                     };
-                    let p = src[sy * n + sx];
+                    let p = src[sy * side + sx];
                     acc[0] += p[0];
                     acc[1] += p[1];
                     acc[2] += p[2];
                 }
-                out[y * n + x] = [acc[0] / d, acc[1] / d, acc[2] / d];
+                out[y * side + x] = [acc[0] / d, acc[1] / d, acc[2] / d];
             }
         }
         out
     };
+
+    let n = N as usize;
     for _ in 0..3 {
-        let h = box_pass(&px, true);
-        px = box_pass(&h, false);
+        let h = box_pass(&px, n, 5, false, true);
+        px = box_pass(&h, n, 5, false, false);
     }
 
-    let rgba: Vec<u8> = px
-        .into_iter()
-        .flat_map(|p| {
-            [
-                p[0].clamp(0.0, 255.0) as u8,
-                p[1].clamp(0.0, 255.0) as u8,
-                p[2].clamp(0.0, 255.0) as u8,
-                255,
-            ]
-        })
-        .collect();
-    Some((N, N, rgba))
+    let to_rgba = |buf: &[[f32; 3]]| -> Vec<u8> {
+        buf.iter()
+            .flat_map(|p| {
+                [
+                    p[0].clamp(0.0, 255.0) as u8,
+                    p[1].clamp(0.0, 255.0) as u8,
+                    p[2].clamp(0.0, 255.0) as u8,
+                    255,
+                ]
+            })
+            .collect()
+    };
+
+    let soft_rgba = to_rgba(&px);
+
+    // Build a 128x128 seamless 2x2 mirrored tile + periodic wrap-around heavy blur
+    // so repeating across any viewport produces organic blended glow with zero visible seams/squares.
+    let tw = n * 2;
+    let mut tiled = vec![[0.0f32; 3]; tw * tw];
+    for y in 0..tw {
+        let sy = if y < n { y } else { tw - 1 - y };
+        for x in 0..tw {
+            let sx = if x < n { x } else { tw - 1 - x };
+            tiled[y * tw + x] = px[sy * n + sx];
+        }
+    }
+    for _ in 0..3 {
+        let h = box_pass(&tiled, tw, 9, true, true);
+        tiled = box_pass(&h, tw, 9, true, false);
+    }
+    let tiled_rgba = to_rgba(&tiled);
+
+    Some(((N, N, soft_rgba), (tw as u32, tw as u32, tiled_rgba)))
 }
 
 #[cfg(test)]

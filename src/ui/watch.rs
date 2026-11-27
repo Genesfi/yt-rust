@@ -353,6 +353,20 @@ impl YtApp {
     }
 
     pub(super) fn draw_shorts_player(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.shorts_slot.mpv.is_none() && self.mpv_error.is_none() {
+            self.shorts_slot.ensure_mpv(
+                &self.backend.data_dir,
+                &self.get_proc_address,
+                ctx,
+                self.volume,
+                self.hwdec_mode,
+                self.sub_font_size,
+                self.sub_bg_opacity,
+            );
+            if let Some(m) = &self.shorts_slot.mpv {
+                m.set_cache_pause_wait(0.3);
+            }
+        }
         let resume_video_title = self
             .watch
             .as_ref()
@@ -882,6 +896,17 @@ impl YtApp {
             if self.watch.is_some() {
                 ui.painter().add(mpv.paint_callback(rect));
             }
+        } else if (self.watch_loading || crate::mpv::find_libmpv(&self.backend.data_dir).is_some())
+            && self.mpv_error.is_none()
+        {
+            ctx.request_repaint();
+            let label = if self.watch_loading {
+                "Resolving stream..."
+            } else {
+                "Loading Shorts..."
+            };
+            draw_buffering_overlay(ui, ctx, rect, radius, label);
+            return;
         } else {
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink(24.0)), |ui| {
                 ui.centered_and_justified(|ui| {
@@ -1084,7 +1109,7 @@ impl YtApp {
             is_live && self.seeking_pos.is_none() && (dur <= 0.0 || live_behind <= 12.0);
 
         let pad_x = 14.0;
-        let controls_h = 62.0;
+        let controls_h = 52.0;
         let controls_rect = Rect::from_min_max(
             pos2(
                 video_rect.left() + pad_x,
@@ -1098,13 +1123,14 @@ impl YtApp {
                 .max_rect(controls_rect)
                 .layout(Layout::top_down(Align::LEFT)),
         );
+        cui.spacing_mut().item_spacing.y = 0.0;
         let cclip = cui.clip_rect().intersect(video_rect);
         cui.set_clip_rect(cclip);
 
         // 1. Slim interactive seekbar (animates thickness & knob on hover/drag)
         let bar_w = controls_rect.width();
         let (bar_rect, bar_resp) =
-            cui.allocate_exact_size(Vec2::new(bar_w, 16.0), Sense::click_and_drag());
+            cui.allocate_exact_size(Vec2::new(bar_w, 12.0), Sense::click_and_drag());
         let bar_hot = bar_resp.hovered() || bar_resp.dragged();
         if bar_hot {
             any_interacted = true;
@@ -1304,9 +1330,9 @@ impl YtApp {
         }
 
         // 2. Clean YouTube control row
-        cui.add_space(4.0);
+        cui.add_space(2.0);
         let row_w = cui.available_width();
-        let (row_rect, _) = cui.allocate_exact_size(Vec2::new(row_w, 38.0), Sense::hover());
+        let (row_rect, _) = cui.allocate_exact_size(Vec2::new(row_w, 36.0), Sense::hover());
         let right_w = if is_shorts && !self.fullscreen {
             82.0_f32.min(row_w * 0.35)
         } else {

@@ -381,6 +381,195 @@ pub(super) fn draw_home_mixed_grid(
     )
 }
 
+pub(super) fn draw_history_feed(
+    ui: &mut egui::Ui,
+    heading: &str,
+    items: &[VideoItem],
+    filter: &mut super::HistoryFilter,
+    loading: bool,
+    has_more: bool,
+) -> Option<GridAction> {
+    let mut action = None;
+    let (shorts, videos): (Vec<&VideoItem>, Vec<&VideoItem>) =
+        items.iter().partition(|it| it.is_short());
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(heading).font(theme::bold(20.0)));
+        if loading {
+            ui.add_space(8.0);
+            ui.spinner();
+        }
+    });
+    ui.add_space(10.0);
+
+    // Separate filter chips (All | Videos | Shorts) just like YouTube Watch History
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let opts = [
+            (super::HistoryFilter::All, format!("All ({})", items.len())),
+            (super::HistoryFilter::Videos, format!("Videos ({})", videos.len())),
+            (super::HistoryFilter::Shorts, format!("Shorts ({})", shorts.len())),
+        ];
+        for (opt, lbl) in opts {
+            let active = *filter == opt;
+            let fill = if active {
+                Color32::from_rgb(241, 241, 241)
+            } else if theme::is_translucent() {
+                Color32::from_rgba_unmultiplied(255, 255, 255, 16)
+            } else {
+                theme::CHIP
+            };
+            let text_col = if active {
+                Color32::from_rgb(15, 15, 15)
+            } else {
+                theme::TEXT
+            };
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new(lbl).font(theme::medium(13.0)).color(text_col),
+                    )
+                    .fill(fill)
+                    .corner_radius(16)
+                    .min_size(Vec2::new(62.0, 30.0)),
+                )
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .clicked()
+            {
+                *filter = opt;
+            }
+        }
+    });
+    ui.add_space(12.0);
+
+    if items.is_empty() && !loading {
+        ui.label(
+            RichText::new("No watch history yet.")
+                .font(theme::regular(14.0))
+                .color(theme::TEXT_DIM),
+        );
+        return None;
+    }
+
+    let scroll_out = ScrollArea::vertical()
+        .id_salt(("history_feed_scroll", heading))
+        .show(ui, |ui| {
+            let avail = (ui.available_width() - 8.0).max(200.0);
+            match *filter {
+                super::HistoryFilter::All => {
+                    if !shorts.is_empty() {
+                        draw_shorts_shelf(ui, "history_shorts", &shorts, &mut action);
+                        ui.add_space(16.0);
+                        if !videos.is_empty() {
+                            ui.label(
+                                RichText::new("Videos")
+                                    .font(theme::bold(17.5))
+                                    .color(theme::TEXT),
+                            );
+                            ui.add_space(10.0);
+                        }
+                    }
+                    if !videos.is_empty() {
+                        draw_history_video_rows(ui, avail, &videos, &mut action);
+                    }
+                }
+                super::HistoryFilter::Videos => {
+                    if videos.is_empty() && !loading {
+                        ui.label(
+                            RichText::new("No regular videos in watch history.")
+                                .font(theme::regular(14.0))
+                                .color(theme::TEXT_DIM),
+                        );
+                    } else {
+                        draw_history_video_rows(ui, avail, &videos, &mut action);
+                    }
+                }
+                super::HistoryFilter::Shorts => {
+                    if shorts.is_empty() && !loading {
+                        ui.label(
+                            RichText::new("No Shorts in watch history.")
+                                .font(theme::regular(14.0))
+                                .color(theme::TEXT_DIM),
+                        );
+                    } else {
+                        let cols = ((avail / 188.0).floor() as usize).clamp(2, 7);
+                        let spacing = 14.0;
+                        let card_w = ((avail - spacing * (cols as f32 - 1.0)) / cols as f32)
+                            .clamp(150.0, 210.0);
+                        let thumb_h = (card_w * 16.0 / 9.0).round();
+                        for row in shorts.chunks(cols) {
+                            ui.horizontal_top(|ui| {
+                                for (idx, item) in row.iter().enumerate() {
+                                    draw_short_portrait_card(
+                                        ui,
+                                        item,
+                                        card_w,
+                                        thumb_h,
+                                        false,
+                                        &mut action,
+                                    );
+                                    if idx + 1 < row.len() {
+                                        ui.add_space(spacing);
+                                    }
+                                }
+                            });
+                            ui.add_space(16.0);
+                        }
+                    }
+                }
+            }
+
+            if has_more && !loading {
+                ui.add_space(8.0);
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("Load more").font(theme::medium(13.0)))
+                            .fill(theme::CHIP)
+                            .corner_radius(18),
+                    )
+                    .clicked()
+                {
+                    action = Some(GridAction::LoadMore);
+                }
+            }
+        });
+
+    if has_more && !loading && action.is_none() {
+        let remaining = scroll_out.content_size.y
+            - (scroll_out.state.clamped_offset().y + scroll_out.inner_rect.height());
+        if remaining < 450.0 {
+            action = Some(GridAction::LoadMore);
+        }
+    }
+
+    action
+}
+
+fn draw_history_video_rows(
+    ui: &mut egui::Ui,
+    avail: f32,
+    videos: &[&VideoItem],
+    action: &mut Option<GridAction>,
+) {
+    let cols = ((avail / 305.0).floor() as usize).clamp(1, 5);
+    let spacing = 16.0;
+    let card_w = ((avail - spacing * (cols as f32 - 1.0)) / cols as f32).max(180.0);
+    let thumb_h = card_w * 9.0 / 16.0;
+    for row in videos.chunks(cols) {
+        draw_video_card_row(
+            ui,
+            row,
+            card_w,
+            thumb_h,
+            spacing,
+            true,
+            false,
+            action,
+        );
+        ui.add_space(18.0);
+    }
+}
+
 pub(super) fn draw_shorts_portrait_grid(
     ui: &mut egui::Ui,
     heading: &str,

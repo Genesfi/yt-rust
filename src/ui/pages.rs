@@ -1009,14 +1009,19 @@ impl YtApp {
         );
         let clearable = !self.settings_query.is_empty();
         let inner = Rect::from_min_max(
-            pos2(srect.left() + 33.0, srect.top() + 3.0),
+            pos2(srect.left() + 33.0, srect.center().y - 10.0),
             pos2(
                 srect.right() - if clearable { 32.0 } else { 12.0 },
-                srect.bottom() - 3.0,
+                srect.center().y + 10.0,
             ),
         );
-        let edit = ui.put(
-            inner,
+        let mut input_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(inner)
+                .layout(Layout::left_to_right(Align::Center)),
+        );
+        let edit = input_ui.add_sized(
+            inner.size(),
             egui::TextEdit::singleline(&mut self.settings_query)
                 .hint_text(
                     RichText::new("Search settings")
@@ -1025,6 +1030,7 @@ impl YtApp {
                 )
                 .font(theme::regular(13.0))
                 .frame(Frame::NONE)
+                .align(egui::Align2::LEFT_CENTER)
                 .desired_width(inner.width()),
         );
         if clearable {
