@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -327,7 +328,21 @@ async fn probe_stream_ok(http: &reqwest::Client, url: &str, ua: Option<&str>) ->
     }
 }
 
+fn is_auth_required_error(stderr: &str) -> bool {
+    let lc = stderr.to_ascii_lowercase();
+    lc.contains("sign in to confirm")
+        || lc.contains("confirm your age")
+        || lc.contains("age-restricted")
+        || lc.contains("members-only")
+        || lc.contains("join this channel")
+        || lc.contains("login_required")
+        || lc.contains("private video")
+        || lc.contains("requires payment")
+}
+
 /// Fallback stream resolution using yt-dlp when InnerTube direct URLs fail.
+/// Tries without account cookies first so normal public playback avoids sending cookies,
+/// and retries with `--cookies` only when YouTube requires authentication/age verification.
 pub async fn resolve_video(
     http: &reqwest::Client,
     data_dir: &Path,
@@ -340,23 +355,41 @@ pub async fn resolve_video(
         resolve_js_runtime(http, data_dir),
     );
     let bin = bin_res?;
-    let data_dir_owned = data_dir.to_owned();
     let cookie_owned = cookie.filter(|c| !c.trim().is_empty()).map(str::to_owned);
-    let vid = video_id.to_owned();
-    let rt_owned = runtime.clone();
-    let bin_first = bin.clone();
-    let streams = tokio::task::spawn_blocking(move || {
-        run_ytdlp(
-            &bin_first,
-            rt_owned.as_deref(),
-            &data_dir_owned,
-            cookie_owned.as_deref(),
-            &vid,
-            max_height,
-            false,
-        )
-    })
-    .await??;
+
+    let mut used_cookie = false;
+    let first_res = {
+        let bin = bin.clone();
+        let rt = runtime.clone();
+        let dir = data_dir.to_owned();
+        let vid = video_id.to_owned();
+        tokio::task::spawn_blocking(move || run_ytdlp(&bin, rt.as_deref(), &dir, None, &vid, max_height, false)).await?
+    };
+
+    let streams = match first_res {
+        Ok(s) => s,
+        Err(first_err) => {
+            let msg = format!("{first_err:#}");
+            if is_auth_required_error(&msg) {
+                if let Some(ref c) = cookie_owned {
+                    used_cookie = true;
+                    let bin = bin.clone();
+                    let rt = runtime.clone();
+                    let dir = data_dir.to_owned();
+                    let vid = video_id.to_owned();
+                    let c = c.clone();
+                    tokio::task::spawn_blocking(move || {
+                        run_ytdlp(&bin, rt.as_deref(), &dir, Some(&c), &vid, max_height, false)
+                    })
+                    .await??
+                } else {
+                    return Err(first_err);
+                }
+            } else {
+                return Err(first_err);
+            }
+        }
+    };
 
     // YouTube c=WEB URLs resolved with cookies can return HTTP 403 on GVS without a browser PO-token.
     // Probe the first 1 KB; if 403, re-resolve using web_safari/tv/android_vr HLS/non-PO-token clients.
@@ -365,7 +398,7 @@ pub async fn resolve_video(
             "yt-dlp primary stream for {video_id} returned 403 on preflight; falling back to web_safari/tv clients"
         );
         let data_dir_retry = data_dir.to_owned();
-        let cookie_retry = cookie.filter(|c| !c.trim().is_empty()).map(str::to_owned);
+        let cookie_retry = if used_cookie { cookie_owned } else { None };
         let vid_retry = video_id.to_owned();
         if let Ok(Ok(alt)) = tokio::task::spawn_blocking(move || {
             run_ytdlp(
@@ -470,8 +503,8 @@ fn run_ytdlp(
             .lines()
             .rfind(|l| l.contains("ERROR"))
             .unwrap_or("yt-dlp failed");
-        if msg.contains("Sign in to confirm") && cookie.is_none() {
-            anyhow::bail!("YouTube requested sign-in verification for this video — please Sign in first.");
+        if is_auth_required_error(&err) && cookie.is_none() {
+            anyhow::bail!("Sign in to confirm: {}", msg.trim());
         }
         anyhow::bail!("{}", msg.trim());
     }
@@ -737,7 +770,102 @@ pub fn default_downloads_dir(data_dir: &Path) -> PathBuf {
     }
 }
 
+fn run_ytdlp_download(
+    bin: &Path,
+    runtime: Option<&str>,
+    data_dir: &Path,
+    out_dir: &Path,
+    cookie: Option<&str>,
+    vid: &str,
+    audio_only: bool,
+    max_height: u32,
+    on_progress: &Arc<dyn Fn(DownloadProgress) + Send + Sync>,
+) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(out_dir)?;
+    let _jar = cookie
+        .map(|c| TempCookieJar::create(data_dir, c))
+        .transpose()?;
+    let out_dir_str = out_dir.to_string_lossy().into_owned();
+    let mut cmd = Command::new(bin);
+    let fmt = format!("bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best");
+    cmd.args([
+        "--no-warnings",
+        "--no-playlist",
+        "--restrict-filenames",
+        "--newline",
+        "--progress",
+        "--progress-template",
+        "download:DLPROG:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._total_bytes_estimate_str,progress._total_bytes_str)s",
+        "-P",
+        &out_dir_str,
+        "-o",
+        "%(title).100B [%(id)s].%(ext)s",
+        "--print",
+        "after_move:filepath",
+    ]);
+    apply_js_runtime(&mut cmd, runtime);
+    if let Some(ref jar) = _jar {
+        cmd.arg("--cookies").arg(&jar.path);
+    }
+    if audio_only {
+        cmd.args(["-x", "--audio-format", "m4a", "-f", "bestaudio/best"]);
+    } else {
+        cmd.args(["-f", &fmt, "--merge-output-format", "mp4"]);
+    }
+    cmd.arg(format!("https://www.youtube.com/watch?v={vid}"));
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+
+    let mut child = cmd.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing yt-dlp stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing yt-dlp stderr"))?;
+    let err_handle = std::thread::spawn(move || {
+        let mut errs = String::new();
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if !errs.is_empty() {
+                errs.push('\n');
+            }
+            errs.push_str(&line);
+        }
+        errs
+    });
+
+    let mut last_path: Option<PathBuf> = None;
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        if let Some(prog) = parse_progress_line(&line) {
+            on_progress(prog);
+        } else {
+            let t = line.trim();
+            if !t.is_empty() && !t.starts_with('[') {
+                last_path = Some(PathBuf::from(t));
+            }
+        }
+    }
+    let status = child.wait()?;
+    let err_text = err_handle.join().unwrap_or_default();
+    if !status.success() {
+        let msg = err_text
+            .lines()
+            .rfind(|l| l.contains("ERROR"))
+            .unwrap_or("yt-dlp download failed");
+        anyhow::bail!("{}", msg.trim());
+    }
+    Ok(last_path.unwrap_or_else(|| out_dir.to_path_buf()))
+}
+
 /// Downloads a video (MP4) or audio (M4A/Opus) into the configured download folder (or Downloads/yt-rust) via yt-dlp.
+/// Tries without account cookies first and retries with cookies only when YouTube requires auth.
 pub async fn download_video(
     http: &reqwest::Client,
     data_dir: &Path,
@@ -746,7 +874,7 @@ pub async fn download_video(
     video_id: &str,
     audio_only: bool,
     max_height: u32,
-    on_progress: impl Fn(DownloadProgress) + Send + 'static,
+    on_progress: impl Fn(DownloadProgress) + Send + Sync + 'static,
 ) -> anyhow::Result<PathBuf> {
     let (bin_res, runtime) = tokio::join!(
         ensure_ytdlp(http, data_dir),
@@ -760,91 +888,40 @@ pub async fn download_video(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| default_downloads_dir(data_dir));
     let vid = video_id.to_owned();
+    let progress_cb: Arc<dyn Fn(DownloadProgress) + Send + Sync> = Arc::new(on_progress);
     tokio::task::spawn_blocking(move || -> anyhow::Result<PathBuf> {
-        std::fs::create_dir_all(&out_dir)?;
-        let _jar = cookie
-            .as_deref()
-            .map(|c| TempCookieJar::create(&data_dir_owned, c))
-            .transpose()?;
-        let out_dir_str = out_dir.to_string_lossy().into_owned();
-        let mut cmd = Command::new(&bin);
-        let fmt = format!(
-            "bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best"
+        let first = run_ytdlp_download(
+            &bin,
+            runtime.as_deref(),
+            &data_dir_owned,
+            &out_dir,
+            None,
+            &vid,
+            audio_only,
+            max_height,
+            &progress_cb,
         );
-        cmd.args([
-            "--no-warnings",
-            "--no-playlist",
-            "--restrict-filenames",
-            "--newline",
-            "--progress",
-            "--progress-template",
-            "download:DLPROG:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._total_bytes_estimate_str,progress._total_bytes_str)s",
-            "-P",
-            &out_dir_str,
-            "-o",
-            "%(title).100B [%(id)s].%(ext)s",
-            "--print",
-            "after_move:filepath",
-        ]);
-        apply_js_runtime(&mut cmd, runtime.as_deref());
-        if let Some(ref jar) = _jar {
-            cmd.arg("--cookies").arg(&jar.path);
-        }
-        if audio_only {
-            cmd.args(["-x", "--audio-format", "m4a", "-f", "bestaudio/best"]);
-        } else {
-            cmd.args(["-f", &fmt, "--merge-output-format", "mp4"]);
-        }
-        cmd.arg(format!("https://www.youtube.com/watch?v={vid}"));
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000);
-        }
-
-        let mut child = cmd.spawn()?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("missing yt-dlp stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("missing yt-dlp stderr"))?;
-        let err_handle = std::thread::spawn(move || {
-            let mut errs = String::new();
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if !errs.is_empty() {
-                    errs.push('\n');
+        match first {
+            Ok(path) => Ok(path),
+            Err(e) => {
+                if is_auth_required_error(&format!("{e:#}")) {
+                    if let Some(c) = cookie.as_deref() {
+                        return run_ytdlp_download(
+                            &bin,
+                            runtime.as_deref(),
+                            &data_dir_owned,
+                            &out_dir,
+                            Some(c),
+                            &vid,
+                            audio_only,
+                            max_height,
+                            &progress_cb,
+                        );
+                    }
                 }
-                errs.push_str(&line);
-            }
-            errs
-        });
-
-        let mut last_path: Option<PathBuf> = None;
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Some(prog) = parse_progress_line(&line) {
-                on_progress(prog);
-            } else {
-                let t = line.trim();
-                if !t.is_empty() && !t.starts_with('[') {
-                    last_path = Some(PathBuf::from(t));
-                }
+                Err(e)
             }
         }
-        let status = child.wait()?;
-        let err_text = err_handle.join().unwrap_or_default();
-        if !status.success() {
-            let msg = err_text
-                .lines()
-                .rfind(|l| l.contains("ERROR"))
-                .unwrap_or("yt-dlp download failed");
-            anyhow::bail!("{}", msg.trim());
-        }
-        Ok(last_path.unwrap_or(out_dir))
     })
     .await?
 }
@@ -930,5 +1007,16 @@ mod tests {
         assert_eq!(s_hls.video_formats.len(), 2);
         assert_eq!((s_hls.video_formats[0].height, s_hls.video_formats[0].fps), (1080, 60));
         assert_eq!(s_hls.video_formats[1].height, 480);
+    }
+
+    #[test]
+    fn detects_auth_required_ytdlp_errors() {
+        assert!(super::is_auth_required_error(
+            "ERROR: [youtube] xyz: Sign in to confirm you're not a bot"
+        ));
+        assert!(super::is_auth_required_error(
+            "ERROR: This video is available to this channel's members-only"
+        ));
+        assert!(!super::is_auth_required_error("HTTP Error 404: Not Found"));
     }
 }

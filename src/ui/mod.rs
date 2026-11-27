@@ -683,6 +683,32 @@ impl YtApp {
         self.status_toast = Some((msg.into(), Instant::now()));
     }
 
+    fn reset_signed_out_state(&mut self) {
+        self.signed_in = false;
+        self.signing_in = false;
+        self.account_name = None;
+        self.account_avatar = None;
+        self.notifications.clear();
+        self.notifications_open = false;
+        self.unread_notifications = 0;
+        self.notifications_seen_params = None;
+        self.notifications_loaded_at = None;
+        self.subs_items.clear();
+        self.guide_channels.clear();
+        self.guide_playlists.clear();
+        self.playlist_items.clear();
+        self.active_playlist_id = None;
+        self.remote_history.clear();
+        self.remote_history_continuation = None;
+        self.home_chips.clear();
+        self.home_loading = true;
+        let _ = self.backend.tx.send(Request::LoadHome {
+            params: None,
+            continuation: None,
+            append: false,
+        });
+    }
+
     pub(super) fn trigger_hud(&mut self, ico: HudIcon, msg: impl Into<String>) {
         self.hud_feedback = Some((ico, msg.into(), Instant::now()));
     }
@@ -2385,30 +2411,12 @@ impl YtApp {
                     self.toast("Signed in to YouTube");
                 }
                 Response::SignedOut => {
-                    self.signed_in = false;
-                    self.signing_in = false;
-                    self.account_name = None;
-                    self.account_avatar = None;
-                    self.notifications.clear();
-                    self.notifications_open = false;
-                    self.unread_notifications = 0;
-                    self.notifications_seen_params = None;
-                    self.notifications_loaded_at = None;
-                    self.subs_items.clear();
-                    self.guide_channels.clear();
-                    self.guide_playlists.clear();
-                    self.playlist_items.clear();
-                    self.active_playlist_id = None;
-                    self.remote_history.clear();
-                    self.remote_history_continuation = None;
-                    self.home_chips.clear();
-                    self.home_loading = true;
-                    let _ = self.backend.tx.send(Request::LoadHome {
-                        params: None,
-                        continuation: None,
-                        append: false,
-                    });
+                    self.reset_signed_out_state();
                     self.toast("Signed out");
+                }
+                Response::SessionRevoked => {
+                    self.reset_signed_out_state();
+                    self.toast("YouTube session expired — please sign in again");
                 }
                 Response::LibmpvDownloaded(res) => {
                     self.downloading_mpv = false;

@@ -12,7 +12,7 @@ use crate::model::{
 };
 
 const ORIGIN: &str = "https://www.youtube.com";
-const WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
+pub const WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 const FALLBACK_WEB_VERSION: &str = "2.20261001.00.00";
 const VISIONOS_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
 const CONSENT_COOKIE: &str = "SOCS=CAISAiAD";
@@ -3564,7 +3564,7 @@ async fn try_authenticated_players(
             return Some(v);
         }
     }
-    if let Ok(v) = player_web_safari(http, video_id, cfg, session).await {
+    if let Ok(v) = player_web_signed_in(http, video_id, cfg, session).await {
         if has_playable_url(&v) {
             return Some(v);
         }
@@ -3614,17 +3614,16 @@ async fn player_tv(
     Ok(resp)
 }
 
-async fn player_web_safari(
+async fn player_web_signed_in(
     http: &reqwest::Client,
     video_id: &str,
     cfg: &WebConfig,
     session: &Session,
 ) -> anyhow::Result<Value> {
-    const SAFARI_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Safari/605.1.15";
     let mut client = json!({
         "clientName": "WEB",
         "clientVersion": cfg.client_version,
-        "userAgent": SAFARI_UA,
+        "userAgent": WEB_UA,
         "hl": "en",
         "gl": "US",
     });
@@ -3639,7 +3638,7 @@ async fn player_web_safari(
     });
     let mut req = http
         .post("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
-        .header("User-Agent", SAFARI_UA)
+        .header("User-Agent", WEB_UA)
         .header("X-YouTube-Client-Name", "1")
         .header("X-YouTube-Client-Version", &cfg.client_version)
         .header("Origin", ORIGIN)

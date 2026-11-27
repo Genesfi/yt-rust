@@ -372,6 +372,7 @@ pub enum Response {
         avatar: Option<String>,
     },
     SignedOut,
+    SessionRevoked,
     LibmpvDownloaded(Result<PathBuf, String>),
     Error(String),
 }
@@ -632,7 +633,20 @@ impl Backend {
                         });
                     }
 
+                    let shared_session = Arc::new(Mutex::new(session));
+                    {
+                        let rot_http = http.clone();
+                        let rot_sess = shared_session.clone();
+                        let rot_dir = dir_clone.clone();
+                        let rot_tx = resp_tx.clone();
+                        let rot_wake = wake.clone();
+                        tokio::spawn(async move {
+                            rotate_cookies_loop(rot_http, rot_sess, rot_dir, rot_tx, rot_wake).await;
+                        });
+                    }
+
                     while let Ok(req) = req_rx.recv() {
+                        let session = shared_session.lock().unwrap().clone();
                         let http = http.clone();
                         let resp_tx = resp_tx.clone();
                         let wake = wake.clone();
@@ -2031,7 +2045,8 @@ impl Backend {
                                             s.save(&data_dir);
                                             let name = s.account_name.clone();
                                             let avatar = s.account_avatar.clone();
-                                            session = Some(s);
+                                            *shared_session.lock().unwrap() = Some(s.clone());
+                                            let session_ref = Some(s);
                                             let _ = resp_tx.send(Response::SignedIn { name, avatar });
                                             // Automatically refresh Home feed with authenticated session
                                             if let Ok(FeedPage {
@@ -2045,7 +2060,7 @@ impl Backend {
                                                 None,
                                                 None,
                                                 &cfg,
-                                                session.as_ref(),
+                                                session_ref.as_ref(),
                                             )
                                             .await
                                             {
@@ -2060,7 +2075,7 @@ impl Backend {
                                                     is_fallback_trending,
                                                 });
                                             }
-                                            if let Some(ref s) = session {
+                                            if let Some(ref s) = session_ref {
                                                 tokio::spawn(load_guide_and_backfill_thumbs(
                                                     http.clone(),
                                                     cfg.clone(),
@@ -2081,7 +2096,7 @@ impl Backend {
                                 }
                             }
                             Request::SignOut => {
-                                session = None;
+                                *shared_session.lock().unwrap() = None;
                                 Session::clear(&data_dir);
                                 login::forget(&data_dir.join("login-webview"));
                                 cfg = innertube::fetch_web_config(&http, None).await;
@@ -2157,6 +2172,53 @@ impl Backend {
             rt: rt_handle,
             wake: wake_for_struct,
         }
+    }
+}
+
+async fn rotate_cookies_loop(
+    http: reqwest::Client,
+    shared_session: Arc<Mutex<Option<Session>>>,
+    data_dir: PathBuf,
+    resp_tx: Sender<Response>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+) {
+    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    loop {
+        let cur = shared_session.lock().unwrap().clone();
+        if let Some(sess) = cur {
+            match sess.rotate(&http).await {
+                Ok(lines) => {
+                    let updated = {
+                        let mut guard = shared_session.lock().unwrap();
+                        if let Some(ref active) = *guard {
+                            if let Some(next) =
+                                active.updated(lines.iter().map(String::as_str))
+                            {
+                                *guard = Some(next.clone());
+                                Some(next)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(s) = updated {
+                        s.save(&data_dir);
+                    }
+                }
+                Err(e) if e.is::<crate::auth::RevokedError>() => {
+                    *shared_session.lock().unwrap() = None;
+                    Session::clear(&data_dir);
+                    let _ = resp_tx.send(Response::SessionRevoked);
+                    wake();
+                }
+                Err(e) => {
+                    log::warn!("cookie rotation skipped (transient): {e:#}");
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(480)).await;
     }
 }
 
