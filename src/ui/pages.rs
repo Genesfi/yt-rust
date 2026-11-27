@@ -685,6 +685,7 @@ impl YtApp {
         };
 
         let mut grid_action: Option<super::cards::GridAction> = None;
+        let mut clicked_channel_chip: Option<usize> = None;
         let mut measured_header_h = sticky.header_h;
 
         let mut sa = ScrollArea::vertical().id_salt(("channel_page_scroll", cid_key.as_str()));
@@ -798,6 +799,38 @@ impl YtApp {
             // Reserve exact flow height for the sticky tab + channel search bar rendered on top.
             ui.allocate_space(Vec2::new(ui.available_width(), sticky.tab_bar_h));
             ui.add_space(8.0);
+
+            if search_active.is_empty() && !self.channel_chips.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    for (idx, chip) in self.channel_chips.iter().enumerate() {
+                        let (fill, text_col) = if chip.selected {
+                            (
+                                Color32::from_rgb(241, 241, 241),
+                                Color32::from_rgb(15, 15, 15),
+                            )
+                        } else {
+                            (theme::CHIP, theme::TEXT)
+                        };
+                        let resp = ui.add(
+                            egui::Button::new(
+                                RichText::new(&chip.title)
+                                    .font(theme::medium(13.0))
+                                    .color(text_col),
+                            )
+                            .fill(fill)
+                            .corner_radius(CornerRadius::same(8)),
+                        );
+                        if resp.hovered() {
+                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                        }
+                        if resp.clicked() && !chip.selected {
+                            clicked_channel_chip = Some(idx);
+                        }
+                    }
+                });
+                ui.add_space(12.0);
+            }
 
             grid_action = super::cards::draw_video_grid_body(
                 ui,
@@ -932,6 +965,7 @@ impl YtApp {
                                 if let Some(cid) = self.channel_id.clone() {
                                     self.channel_search_active.clear();
                                     self.channel_tab_params = tab.params.clone();
+                                    self.channel_chips.clear();
                                     self.channel_items.clear();
                                     self.channel_continuation = None;
                                     self.channel_loading = true;
@@ -942,6 +976,7 @@ impl YtApp {
                                         channel_id: cid,
                                         params: tab.params.clone(),
                                         continuation: None,
+                                        append: false,
                                     });
                                 }
                             }
@@ -954,6 +989,7 @@ impl YtApp {
                                 self.channel_search_input.clear();
                                 self.channel_search_active.clear();
                                 if let Some(cid) = self.channel_id.clone() {
+                                    self.channel_chips.clear();
                                     self.channel_items.clear();
                                     self.channel_continuation = None;
                                     self.channel_loading = true;
@@ -964,6 +1000,7 @@ impl YtApp {
                                         channel_id: cid,
                                         params: self.channel_tab_params.clone(),
                                         continuation: None,
+                                        append: false,
                                     });
                                 }
                             }
@@ -1008,6 +1045,26 @@ impl YtApp {
         sticky.tab_bar_h = measured_tab_bar_h;
         ctx.data_mut(|d| d.insert_temp(sticky_id, sticky));
 
+        if let Some(chip_idx) = clicked_channel_chip {
+            if let (Some(cid), Some(chip)) = (
+                self.channel_id.clone(),
+                self.channel_chips.get(chip_idx).cloned(),
+            ) {
+                for (i, c) in self.channel_chips.iter_mut().enumerate() {
+                    c.selected = i == chip_idx;
+                }
+                self.channel_items.clear();
+                self.channel_continuation = None;
+                self.channel_loading = true;
+                let _ = self.backend.tx.send(Request::LoadChannel {
+                    channel_id: cid,
+                    params: chip.params,
+                    continuation: chip.continuation,
+                    append: false,
+                });
+            }
+        }
+
         if cont.is_some() && !loading && grid_action.is_none() {
             let remaining = scroll_out.content_size.y
                 - (scroll_out.state.clamped_offset().y + scroll_out.inner_rect.height());
@@ -1035,6 +1092,7 @@ impl YtApp {
                             channel_id: cid,
                             params: tab_params,
                             continuation: cont,
+                            append: true,
                         });
                     } else {
                         let _ = app.backend.tx.send(Request::SearchChannel {
@@ -1443,6 +1501,11 @@ impl YtApp {
         words: &[String],
     ) -> bool {
         let m_quality = settings_match(words, group, "Preferred max quality resolution 4k 1080p 720p");
+        let m_hover = settings_match(
+            words,
+            group,
+            "Hover video preview inline beranda home thumbnail 360p 480p 720p mute",
+        );
         let m_autoplay = settings_match(words, group, "Autoplay next Up Next video");
         let m_resume = settings_match(words, group, "Auto-resume last watched video tabs startup");
         let m_pot = settings_match(
@@ -1450,7 +1513,7 @@ impl YtApp {
             group,
             "BotGuard PO Token auto on off yt-dlp blocked 403 webview",
         );
-        if !m_quality && !m_autoplay && !m_resume && !m_pot {
+        if !m_quality && !m_hover && !m_autoplay && !m_resume && !m_pot {
             return false;
         }
         settings_group_frame(ui, group, None, |ui| {
@@ -1471,6 +1534,36 @@ impl YtApp {
                             });
                     },
                 );
+            }
+            if m_hover {
+                if count > 0 {
+                    settings_divider(ui);
+                }
+                count += 1;
+                let prev_hover = self.hover_preview_quality;
+                settings_row(
+                    ui,
+                    "Hover video preview",
+                    Some("Play an inline preview when hovering video cards on feeds (with mute/unmute toggle)."),
+                    |ui| {
+                        egui::ComboBox::from_id_salt("settings_hover_preview")
+                            .selected_text(self.hover_preview_quality.label())
+                            .show_ui(ui, |ui| {
+                                for q in crate::model::HoverPreviewQuality::ALL {
+                                    ui.selectable_value(
+                                        &mut self.hover_preview_quality,
+                                        q,
+                                        q.label(),
+                                    );
+                                }
+                            });
+                    },
+                );
+                if self.hover_preview_quality != prev_hover
+                    && self.hover_preview_quality == crate::model::HoverPreviewQuality::Off
+                {
+                    self.stop_hover_preview();
+                }
             }
             if m_autoplay {
                 if count > 0 {

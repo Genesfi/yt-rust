@@ -15,10 +15,11 @@ use egui::{Align, Color32, Frame, Key, Layout, Margin, ViewportCommand};
 use crate::backend::{Backend, Request, Response};
 use crate::innertube;
 use crate::model::{
-    AmbientMode, ChannelInfo, ChannelNotificationParams, CommentItem, FeedChip, HwdecMode,
-    KeyBinding, LastWatched, LiveChatEmote, LiveChatMessage, NotificationMenuItem,
-    PlaylistOption, PlaylistSummary, PoTokenMode, PreferredQuality, ShortcutConfig, ShortcutSlot,
-    SidebarChannel, SponsorCategory, SponsorSegment, VideoItem, WatchData, WindowMaterial,
+    AmbientMode, ChannelInfo, ChannelNotificationParams, CommentItem, FeedChip,
+    HoverPreviewQuality, HwdecMode, KeyBinding, LastWatched, LiveChatEmote, LiveChatMessage,
+    NotificationMenuItem, PlaylistOption, PlaylistSummary, PoTokenMode, PreferredQuality,
+    ShortcutConfig, ShortcutSlot, SidebarChannel, SponsorCategory, SponsorSegment, VideoItem,
+    WatchData, WindowMaterial,
 };
 use crate::mpv::{GlProcAddrFn, MpvPlayer, PlaybackState};
 use crate::os_media::OsMedia;
@@ -423,6 +424,7 @@ pub struct YtApp {
     pub(super) channel_name: String,
     pub(super) channel_info: Option<ChannelInfo>,
     pub(super) channel_tab_params: Option<String>,
+    pub(super) channel_chips: Vec<FeedChip>,
     pub(super) channel_items: Vec<VideoItem>,
     pub(super) channel_continuation: Option<String>,
     pub(super) channel_loading: bool,
@@ -503,6 +505,15 @@ pub struct YtApp {
     pub(super) muted: bool,
     pub(super) speed: f64,
     pub(super) preferred_quality: PreferredQuality,
+    pub(super) hover_preview_quality: HoverPreviewQuality,
+    pub(super) hover_preview_muted: bool,
+    pub(super) hover_preview_mpv: Option<MpvPlayer>,
+    pub(super) hover_preview_playback: PlaybackState,
+    pub(super) hover_preview_candidate: Option<(String, Instant)>,
+    pub(super) hover_preview_loading_id: Option<String>,
+    pub(super) hover_preview_active_id: Option<String>,
+    pub(super) hover_preview_duration: f64,
+    pub(super) hover_preview_last_hover_at: Option<Instant>,
     pub(super) hwdec_mode: HwdecMode,
     pub(super) download_dir: String,
     pub(super) sponsorblock_enabled: bool,
@@ -630,6 +641,8 @@ impl YtApp {
         let mut sub_bg_opacity = 0.70f32;
         let mut shortcuts = ShortcutConfig::default();
         let mut preferred_quality = PreferredQuality::P1080;
+        let mut hover_preview_quality = HoverPreviewQuality::P480;
+        let mut hover_preview_muted = true;
         let mut hwdec_mode = HwdecMode::AutoCopy;
         let mut download_dir = String::new();
         let mut sidebar_expanded = true;
@@ -732,6 +745,12 @@ impl YtApp {
                     "480" => PreferredQuality::P480,
                     _ => PreferredQuality::P1080,
                 };
+            }
+            if let Some(hq) = storage.get_string("hover_preview_quality") {
+                hover_preview_quality = HoverPreviewQuality::from_key(&hq);
+            }
+            if let Some(hm) = storage.get_string("hover_preview_muted") {
+                hover_preview_muted = hm != "0";
             }
             if let Some(h) = storage.get_string("history") {
                 if let Ok(parsed) = serde_json::from_str::<Vec<VideoItem>>(&h) {
@@ -847,6 +866,7 @@ impl YtApp {
             channel_name: String::new(),
             channel_info: None,
             channel_tab_params: None,
+            channel_chips: Vec::new(),
             channel_items: Vec::new(),
             channel_continuation: None,
             channel_loading: false,
@@ -923,6 +943,15 @@ impl YtApp {
             muted: false,
             speed: 1.0,
             preferred_quality,
+            hover_preview_quality,
+            hover_preview_muted,
+            hover_preview_mpv: None,
+            hover_preview_playback: PlaybackState::default(),
+            hover_preview_candidate: None,
+            hover_preview_loading_id: None,
+            hover_preview_active_id: None,
+            hover_preview_duration: 0.0,
+            hover_preview_last_hover_at: None,
             hwdec_mode,
             download_dir,
             sponsorblock_enabled,
@@ -1250,6 +1279,7 @@ impl YtApp {
         self.channel_name = name;
         self.channel_info = None;
         self.channel_tab_params = None;
+        self.channel_chips.clear();
         self.channel_items.clear();
         self.channel_continuation = None;
         self.channel_loading = true;
@@ -1260,6 +1290,7 @@ impl YtApp {
             channel_id,
             params: None,
             continuation: None,
+            append: false,
         });
     }
 
@@ -1358,7 +1389,19 @@ impl YtApp {
         self.toast(format!("Removed \"{}\"", item.title));
     }
 
-    pub(super) fn open_video(&mut self, item: VideoItem) {
+    pub(super) fn open_video(&mut self, mut item: VideoItem) {
+        if self.hover_preview_active_id.as_deref() == Some(item.id.as_str())
+            && !item.is_live
+            && !item.is_short()
+            && item.resume_secs.is_none()
+            && self.hover_preview_playback.time_pos > 2.0
+        {
+            let dur = self.hover_preview_duration.max(self.hover_preview_playback.duration);
+            if dur <= 0.0 || self.hover_preview_playback.time_pos + 5.0 < dur {
+                item.resume_secs = Some(self.hover_preview_playback.time_pos);
+            }
+        }
+        self.stop_hover_preview();
         if let Some(s) = item.resume_secs.filter(|&s| s > 2.0) {
             self.resume_positions.insert(item.id.clone(), s);
         }
@@ -2898,6 +2941,7 @@ impl YtApp {
                     channel_id,
                     info,
                     mut items,
+                    chips,
                     continuation,
                     append,
                 } => {
@@ -2907,8 +2951,27 @@ impl YtApp {
                         if !info.name.is_empty() && info.name != "Channel" {
                             self.channel_name = info.name.clone();
                         }
-                        if !append || self.channel_info.is_none() {
+                        if !info.tabs.is_empty()
+                            || info.avatar_url.is_some()
+                            || !info.subscribers_text.is_empty()
+                            || self.channel_info.is_none()
+                        {
                             self.channel_info = Some(info);
+                        }
+                        if !chips.is_empty() {
+                            self.channel_chips = chips;
+                        }
+                        let ch_avatar = self
+                            .channel_info
+                            .as_ref()
+                            .and_then(|i| i.avatar_url.clone());
+                        for it in &mut items {
+                            if it.channel.is_empty() && !self.channel_name.is_empty() {
+                                it.channel = self.channel_name.clone();
+                            }
+                            if it.channel_avatar_url.is_none() {
+                                it.channel_avatar_url = ch_avatar.clone();
+                            }
                         }
                         if append {
                             for it in items {
@@ -2972,6 +3035,54 @@ impl YtApp {
                 Response::SearchSuggestions { query, suggestions } => {
                     if query == self.search_input.trim() {
                         self.search_suggestions = suggestions;
+                    }
+                }
+                Response::HoverPreviewReady {
+                    video_id,
+                    video_url,
+                    audio_url,
+                    duration_secs,
+                } => {
+                    if self.hover_preview_quality != HoverPreviewQuality::Off
+                        && self.hover_preview_loading_id.as_deref() == Some(video_id.as_str())
+                    {
+                        if self.hover_preview_mpv.is_none() && self.mpv_error.is_none() {
+                            if let Some(gpa) = self.get_proc_address.clone() {
+                                match MpvPlayer::new_preview(
+                                    &self.backend.data_dir,
+                                    gpa,
+                                    ctx.clone(),
+                                ) {
+                                    Ok(player) => {
+                                        player.set_hwdec(self.hwdec_mode);
+                                        player.set_volume(self.volume);
+                                        player.set_mute(self.hover_preview_muted);
+                                        self.hover_preview_mpv = Some(player);
+                                    }
+                                    Err(e) => {
+                                        log::warn!("hover preview mpv init failed: {e:#}");
+                                        self.hover_preview_loading_id = None;
+                                    }
+                                }
+                            } else {
+                                self.hover_preview_loading_id = None;
+                            }
+                        }
+                        if let Some(mpv) = &self.hover_preview_mpv {
+                            mpv.set_hwdec(self.hwdec_mode);
+                            mpv.set_volume(self.volume);
+                            mpv.set_mute(self.hover_preview_muted);
+                            mpv.load_stream(&video_url, audio_url.as_deref(), Some(0.0));
+                            self.hover_preview_active_id = Some(video_id);
+                            self.hover_preview_loading_id = None;
+                            self.hover_preview_duration = duration_secs;
+                            self.hover_preview_playback = PlaybackState::default();
+                        }
+                    }
+                }
+                Response::HoverPreviewFailed { video_id } => {
+                    if self.hover_preview_loading_id.as_deref() == Some(video_id.as_str()) {
+                        self.hover_preview_loading_id = None;
                     }
                 }
                 Response::WatchReady {
@@ -4689,6 +4800,14 @@ impl eframe::App for YtApp {
             PreferredQuality::P480 => "480",
         };
         storage.set_string("quality", q.into());
+        storage.set_string(
+            "hover_preview_quality",
+            self.hover_preview_quality.key().into(),
+        );
+        storage.set_string(
+            "hover_preview_muted",
+            if self.hover_preview_muted { "1" } else { "0" }.into(),
+        );
         if let Ok(h) = serde_json::to_string(&self.history) {
             storage.set_string("history", h);
         }
@@ -4713,6 +4832,9 @@ impl eframe::App for YtApp {
             }
         }
         if let Some(mpv) = &self.shorts_slot.mpv {
+            mpv.destroy_gl(gl);
+        }
+        if let Some(mpv) = &self.hover_preview_mpv {
             mpv.destroy_gl(gl);
         }
     }
@@ -4802,6 +4924,7 @@ impl eframe::App for YtApp {
                     self.draw_player_tab_bar(ui);
                 }
 
+                self.begin_hover_preview_frame(&ctx);
                 match self.page {
                     Page::Home => self.draw_home_page(ui),
                     Page::Shorts => self.draw_shorts_page(ui),
@@ -4883,6 +5006,8 @@ impl eframe::App for YtApp {
                 }
             });
 
+        self.end_hover_preview_frame(&ctx);
+
         let has_video_player = self.watch.is_some()
             || self.bg_player_tab.as_ref().is_some_and(|b| b.watch.is_some());
         if !self.fullscreen
@@ -4895,6 +5020,148 @@ impl eframe::App for YtApp {
         self.draw_playlist_picker_modal(&ctx);
         self.draw_toast_snackbar(&ctx);
         self.record_nav_transition();
+    }
+}
+
+impl YtApp {
+    pub(super) fn stop_hover_preview(&mut self) {
+        if self.hover_preview_loading_id.take().is_some() {
+            let _ = self.backend.tx.send(Request::CancelHoverPreview);
+        }
+        self.hover_preview_candidate = None;
+        self.hover_preview_active_id = None;
+        self.hover_preview_duration = 0.0;
+        self.hover_preview_last_hover_at = None;
+        self.hover_preview_playback = PlaybackState::default();
+        if let Some(mpv) = &self.hover_preview_mpv {
+            mpv.stop();
+        }
+    }
+
+    fn begin_hover_preview_frame(&mut self, ctx: &egui::Context) {
+        let allowed = self.hover_preview_quality != HoverPreviewQuality::Off
+            && !matches!(self.page, Page::Watch | Page::Shorts)
+            && !self.win_pip_mode
+            && !self.hidden_to_tray
+            && !self.fullscreen;
+        if !allowed {
+            self.stop_hover_preview();
+            ctx.data_mut(|d| {
+                d.insert_temp(cards::hover_input_id(), cards::HoverPreviewInput::default());
+                d.insert_temp(
+                    cards::hover_output_id(),
+                    cards::HoverPreviewOutput::default(),
+                );
+            });
+            return;
+        }
+        if let (Some(mpv), Some(_)) = (&self.hover_preview_mpv, &self.hover_preview_active_id) {
+            self.hover_preview_playback = mpv.poll_state();
+            if !self.hover_preview_playback.paused {
+                ctx.request_repaint_after(Duration::from_millis(33));
+            }
+        }
+        let input = cards::HoverPreviewInput {
+            enabled: true,
+            active_id: self.hover_preview_active_id.clone(),
+            loading_id: self.hover_preview_loading_id.clone(),
+            muted: self.hover_preview_muted,
+            time_pos: self.hover_preview_playback.time_pos,
+            duration: self
+                .hover_preview_duration
+                .max(self.hover_preview_playback.duration),
+            has_frame: self.hover_preview_active_id.is_some()
+                && self.hover_preview_playback.video_h > 0,
+            render_handle: self.hover_preview_mpv.as_ref().map(|m| m.render_handle()),
+        };
+        ctx.data_mut(|d| {
+            d.insert_temp(cards::hover_input_id(), input);
+            d.insert_temp(
+                cards::hover_output_id(),
+                cards::HoverPreviewOutput::default(),
+            );
+        });
+    }
+
+    fn end_hover_preview_frame(&mut self, ctx: &egui::Context) {
+        if self.hover_preview_quality == HoverPreviewQuality::Off
+            || matches!(self.page, Page::Watch | Page::Shorts)
+            || self.win_pip_mode
+            || self.hidden_to_tray
+            || self.fullscreen
+        {
+            return;
+        }
+        let out = ctx
+            .data_mut(|d| d.get_temp::<cards::HoverPreviewOutput>(cards::hover_output_id()))
+            .unwrap_or_default();
+
+        if out.toggle_mute {
+            self.hover_preview_muted = !self.hover_preview_muted;
+            if let Some(mpv) = &self.hover_preview_mpv {
+                mpv.set_mute(self.hover_preview_muted);
+                mpv.set_volume(self.volume);
+            }
+        }
+
+        let popup_open = egui::Popup::is_any_open(ctx);
+        match out.hovered_id {
+            Some(vid) if !popup_open => {
+                self.hover_preview_last_hover_at = Some(Instant::now());
+                if self.hover_preview_active_id.as_deref() == Some(vid.as_str())
+                    || self.hover_preview_loading_id.as_deref() == Some(vid.as_str())
+                {
+                    return;
+                }
+                match &self.hover_preview_candidate {
+                    Some((cand, started)) if cand == &vid => {
+                        if started.elapsed() >= Duration::from_millis(500) {
+                            let target = vid;
+                            self.hover_preview_candidate = None;
+                            self.hover_preview_active_id = None;
+                            self.hover_preview_duration = 0.0;
+                            self.hover_preview_playback = PlaybackState::default();
+                            if let Some(mpv) = &self.hover_preview_mpv {
+                                mpv.stop();
+                            }
+                            self.hover_preview_loading_id = Some(target.clone());
+                            let _ = self.backend.tx.send(Request::ResolveHoverPreview {
+                                video_id: target,
+                                max_height: self.hover_preview_quality.max_height(),
+                            });
+                        } else {
+                            ctx.request_repaint_after(Duration::from_millis(80));
+                        }
+                    }
+                    _ => {
+                        if self.hover_preview_active_id.is_some()
+                            || self.hover_preview_loading_id.is_some()
+                        {
+                            self.stop_hover_preview();
+                            self.hover_preview_last_hover_at = Some(Instant::now());
+                        }
+                        self.hover_preview_candidate = Some((vid, Instant::now()));
+                        ctx.request_repaint_after(Duration::from_millis(520));
+                    }
+                }
+            }
+            _ => {
+                self.hover_preview_candidate = None;
+                let has_active_or_loading = self.hover_preview_active_id.is_some()
+                    || self.hover_preview_loading_id.is_some();
+                if has_active_or_loading {
+                    let expired = popup_open
+                        || self
+                            .hover_preview_last_hover_at
+                            .is_none_or(|t| t.elapsed() >= Duration::from_millis(160));
+                    if expired {
+                        self.stop_hover_preview();
+                    } else {
+                        ctx.request_repaint_after(Duration::from_millis(60));
+                    }
+                }
+            }
+        }
     }
 }
 

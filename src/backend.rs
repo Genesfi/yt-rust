@@ -63,6 +63,7 @@ pub enum Request {
         channel_id: String,
         params: Option<String>,
         continuation: Option<String>,
+        append: bool,
     },
     SearchChannel {
         channel_id: String,
@@ -85,6 +86,11 @@ pub enum Request {
         video_id: String,
         quality: PreferredQuality,
     },
+    ResolveHoverPreview {
+        video_id: String,
+        max_height: u32,
+    },
+    CancelHoverPreview,
     RecoverStream {
         video_id: String,
         quality: PreferredQuality,
@@ -245,6 +251,7 @@ pub enum Response {
         channel_id: String,
         info: ChannelInfo,
         items: Vec<VideoItem>,
+        chips: Vec<FeedChip>,
         continuation: Option<String>,
         append: bool,
     },
@@ -271,6 +278,15 @@ pub enum Response {
         selected_audio_url: Option<String>,
         selected_format_idx: Option<usize>,
         used_ytdlp: bool,
+    },
+    HoverPreviewReady {
+        video_id: String,
+        video_url: String,
+        audio_url: Option<String>,
+        duration_secs: f64,
+    },
+    HoverPreviewFailed {
+        video_id: String,
     },
     StreamRecovered {
         video_id: String,
@@ -724,6 +740,12 @@ impl Backend {
                     let short_inflight: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> =
                         Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
                     let short_notify = Arc::new(tokio::sync::Notify::new());
+                    let hover_cache: Arc<
+                        tokio::sync::Mutex<
+                            HashMap<String, (String, Option<String>, f64, u32, std::time::Instant)>,
+                        >,
+                    > = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                    let hover_gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
                     {
                         let jsc_warm = jsc.clone();
                         let http_warm = http.clone();
@@ -757,6 +779,8 @@ impl Backend {
                         let short_cache = short_cache.clone();
                         let short_inflight = short_inflight.clone();
                         let short_notify = short_notify.clone();
+                        let hover_cache = hover_cache.clone();
+                        let hover_gen = hover_gen.clone();
 
                         match req {
                             Request::LoadHome {
@@ -1134,8 +1158,8 @@ impl Backend {
                                 channel_id,
                                 params,
                                 continuation,
+                                append,
                             } => {
-                                let append = continuation.is_some();
                                 match innertube::channel_videos(
                                     &http,
                                     &channel_id,
@@ -1150,6 +1174,7 @@ impl Backend {
                                         info,
                                         FeedPage {
                                             items,
+                                            chips,
                                             continuation,
                                             visitor_data,
                                             ..
@@ -1162,6 +1187,7 @@ impl Backend {
                                             channel_id,
                                             info,
                                             items,
+                                            chips,
                                             continuation,
                                             append,
                                         });
@@ -2267,6 +2293,122 @@ impl Backend {
                                     short_notify.notify_waiters();
                                 });
                             }
+                            Request::CancelHoverPreview => {
+                                hover_gen.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Request::ResolveHoverPreview {
+                                video_id,
+                                max_height,
+                            } => {
+                                let my_gen = hover_gen.fetch_add(1, Ordering::Relaxed) + 1;
+                                let cfg_clone = cfg.clone();
+                                let sess_clone = session.clone();
+                                let proxy_clone = proxy.clone();
+                                let hover_cache = hover_cache.clone();
+                                let hover_gen = hover_gen.clone();
+                                tokio::spawn(async move {
+                                    {
+                                        let cache = hover_cache.lock().await;
+                                        if let Some((v_url, a_url, dur, cached_h, at)) =
+                                            cache.get(&video_id)
+                                        {
+                                            if *cached_h == max_height
+                                                && at.elapsed()
+                                                    < std::time::Duration::from_secs(5 * 60)
+                                            {
+                                                if hover_gen.load(Ordering::Relaxed) == my_gen {
+                                                    let _ = resp_tx.send(
+                                                        Response::HoverPreviewReady {
+                                                            video_id,
+                                                            video_url: v_url.clone(),
+                                                            audio_url: a_url.clone(),
+                                                            duration_secs: *dur,
+                                                        },
+                                                    );
+                                                    wake();
+                                                }
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    if hover_gen.load(Ordering::Relaxed) != my_gen {
+                                        return;
+                                    }
+                                    let po_cli = potoken.clone();
+                                    let jsc_cli = jsc.clone();
+                                    let po_mode =
+                                        PoTokenMode::from_u8(po_token_mode.load(Ordering::Relaxed));
+                                    let target_q = if max_height <= 480 {
+                                        PreferredQuality::P480
+                                    } else {
+                                        PreferredQuality::P720
+                                    };
+                                    match resolve_watch_with_height(
+                                        &http,
+                                        &data_dir,
+                                        &video_id,
+                                        target_q,
+                                        Some(max_height),
+                                        &cfg_clone,
+                                        sess_clone.as_ref(),
+                                        proxy_clone.as_ref(),
+                                        &po_cli,
+                                        &jsc_cli,
+                                        po_mode,
+                                        false,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Response::WatchReady {
+                                            data,
+                                            selected_video_url,
+                                            selected_audio_url,
+                                            ..
+                                        }) => {
+                                            let dur = data.duration_secs;
+                                            {
+                                                let mut cache = hover_cache.lock().await;
+                                                if cache.len() >= 10 {
+                                                    if let Some(oldest_k) = cache
+                                                        .iter()
+                                                        .min_by_key(|(_, (_, _, _, _, at))| *at)
+                                                        .map(|(k, _)| k.clone())
+                                                    {
+                                                        cache.remove(&oldest_k);
+                                                    }
+                                                }
+                                                cache.insert(
+                                                    video_id.clone(),
+                                                    (
+                                                        selected_video_url.clone(),
+                                                        selected_audio_url.clone(),
+                                                        dur,
+                                                        max_height,
+                                                        std::time::Instant::now(),
+                                                    ),
+                                                );
+                                            }
+                                            if hover_gen.load(Ordering::Relaxed) == my_gen {
+                                                let _ = resp_tx.send(Response::HoverPreviewReady {
+                                                    video_id,
+                                                    video_url: selected_video_url,
+                                                    audio_url: selected_audio_url,
+                                                    duration_secs: dur,
+                                                });
+                                                wake();
+                                            }
+                                        }
+                                        _ => {
+                                            if hover_gen.load(Ordering::Relaxed) == my_gen {
+                                                let _ = resp_tx.send(Response::HoverPreviewFailed {
+                                                    video_id,
+                                                });
+                                                wake();
+                                            }
+                                        }
+                                    }
+                                });
+                            }
                             Request::RecoverStream {
                                 video_id,
                                 quality,
@@ -2954,6 +3096,17 @@ fn select_and_wrap_watch(
     ua: Option<&str>,
     prefetch: bool,
 ) -> Option<(String, Option<String>, Option<usize>, String, Option<String>)> {
+    select_and_wrap_watch_height(data, quality.max_height(), quality != PreferredQuality::Best4K, proxy, ua, prefetch)
+}
+
+fn select_and_wrap_watch_height(
+    data: &WatchData,
+    max_height: u32,
+    hint_non_4k: bool,
+    proxy: Option<&StreamProxy>,
+    ua: Option<&str>,
+    prefetch: bool,
+) -> Option<(String, Option<String>, Option<usize>, String, Option<String>)> {
     let wrap = |url: &str, len: u64| -> String {
         let is_hls = url.contains(".m3u8") || url.contains("/manifest/hls");
         match proxy {
@@ -2968,15 +3121,15 @@ fn select_and_wrap_watch(
     };
     if data.is_live {
         if let Some(hls) = data.hls_url.clone() {
-            let hint_idx = if quality != PreferredQuality::Best4K {
-                pick_format_index(&data.video_formats, quality.max_height())
+            let hint_idx = if hint_non_4k {
+                pick_format_index(&data.video_formats, max_height)
             } else {
                 None
             };
             return Some((hls.clone(), None, hint_idx, hls, None));
         }
     }
-    if let Some(idx) = pick_format_index(&data.video_formats, quality.max_height()) {
+    if let Some(idx) = pick_format_index(&data.video_formats, max_height) {
         let fmt = &data.video_formats[idx];
         let raw_v = fmt.url.clone();
         let raw_a = if fmt.has_audio {
@@ -3171,6 +3324,39 @@ async fn resolve_watch(
     po_mode: PoTokenMode,
     prefetch: bool,
 ) -> anyhow::Result<Response> {
+    resolve_watch_with_height(
+        http,
+        data_dir,
+        video_id,
+        quality,
+        None,
+        cfg,
+        session,
+        proxy,
+        potoken,
+        jsc,
+        po_mode,
+        prefetch,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_watch_with_height(
+    http: &reqwest::Client,
+    data_dir: &PathBuf,
+    video_id: &str,
+    quality: PreferredQuality,
+    height_override: Option<u32>,
+    cfg: &WebConfig,
+    session: Option<&Session>,
+    proxy: Option<&StreamProxy>,
+    potoken: &PoTokenClient,
+    jsc: &crate::jsc::Solver,
+    po_mode: PoTokenMode,
+    prefetch: bool,
+) -> anyhow::Result<Response> {
+    let target_h = height_override.unwrap_or_else(|| quality.max_height());
     let mut blocked_hint = po_mode == PoTokenMode::On;
     let mut strict_auth = false;
 
@@ -3185,7 +3371,7 @@ async fn resolve_watch(
                             potoken.close_if_running();
                         }
                         let hint_idx = if quality != PreferredQuality::Best4K {
-                            pick_format_index(&data.video_formats, quality.max_height())
+                            pick_format_index(&data.video_formats, target_h)
                         } else {
                             None
                         };
@@ -3198,9 +3384,14 @@ async fn resolve_watch(
                         });
                     }
                 }
-                if let Some((v_url, a_url, idx, _, _)) =
-                    select_and_wrap_watch(&data, quality, proxy, None, prefetch)
-                {
+                if let Some((v_url, a_url, idx, _, _)) = select_and_wrap_watch_height(
+                    &data,
+                    target_h,
+                    quality != PreferredQuality::Best4K,
+                    proxy,
+                    None,
+                    prefetch,
+                ) {
                     if po_mode == PoTokenMode::Auto {
                         potoken.close_if_running();
                     }
@@ -3251,7 +3442,7 @@ async fn resolve_watch(
         http,
         data_dir,
         video_id,
-        quality.max_height(),
+        target_h,
         cfg,
         session,
         potoken,

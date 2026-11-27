@@ -2599,11 +2599,27 @@ impl YtApp {
                             .map_or(w.description.len(), |(i, _)| i);
                         &w.description[..end]
                     };
-                    ui.label(
-                        RichText::new(desc)
-                            .font(theme::regular(13.0))
-                            .color(Color32::from_rgb(215, 215, 215)),
-                    );
+                    let dur_limit = if self.playback.duration > 0.0 {
+                        self.playback.duration
+                    } else {
+                        w.duration_secs
+                    };
+                    let max_seek = (!w.is_live && dur_limit > 0.0).then_some(dur_limit);
+                    if let Some(seek_secs) = draw_text_with_timestamps(
+                        ui,
+                        desc,
+                        13.0,
+                        Color32::from_rgb(215, 215, 215),
+                        max_seek,
+                    ) {
+                        if let Some(mpv) = &self.mpv {
+                            mpv.seek_abs(seek_secs);
+                            if self.playback.eof {
+                                mpv.set_paused(false);
+                            }
+                            self.trigger_hud(HudIcon::SeekForward, format_duration(seek_secs));
+                        }
+                    }
                     if w.description.len() > 240 {
                         let btn = if self.show_description {
                             "Show less"
@@ -2824,6 +2840,13 @@ impl YtApp {
                 );
             }
         } else {
+            let dur_limit = if self.playback.duration > 0.0 {
+                self.playback.duration
+            } else {
+                w.duration_secs
+            };
+            let max_seek = (!w.is_live && dur_limit > 0.0).then_some(dur_limit);
+            let mut seek_requested: Option<f64> = None;
             let mut open_reply_for: Option<(String, String, Option<String>)> = None;
             let mut submit_reply: Option<(String, String, String, Option<String>)> = None;
             let mut cancel_reply = false;
@@ -2914,11 +2937,11 @@ impl YtApp {
                                 );
                             }
                         });
-                        ui.label(
-                            RichText::new(&c.text)
-                                .font(theme::regular(13.0))
-                                .color(theme::TEXT),
-                        );
+                        if let Some(secs) =
+                            draw_text_with_timestamps(ui, &c.text, 13.0, theme::TEXT, max_seek)
+                        {
+                            seek_requested = Some(secs);
+                        }
                         ui.horizontal(|ui| {
                             let can_like = self.signed_in
                                 && if c.is_liked {
@@ -3023,11 +3046,15 @@ impl YtApp {
                                                 );
                                             }
                                         });
-                                        ui.label(
-                                            RichText::new(&r.text)
-                                                .font(theme::regular(12.5))
-                                                .color(theme::TEXT),
-                                        );
+                                        if let Some(secs) = draw_text_with_timestamps(
+                                            ui,
+                                            &r.text,
+                                            12.5,
+                                            theme::TEXT,
+                                            max_seek,
+                                        ) {
+                                            seek_requested = Some(secs);
+                                        }
                                         ui.horizontal(|ui| {
                                             let can_like = self.signed_in
                                                 && if r.is_liked {
@@ -3164,6 +3191,15 @@ impl YtApp {
                     });
                 });
                 ui.add_space(10.0);
+            }
+            if let Some(secs) = seek_requested {
+                if let Some(mpv) = &self.mpv {
+                    mpv.seek_abs(secs);
+                    if self.playback.eof {
+                        mpv.set_paused(false);
+                    }
+                    self.trigger_hud(HudIcon::SeekForward, format_duration(secs));
+                }
             }
             if let Some((cid, act, next_liked)) = toggle_like_comment {
                 for c in &mut self.comments {
@@ -5514,4 +5550,220 @@ fn shorts_nav_circle(ui: &mut egui::Ui, ico: char, tooltip: &str) -> bool {
     ui.painter().circle_filled(rect.center(), 22.0, fill);
     theme::draw_icon_centered(ui.painter(), rect.center(), ico, 19.0, theme::TEXT);
     resp.on_hover_text(tooltip).clicked()
+}
+
+fn is_ts_left_boundary(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '(' | '[' | '{' | '-' | '/' | '•' | '|' | '–' | '—' | '"' | '\'' | '@'
+        )
+}
+
+fn is_ts_right_boundary(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            ')' | ']' | '}' | ',' | '.' | '!' | '?' | ';' | ':' | '-' | '/' | '–' | '—' | '"' | '\''
+        )
+}
+
+fn parse_timestamp_token(tok: &str) -> Option<f64> {
+    let parts: Vec<&str> = tok.split(':').collect();
+    if parts.len() != 2 && parts.len() != 3 {
+        return None;
+    }
+    if parts.iter().any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    if parts.len() == 2 {
+        if parts[0].len() > 3 || parts[1].len() != 2 {
+            return None;
+        }
+        let m: u64 = parts[0].parse().ok()?;
+        let s: u64 = parts[1].parse().ok()?;
+        (s < 60).then_some((m * 60 + s) as f64)
+    } else {
+        if parts[0].len() > 2 || parts[1].len() != 2 || parts[2].len() != 2 {
+            return None;
+        }
+        let h: u64 = parts[0].parse().ok()?;
+        let m: u64 = parts[1].parse().ok()?;
+        let s: u64 = parts[2].parse().ok()?;
+        (m < 60 && s < 60).then_some((h * 3600 + m * 60 + s) as f64)
+    }
+}
+
+/// Finds clickable timestamp byte ranges `(start, end, secs)` inside comment/description text.
+fn extract_timestamp_spans(text: &str, max_secs: Option<f64>) -> Vec<(usize, usize, f64)> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            let ch_len = text[i..].chars().next().map_or(1, char::len_utf8);
+            i += ch_len;
+            continue;
+        }
+        let left_ok = i == 0
+            || text[..i]
+                .chars()
+                .next_back()
+                .is_some_and(is_ts_left_boundary);
+        let start = i;
+        let mut end = i;
+        while end < bytes.len() && (bytes[end].is_ascii_digit() || bytes[end] == b':') {
+            end += 1;
+        }
+        // Trim trailing ':' (e.g. "3:45: intro") so the timestamp token itself stays clean.
+        while end > start && bytes[end - 1] == b':' {
+            end -= 1;
+        }
+        let right_ok = end == bytes.len()
+            || text[end..]
+                .chars()
+                .next()
+                .is_some_and(is_ts_right_boundary);
+        if left_ok && right_ok && end > start {
+            if let Some(secs) = parse_timestamp_token(&text[start..end]) {
+                let in_range = max_secs.is_none_or(|m| secs <= m + 1.0);
+                if in_range {
+                    out.push((start, end, secs));
+                }
+            }
+        }
+        i = end.max(i + 1);
+    }
+    out
+}
+
+fn draw_text_with_timestamps(
+    ui: &mut egui::Ui,
+    text: &str,
+    font_size: f32,
+    base_color: Color32,
+    max_secs: Option<f64>,
+) -> Option<f64> {
+    let spans = extract_timestamp_spans(text, max_secs);
+    if spans.is_empty() {
+        ui.label(
+            RichText::new(text)
+                .font(theme::regular(font_size))
+                .color(base_color),
+        );
+        return None;
+    }
+
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = ui.available_width().max(60.0);
+    let normal_fmt = egui::TextFormat {
+        font_id: theme::regular(font_size),
+        color: base_color,
+        ..Default::default()
+    };
+    let link_fmt = egui::TextFormat {
+        font_id: theme::medium(font_size),
+        color: theme::YT_BLUE,
+        ..Default::default()
+    };
+
+    let mut cursor_byte = 0usize;
+    let mut char_pos = 0usize;
+    let mut char_spans: Vec<(usize, usize, f64)> = Vec::with_capacity(spans.len());
+
+    for (s, e, secs) in spans {
+        if s > cursor_byte {
+            let plain = &text[cursor_byte..s];
+            job.append(plain, 0.0, normal_fmt.clone());
+            char_pos += plain.chars().count();
+        }
+        let ts_str = &text[s..e];
+        let ts_chars = ts_str.chars().count();
+        job.append(ts_str, 0.0, link_fmt.clone());
+        char_spans.push((char_pos, char_pos + ts_chars, secs));
+        char_pos += ts_chars;
+        cursor_byte = e;
+    }
+    if cursor_byte < text.len() {
+        job.append(&text[cursor_byte..], 0.0, normal_fmt);
+    }
+
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::click());
+
+    let hovered_ts = resp
+        .hover_pos()
+        .or_else(|| {
+            if resp.clicked() {
+                resp.interact_pointer_pos()
+            } else {
+                None
+            }
+        })
+        .and_then(|ptr| {
+            char_spans.iter().find_map(|&(cs, ce, secs)| {
+                let r0 = galley.pos_from_cursor(egui::text::CCursor::new(cs));
+                let r1 = galley.pos_from_cursor(egui::text::CCursor::new(ce));
+                if (r0.top() - r1.top()).abs() < 2.0 {
+                    let hit = Rect::from_min_max(
+                        pos2(rect.left() + r0.left() - 2.0, rect.top() + r0.top()),
+                        pos2(rect.left() + r1.left() + 2.0, rect.top() + r0.bottom()),
+                    );
+                    hit.contains(ptr).then_some((hit, secs))
+                } else {
+                    None
+                }
+            })
+        });
+
+    ui.painter().galley(rect.min, galley, base_color);
+
+    if let Some((hit_rect, secs)) = hovered_ts {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        ui.painter().line_segment(
+            [
+                pos2(hit_rect.left() + 2.0, hit_rect.bottom() - 1.5),
+                pos2(hit_rect.right() - 2.0, hit_rect.bottom() - 1.5),
+            ],
+            Stroke::new(1.0, theme::YT_BLUE),
+        );
+        let tip = format!("Jump to {}", format_duration(secs));
+        let clicked = resp.on_hover_text(tip).clicked();
+        if clicked {
+            return Some(secs);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod watch_timestamp_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_valid_timestamps_and_ignores_invalid_tokens() {
+        let txt = "0:15 intro (3:45) and 1:02:30-1:05:00, skip 12:75, 1:2, abc1:23, 1:2:3:4.";
+        let spans = extract_timestamp_spans(txt, None);
+        let got: Vec<(&str, f64)> = spans
+            .iter()
+            .map(|&(s, e, sec)| (&txt[s..e], sec))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("0:15", 15.0),
+                ("3:45", 225.0),
+                ("1:02:30", 3750.0),
+                ("1:05:00", 3900.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn filters_timestamps_beyond_video_duration() {
+        let txt = "0:30 early, 15:00 way past end";
+        let spans = extract_timestamp_spans(txt, Some(300.0));
+        assert_eq!(spans.len(), 1);
+        assert_eq!(&txt[spans[0].0..spans[0].1], "0:30");
+    }
 }

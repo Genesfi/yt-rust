@@ -1408,6 +1408,7 @@ pub async fn channel_videos(
         }
     }
     let cont = find_continuation(&v);
+    let chips = collect_chips(&v);
     Ok((
         ChannelInfo {
             id: channel_id.to_owned(),
@@ -1422,7 +1423,7 @@ pub async fn channel_videos(
         },
         FeedPage {
             items,
-            chips: Vec::new(),
+            chips,
             continuation: cont,
             visitor_data: new_vd,
             is_fallback_trending: false,

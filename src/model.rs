@@ -384,6 +384,54 @@ impl HwdecMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HoverPreviewQuality {
+    Off,
+    P360,
+    P480,
+    P720,
+}
+
+impl HoverPreviewQuality {
+    pub fn max_height(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::P360 => 360,
+            Self::P480 => 480,
+            Self::P720 => 720,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::P360 => "360",
+            Self::P480 => "480",
+            Self::P720 => "720",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Self {
+        match s {
+            "off" => Self::Off,
+            "360" => Self::P360,
+            "720" => Self::P720,
+            _ => Self::P480,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::P360 => "360p (Fastest)",
+            Self::P480 => "480p",
+            Self::P720 => "720p (HD)",
+        }
+    }
+
+    pub const ALL: [Self; 4] = [Self::Off, Self::P360, Self::P480, Self::P720];
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PreferredQuality {
     Best4K,
     P1440,

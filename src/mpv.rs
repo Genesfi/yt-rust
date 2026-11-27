@@ -221,6 +221,23 @@ struct RenderContextHolder {
 unsafe impl Send for RenderContextHolder {}
 unsafe impl Sync for RenderContextHolder {}
 
+#[derive(Clone)]
+pub struct MpvRenderHandle(Arc<Mutex<Option<RenderContextHolder>>>);
+
+impl MpvRenderHandle {
+    pub fn paint_callback(&self, rect: egui::Rect) -> egui::PaintCallback {
+        let holder = self.0.clone();
+        egui::PaintCallback {
+            rect,
+            callback: Arc::new(eframe::egui_glow::CallbackFn::new(move |info, painter| {
+                let Ok(mut guard) = holder.lock() else { return };
+                let Some(ctx) = guard.as_mut() else { return };
+                render_into_egui(ctx, info, painter);
+            })),
+        }
+    }
+}
+
 pub struct MpvPlayer {
     vt: Arc<MpvVtable>,
     handle: *mut MpvHandle,
@@ -295,6 +312,23 @@ impl MpvPlayer {
         get_proc_address: GlProcAddrFn,
         egui_ctx: egui::Context,
     ) -> anyhow::Result<Self> {
+        Self::new_inner(data_dir, get_proc_address, egui_ctx, false)
+    }
+
+    pub fn new_preview(
+        data_dir: &Path,
+        get_proc_address: GlProcAddrFn,
+        egui_ctx: egui::Context,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(data_dir, get_proc_address, egui_ctx, true)
+    }
+
+    fn new_inner(
+        data_dir: &Path,
+        get_proc_address: GlProcAddrFn,
+        egui_ctx: egui::Context,
+        is_preview: bool,
+    ) -> anyhow::Result<Self> {
         let dll_path = find_libmpv(data_dir)
             .ok_or_else(|| anyhow::anyhow!("libmpv-2.dll not found"))?;
         let vt = Arc::new(MpvVtable::load(&dll_path)?);
@@ -319,10 +353,19 @@ impl MpvPlayer {
             set_opt("ytdl", "no");
             set_opt("keep-open", "yes");
             set_opt("cache", "yes");
-            set_opt("demuxer-max-bytes", "72MiB");
-            set_opt("demuxer-max-back-bytes", "24MiB");
-            set_opt("demuxer-readahead-secs", "60");
-            set_opt("cache-pause-wait", "1.5");
+            if is_preview {
+                set_opt("demuxer-max-bytes", "20MiB");
+                set_opt("demuxer-max-back-bytes", "4MiB");
+                set_opt("demuxer-readahead-secs", "15");
+                set_opt("cache-pause-wait", "0.5");
+                set_opt("loop-file", "inf");
+                set_opt("mute", "yes");
+            } else {
+                set_opt("demuxer-max-bytes", "72MiB");
+                set_opt("demuxer-max-back-bytes", "24MiB");
+                set_opt("demuxer-readahead-secs", "60");
+                set_opt("cache-pause-wait", "1.5");
+            }
             set_opt("network-timeout", "15");
             set_opt(
                 "stream-lavf-o",
@@ -334,10 +377,14 @@ impl MpvPlayer {
             );
             set_opt("referrer", "https://www.youtube.com/");
             set_opt("terminal", "no");
-            if let Some(log_str) = data_dir.join("mpv.log").to_str() {
-                set_opt("log-file", log_str);
+            if !is_preview {
+                if let Some(log_str) = data_dir.join("mpv.log").to_str() {
+                    set_opt("log-file", log_str);
+                }
+                set_opt("msg-level", "all=info");
+            } else {
+                set_opt("msg-level", "all=warn");
             }
-            set_opt("msg-level", "all=info");
 
             let rc = (vt.mpv_initialize)(handle);
             if rc < 0 {
@@ -593,16 +640,12 @@ impl MpvPlayer {
         st
     }
 
+    pub fn render_handle(&self) -> MpvRenderHandle {
+        MpvRenderHandle(self.render.clone())
+    }
+
     pub fn paint_callback(&self, rect: egui::Rect) -> egui::PaintCallback {
-        let holder = self.render.clone();
-        egui::PaintCallback {
-            rect,
-            callback: Arc::new(eframe::egui_glow::CallbackFn::new(move |info, painter| {
-                let Ok(mut guard) = holder.lock() else { return };
-                let Some(ctx) = guard.as_mut() else { return };
-                render_into_egui(ctx, info, painter);
-            })),
-        }
+        self.render_handle().paint_callback(rect)
     }
 
     pub fn destroy_gl(&self, gl: Option<&glow::Context>) {

@@ -5,9 +5,36 @@ use egui::{
 
 use crate::backend::Request;
 use crate::model::{ChannelNotificationParams, NotificationLevel, PlaylistOption, VideoItem};
+use crate::mpv::MpvRenderHandle;
 use crate::theme::{self, icon};
 
-use super::YtApp;
+use super::{YtApp, format_duration};
+
+#[derive(Clone, Default)]
+pub(super) struct HoverPreviewInput {
+    pub enabled: bool,
+    pub active_id: Option<String>,
+    pub loading_id: Option<String>,
+    pub muted: bool,
+    pub time_pos: f64,
+    pub duration: f64,
+    pub has_frame: bool,
+    pub render_handle: Option<MpvRenderHandle>,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct HoverPreviewOutput {
+    pub hovered_id: Option<String>,
+    pub toggle_mute: bool,
+}
+
+pub(super) fn hover_input_id() -> egui::Id {
+    egui::Id::unique("hover_preview_bridge_input")
+}
+
+pub(super) fn hover_output_id() -> egui::Id {
+    egui::Id::unique("hover_preview_bridge_output")
+}
 
 pub(super) enum GridAction {
     Open(VideoItem),
@@ -1153,6 +1180,12 @@ fn draw_video_card_row(
     show_remove_playlist: bool,
     action: &mut Option<GridAction>,
 ) {
+    let hover_in = ui
+        .ctx()
+        .data_mut(|d| d.get_temp::<HoverPreviewInput>(hover_input_id()))
+        .unwrap_or_default();
+    let any_popup_open = egui::Popup::is_any_open(ui.ctx());
+
     ui.horizontal_top(|ui| {
         for (col_idx, item) in row.iter().enumerate() {
             let item = *item;
@@ -1177,12 +1210,31 @@ fn draw_video_card_row(
                 );
             }
 
+            let can_preview = hover_in.enabled
+                && !item.is_short()
+                && item.playlist_browse_id.is_none()
+                && !any_popup_open;
+            if can_preview && hovered {
+                ui.ctx().data_mut(|d| {
+                    let mut out = d
+                        .get_temp::<HoverPreviewOutput>(hover_output_id())
+                        .unwrap_or_default();
+                    out.hovered_id = Some(item.id.clone());
+                    d.insert_temp(hover_output_id(), out);
+                });
+            }
+
+            let is_preview_active =
+                can_preview && hover_in.active_id.as_deref() == Some(item.id.as_str());
+            let is_preview_loading =
+                can_preview && hover_in.loading_id.as_deref() == Some(item.id.as_str());
+
             let mut card_ui = ui.new_child(egui::UiBuilder::new().max_rect(card_rect));
             let cclip = card_ui.clip_rect().intersect(card_rect);
             card_ui.set_clip_rect(cclip);
             let mut child_clicked_override = false;
             card_ui.vertical(|ui| {
-                draw_thumbnail_with_hover(
+                let thumb_rect = draw_thumbnail_with_hover(
                     ui,
                     &item.thumbnail_url,
                     &item.duration_text,
@@ -1190,7 +1242,58 @@ fn draw_video_card_row(
                     12.0,
                     item.watched_percent,
                     hover_t,
+                    if is_preview_active {
+                        Some(&hover_in)
+                    } else {
+                        None
+                    },
+                    is_preview_loading,
                 );
+                if is_preview_active && hover_in.has_frame {
+                    let mute_rect = Rect::from_min_size(
+                        pos2(thumb_rect.right() - 36.0, thumb_rect.top() + 8.0),
+                        Vec2::splat(28.0),
+                    );
+                    let mute_resp = ui
+                        .interact(
+                            mute_rect,
+                            ui.scope_id().with(("hover_mute", &item.id)),
+                            Sense::click(),
+                        )
+                        .on_hover_cursor(CursorIcon::PointingHand);
+                    let bg_alpha = if mute_resp.hovered() { 220 } else { 175 };
+                    ui.painter()
+                        .circle_filled(mute_rect.center(), 14.0, Color32::from_black_alpha(bg_alpha));
+                    theme::draw_icon_centered(
+                        ui.painter(),
+                        mute_rect.center(),
+                        if hover_in.muted {
+                            icon::VOLUME_X
+                        } else {
+                            icon::VOLUME_2
+                        },
+                        14.0,
+                        Color32::WHITE,
+                    );
+                    let mute_tip = if hover_in.muted {
+                        "Unmute preview"
+                    } else {
+                        "Mute preview"
+                    };
+                    let mute_resp = mute_resp.on_hover_text(mute_tip);
+                    if mute_resp.hovered() || mute_resp.clicked() {
+                        child_clicked_override = true;
+                    }
+                    if mute_resp.clicked() {
+                        ui.ctx().data_mut(|d| {
+                            let mut out = d
+                                .get_temp::<HoverPreviewOutput>(hover_output_id())
+                                .unwrap_or_default();
+                            out.toggle_mute = true;
+                            d.insert_temp(hover_output_id(), out);
+                        });
+                    }
+                }
                 ui.add_space(10.0);
                 ui.horizontal_top(|ui| {
                     let avatar_r = ui
@@ -1516,9 +1619,10 @@ pub(super) fn draw_thumbnail(
     radius: f32,
     watched_percent: Option<f32>,
 ) {
-    draw_thumbnail_with_hover(ui, url, duration, size, radius, watched_percent, 0.0);
+    draw_thumbnail_with_hover(ui, url, duration, size, radius, watched_percent, 0.0, None, false);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_thumbnail_with_hover(
     ui: &mut egui::Ui,
     url: &str,
@@ -1527,32 +1631,56 @@ fn draw_thumbnail_with_hover(
     radius: f32,
     watched_percent: Option<f32>,
     hover_t: f32,
-) {
+    preview: Option<&HoverPreviewInput>,
+    preview_loading: bool,
+) -> Rect {
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
 
     // Slightly flatten radius on hover just like YouTube
     let cur_radius = (radius - 4.0 * hover_t).max(4.0);
-    theme::paint_image_rounded(ui, url, rect, cur_radius.round() as u8);
+    let playing_frame = preview.filter(|p| p.has_frame && p.render_handle.is_some());
 
-    if hover_t > 0.02 {
-        let badge_alpha = (hover_t * 210.0).round() as u8;
-        let play_pill = Rect::from_center_size(rect.center(), vec2(44.0, 32.0));
-        ui.painter().rect_filled(
-            play_pill,
-            16.0,
-            Color32::from_black_alpha((hover_t * 175.0).round() as u8),
-        );
-        theme::draw_icon_centered(
-            ui.painter(),
-            play_pill.center(),
-            icon::PLAY,
-            16.0,
-            Color32::from_white_alpha(badge_alpha),
-        );
+    if let Some(p) = playing_frame {
+        ui.painter().rect_filled(rect, cur_radius, Color32::BLACK);
+        if let Some(handle) = &p.render_handle {
+            ui.painter().add(handle.paint_callback(rect));
+        }
+    } else {
+        theme::paint_image_rounded(ui, url, rect, cur_radius.round() as u8);
+        if preview_loading {
+            let pill = Rect::from_min_size(pos2(rect.right() - 34.0, rect.top() + 8.0), Vec2::splat(26.0));
+            ui.painter()
+                .circle_filled(pill.center(), 13.0, Color32::from_black_alpha(180));
+            ui.put(
+                pill.shrink(5.0),
+                egui::Spinner::new().size(14.0).color(Color32::WHITE),
+            );
+        } else if hover_t > 0.02 {
+            let badge_alpha = (hover_t * 210.0).round() as u8;
+            let play_pill = Rect::from_center_size(rect.center(), vec2(44.0, 32.0));
+            ui.painter().rect_filled(
+                play_pill,
+                16.0,
+                Color32::from_black_alpha((hover_t * 175.0).round() as u8),
+            );
+            theme::draw_icon_centered(
+                ui.painter(),
+                play_pill.center(),
+                icon::PLAY,
+                16.0,
+                Color32::from_white_alpha(badge_alpha),
+            );
+        }
     }
 
-    if let Some(pct) = watched_percent.filter(|&p| p > 0.01) {
-        let bar_h = 4.0;
+    let active_pct = if let Some(p) = playing_frame {
+        (p.duration > 0.0).then_some((p.time_pos / p.duration).clamp(0.0, 1.0) as f32)
+    } else {
+        watched_percent.filter(|&p| p > 0.01)
+    };
+
+    if let Some(pct) = active_pct {
+        let bar_h = if playing_frame.is_some() { 3.5 } else { 4.0 };
         let track = Rect::from_min_max(
             pos2(rect.left(), rect.bottom() - bar_h),
             pos2(rect.right(), rect.bottom()),
@@ -1564,15 +1692,28 @@ fn draw_thumbnail_with_hover(
         ui.painter().rect_filled(fill, 0.0, Color32::from_rgb(255, 0, 0));
     }
 
-    if !duration.is_empty() {
+    let badge_text = if let Some(p) = playing_frame {
         let is_live = duration.eq_ignore_ascii_case("LIVE");
+        if is_live {
+            duration.to_owned()
+        } else if p.duration > 0.0 {
+            format_duration((p.duration - p.time_pos).max(0.0))
+        } else {
+            duration.to_owned()
+        }
+    } else {
+        duration.to_owned()
+    };
+
+    if !badge_text.is_empty() {
+        let is_live = badge_text.eq_ignore_ascii_case("LIVE");
         let bg = if is_live {
             theme::YT_RED
         } else {
             Color32::from_black_alpha(210)
         };
         let galley = ui.painter().layout_no_wrap(
-            duration.to_owned(),
+            badge_text,
             theme::semibold(11.0),
             Color32::WHITE,
         );
@@ -1584,6 +1725,8 @@ fn draw_thumbnail_with_hover(
         ui.painter()
             .galley(badge_rect.min + pad, galley, Color32::WHITE);
     }
+
+    rect
 }
 
 pub(super) fn draw_members_badge(ui: &mut egui::Ui) {
